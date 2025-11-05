@@ -11,6 +11,8 @@ from functools import wraps
 from utils import send_email, generate_random_password
 from bson import ObjectId
 from datetime import datetime, timedelta, timezone
+from bson import ObjectId
+from flask import send_from_directory
 
 load_dotenv()
 app = Flask(__name__)
@@ -25,7 +27,6 @@ users_col = db["users"]
 attendance_col = db["attendance"]
 leaves_col = db["leaves"]
 
-from flask import send_from_directory
 
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -100,6 +101,7 @@ def register_admin():
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.json
+    print("Dataaaaa>>>>>>>>>",data)
     email = data.get("email")
     password = data.get("password")
     user = users_col.find_one({"email": email})
@@ -110,6 +112,8 @@ def login():
         # "exp": datetime.datetime.utcnow() + datetime.timedelta(days=1)
         "exp": datetime.now(timezone.utc) + timedelta(days=1)
     }, app.config['SECRET_KEY'], algorithm="HS256")
+    print("Token>>>>>>>>>>>>",token)
+    print("USER id>>>>>>>>>>>>",user.get("role", "employee"))
     return jsonify({"token": token, "role": user.get("role", "employee"), "user": {"name": user.get("name"), "email": user.get("email")}})
 
 # Admin: add employee
@@ -246,6 +250,7 @@ def checkin_photo():
         "photo_url": f"/attendance_photos/{filename}",
     }
     attendance_col.insert_one(record)
+    cleanup_old_attendance_photos()
     return jsonify({"message": "Checked in with photo"})
 
 # ---- Check-out with photo ----
@@ -275,6 +280,7 @@ def checkout_photo():
         "photo_url": f"/attendance_photos/{filename}",
     }
     attendance_col.insert_one(record)
+    cleanup_old_attendance_photos()
     return jsonify({"message": "Checked out with photo"})
 
 # serve photos
@@ -333,7 +339,7 @@ def apply_leave():
         "date": date,
         "type": leave_type,
         "reason": reason,
-        "status": "pending",
+        "status": "Pending",
         "applied_at": datetime.now(timezone.utc),
         "attachment_url": attachment_url
     }
@@ -347,11 +353,23 @@ def apply_leave():
 def admin_view_leaves():
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
+
     rows = []
     for l in leaves_col.find():
+        # Convert IDs and timestamps to readable format
         l["_id"] = str(l["_id"])
+        user_id = l.get("user_id")
+
+        # Ensure user_id is always converted to ObjectId
+        try:
+            user = users_col.find_one({"_id": ObjectId(user_id)})
+            l["employee_name"] = user["name"] if user else "Unknown"
+        except:
+            l["employee_name"] = "Unknown"
+
         rows.append(l)
-    return jsonify(rows)
+
+    return jsonify(rows), 200
 
 # Admin: update leave status
 @app.route("/api/admin/leaves/<leave_id>", methods=["PUT"])
@@ -361,7 +379,7 @@ def update_leave(leave_id):
         return jsonify({"message": "Unauthorized"}), 403
     data = request.json
     status = data.get("status")
-    if status not in ("approved", "rejected", "pending"):
+    if status not in ("Approved", "Rejected", "Pending"):
         return jsonify({"message": "Invalid status"}), 400
     leaves_col.update_one({"_id": __import__("bson").ObjectId(leave_id)}, {"$set": {"status": status}})
     # Optionally email employee
@@ -421,6 +439,30 @@ def admin_employee_attendance(emp_id):
         records.append(a)
 
     return jsonify(records)
+
+
+def cleanup_old_attendance_photos():
+    """Delete attendance photos and DB records older than 7 days"""
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+
+    old_records = attendance_col.find({
+        "time": {"$lt": seven_days_ago}
+    })
+
+    for record in old_records:
+        photo_url = record.get("photo_url")
+        if photo_url:
+            file_path = os.path.join("uploads/attendance_photos", photo_url.split("/")[-1])
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    print("Deleted file:", file_path)
+            except Exception as e:
+                print("File deletion error:", e)
+
+        attendance_col.delete_one({"_id": record["_id"]})
+        print("Deleted DB record:", record["_id"])
+
 
 if __name__ == "__main__":
     app.run(debug=True, port=int(os.getenv("PORT", 5000)))
