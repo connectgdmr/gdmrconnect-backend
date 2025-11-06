@@ -13,6 +13,7 @@ from bson import ObjectId
 from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 from flask import send_from_directory
+import pytz
 
 load_dotenv()
 app = Flask(__name__)
@@ -30,6 +31,35 @@ leaves_col = db["leaves"]
 
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# IST timezone
+IST = pytz.timezone('Asia/Kolkata')
+
+def utc_to_ist(utc_datetime):
+    """Convert UTC datetime to IST"""
+    if utc_datetime.tzinfo is None:
+        # Assume UTC if no timezone info
+        utc_datetime = pytz.utc.localize(utc_datetime)
+    ist_datetime = utc_datetime.astimezone(IST)
+    return ist_datetime
+
+def format_datetime_ist(dt):
+    """Convert UTC datetime to IST and return as ISO string"""
+    # Handle string datetime
+    if isinstance(dt, str):
+        try:
+            # Try parsing ISO format
+            dt = datetime.fromisoformat(dt.replace('Z', '+00:00'))
+        except:
+            # Fallback to parsing common formats
+            dt = datetime.fromisoformat(dt)
+    # MongoDB datetime objects are timezone-naive but stored as UTC
+    # Treat timezone-naive datetimes as UTC
+    if dt.tzinfo is None:
+        dt = pytz.utc.localize(dt)
+    # Convert to IST
+    ist_dt = dt.astimezone(IST)
+    return ist_dt.isoformat()
 
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
@@ -237,21 +267,23 @@ def checkin_photo():
     # decode base64 string
     header, encoded = img_data.split(",", 1)
     image_bytes = base64.b64decode(encoded)
-    filename = f"{request.user['_id']}_checkin_{int(datetime.utcnow().timestamp())}.jpg"
+    filename = f"{request.user['_id']}_checkin_{int(datetime.now(timezone.utc).timestamp())}.jpg"
     path = os.path.join(UPLOAD_FOLDER, filename)
 
     with open(path, "wb") as f:
         f.write(image_bytes)
 
+    now_utc = datetime.now(timezone.utc)
     record = {
         "user_id": str(request.user["_id"]),
         "type": "checkin",
-        "time": datetime.utcnow(),
+        "time": now_utc,
         "photo_url": f"/attendance_photos/{filename}",
     }
     attendance_col.insert_one(record)
     cleanup_old_attendance_photos()
-    return jsonify({"message": "Checked in with photo"})
+    ist_time = utc_to_ist(now_utc)
+    return jsonify({"message": "Checked in with photo", "time": ist_time.isoformat()})
 
 # ---- Check-out with photo ----
 @app.route("/api/attendance/checkout-photo", methods=["POST"])
@@ -267,21 +299,23 @@ def checkout_photo():
 
     header, encoded = img_data.split(",", 1)
     image_bytes = base64.b64decode(encoded)
-    filename = f"{request.user['_id']}_checkout_{int(datetime.utcnow().timestamp())}.jpg"
+    filename = f"{request.user['_id']}_checkout_{int(datetime.now(timezone.utc).timestamp())}.jpg"
     path = os.path.join(UPLOAD_FOLDER, filename)
 
     with open(path, "wb") as f:
         f.write(image_bytes)
 
+    now_utc = datetime.now(timezone.utc)
     record = {
         "user_id": str(request.user["_id"]),
         "type": "checkout",
-        "time": datetime.utcnow(),
+        "time": now_utc,
         "photo_url": f"/attendance_photos/{filename}",
     }
     attendance_col.insert_one(record)
     cleanup_old_attendance_photos()
-    return jsonify({"message": "Checked out with photo"})
+    ist_time = utc_to_ist(now_utc)
+    return jsonify({"message": "Checked out with photo", "time": ist_time.isoformat()})
 
 # serve photos
 @app.route("/attendance_photos/<path:filename>")
@@ -400,7 +434,8 @@ def my_attendance():
     rows = []
     for a in attendance_col.find({"user_id": uid}).sort("time", -1):
         a["_id"] = str(a["_id"])
-        a["time"] = a["time"].isoformat()
+        # Convert UTC time to IST before returning
+        a["time"] = format_datetime_ist(a["time"])
         rows.append(a)
     return jsonify(rows)
 
@@ -433,7 +468,8 @@ def admin_employee_attendance(emp_id):
     records = []
     for a in attendance_col.find({"user_id": emp_id}).sort("time", -1):
         a["_id"] = str(a["_id"])
-        a["time"] = a["time"].isoformat()
+        # Convert UTC time to IST before returning
+        a["time"] = format_datetime_ist(a["time"])
         a["employee_name"] = emp.get("name")
         a["employee_email"] = emp.get("email")
         records.append(a)
@@ -443,7 +479,7 @@ def admin_employee_attendance(emp_id):
 
 def cleanup_old_attendance_photos():
     """Delete attendance photos and DB records older than 7 days"""
-    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
 
     old_records = attendance_col.find({
         "time": {"$lt": seven_days_ago}
