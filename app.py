@@ -6,21 +6,38 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
-import datetime
 from functools import wraps
 from utils import send_email, generate_random_password
 from bson import ObjectId
 from datetime import datetime, timedelta, timezone
-from bson import ObjectId
 from flask import send_from_directory
 import pytz
+from flask_bcrypt import Bcrypt
 
 load_dotenv()
+
 app = Flask(__name__)
-CORS(app)
+bcrypt = Bcrypt(app)
+# CORS(app)
+
+from flask_cors import CORS
+
+CORS(app, resources={
+    r"/*": {
+        "origins": [
+            "https://gdmrconnect.com",
+            "https://*.netlify.app",
+            "http://localhost:3000"
+        ],
+        "supports_credentials": True,
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
+
+
 
 app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "replace-this-secret")
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://jinugdmr_db_user:jHVhucjfLIN1Q9Jz@cluster0.lwly6jg.mongodb.net/?appName=Cluster0")
 client = MongoClient(MONGO_URI)
 db = client["attendance_db"]
 
@@ -61,30 +78,15 @@ def format_datetime_ist(dt):
     ist_dt = dt.astimezone(IST)
     return ist_dt.isoformat()
 
+@app.route("/")
+def home():
+    return "Backend running ✅", 200
+
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
     import os
     uploads_dir = os.path.join(os.getcwd(), "uploads")
     return send_from_directory(uploads_dir, filename)
-
-# def token_required(f):
-#     @wraps(f)
-#     def decorated(*args, **kwargs):
-#         token = None
-#         if 'Authorization' in request.headers:
-#             token = request.headers['Authorization'].split(" ")[1]
-#         if not token:
-#             return jsonify({"message": "Token is missing!"}), 401
-#         try:
-#             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
-#             current_user = users_col.find_one({"_id": data["user_id"]})
-#             if not current_user:
-#                 return jsonify({"message": "User not found"}), 401
-#             request.user = current_user
-#         except Exception as e:
-#             return jsonify({"message": "Token is invalid!", "error": str(e)}), 401
-#         return f(*args, **kwargs)
-#     return decorated
 
 def token_required(f):
     @wraps(f)
@@ -116,7 +118,7 @@ def register_admin():
     password = data.get("password", "admin123")
     if users_col.find_one({"email": email}):
         return jsonify({"message": "Admin already exists"}), 400
-    hashed = generate_password_hash(password)
+    hashed = bcrypt.generate_password_hash(password).decode("utf-8")
     user_doc = {
         "name": name,
         "email": email,
@@ -128,23 +130,69 @@ def register_admin():
     res = users_col.insert_one(user_doc)
     return jsonify({"message": "Admin created", "id": str(res.inserted_id)}), 201
 
+@app.route("/api/register-manager", methods=["POST"])
+@token_required
+def register_manager():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data = request.get_json()
+    if not data:
+        return jsonify({"message": "Invalid data"}), 400
+
+    name = data.get("name")
+    email = data.get("email")
+    password = data.get("password")
+
+    if not name or not email or not password:
+        return jsonify({"message": "All fields are required"}), 400
+
+    existing = users_col.find_one({"email": email})
+    if existing:
+        return jsonify({"message": "Email already exists"}), 400
+
+    hashed_pw = bcrypt.generate_password_hash(password).decode("utf-8")
+
+    new_user = {
+        "name": name,
+        "email": email,
+        "password": hashed_pw,
+        "role": "manager"
+    }
+
+    users_col.insert_one(new_user)
+    return jsonify({"message": "Manager created successfully!"}), 201
+
+
+
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.json
-    print("Dataaaaa>>>>>>>>>",data)
+    print("Dataaaaa>>>>>>>>>", data)
+    
     email = data.get("email")
     password = data.get("password")
+
     user = users_col.find_one({"email": email})
-    if not user or not check_password_hash(user["password"], password):
+    if not user or not bcrypt.check_password_hash(user["password"], password):
         return jsonify({"message": "Invalid credentials"}), 401
+
     token = jwt.encode({
         "user_id": str(user["_id"]),
-        # "exp": datetime.datetime.utcnow() + datetime.timedelta(days=1)
         "exp": datetime.now(timezone.utc) + timedelta(days=1)
     }, app.config['SECRET_KEY'], algorithm="HS256")
-    print("Token>>>>>>>>>>>>",token)
-    print("USER id>>>>>>>>>>>>",user.get("role", "employee"))
-    return jsonify({"token": token, "role": user.get("role", "employee"), "user": {"name": user.get("name"), "email": user.get("email")}})
+
+    print("Token>>>>>>>>>>>>", token)
+    print("USER role>>>>>>>>>>>>", user.get("role", "employee"))
+
+    return jsonify({
+        "token": token,
+        "role": user.get("role", "employee"),
+        "user": {
+            "name": user.get("name"),
+            "email": user.get("email")
+        }
+    })
 
 # Admin: add employee
 @app.route("/api/admin/employees", methods=["POST"])
@@ -157,11 +205,12 @@ def add_employee():
     email = data.get("email")
     department = data.get("department", "")
     position = data.get("position", "")
-    if users_col.find_one({"email": email}):
-        return jsonify({"message": "Employee with email exists"}), 400
+    if users_col.find_one({"email": email, "role": "employee"}):
+        return jsonify({"message": "Employee with this email already exists"}), 400
+
     password = generate_random_password()
     print("pasword>>>>>>>>>>>",password)
-    hashed = generate_password_hash(password)
+    hashed =bcrypt.generate_password_hash(password).decode("utf-8")
     now = datetime.now(timezone.utc)
     user_doc = {
         "name": name,
@@ -223,34 +272,6 @@ def delete_employee(emp_id):
     leaves_col.delete_many({"user_id": emp_id})
     return jsonify({"message": "Deleted"})
 
-# Employee: check-in / check-out
-# @app.route("/api/attendance/checkin", methods=["POST"])
-# @token_required
-# def checkin():
-#     if request.user.get("role") != "employee":
-#         return jsonify({"message": "Only employees can check in"}), 403
-#     now = datetime.now(timezone.utc)
-#     rec = {
-#         "user_id": str(request.user["_id"]),
-#         "type": "checkin",
-#         "time": now
-#     }
-#     attendance_col.insert_one(rec)
-#     return jsonify({"message": "Checked in", "time": now.isoformat()})
-
-# @app.route("/api/attendance/checkout", methods=["POST"])
-# @token_required
-# def checkout():
-#     if request.user.get("role") != "employee":
-#         return jsonify({"message": "Only employees can check out"}), 403
-#     now = datetime.now(timezone.utc)
-#     rec = {
-#         "user_id": str(request.user["_id"]),
-#         "type": "checkout",
-#         "time": now
-#     }
-#     attendance_col.insert_one(rec)
-#     return jsonify({"message": "Checked out", "time": now.isoformat()})
 
 # ---- Check-in with photo ----
 @app.route("/api/attendance/checkin-photo", methods=["POST"])
@@ -322,24 +343,7 @@ def checkout_photo():
 def serve_attendance_photo(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
-# Employee: apply leave
-# @app.route("/api/leaves", methods=["POST"])
-# @token_required
-# def apply_leave():
-#     data = request.json
-#     if request.user.get("role") != "employee":
-#         return jsonify({"message": "Only employees can apply leave"}), 403
-#     leave = {
-#         "user_id": str(request.user["_id"]),
-#         "date": data.get("date"),
-#         "type": data.get("type", "full"),  # half or full
-#         "reason": data.get("reason", ""),
-#         "status": "pending",
-#         "applied_at": datetime.now(timezone.utc)
-#     }
-#     res = leaves_col.insert_one(leave)
-#     # Optionally notify admin via email (not implemented)
-#     return jsonify({"message": "Applied", "id": str(res.inserted_id)}), 201
+
 
 # Employee: apply leave (with optional attachment)
 @app.route("/api/leaves", methods=["POST"])
@@ -385,7 +389,8 @@ def apply_leave():
 @app.route("/api/admin/leaves", methods=["GET"])
 @token_required
 def admin_view_leaves():
-    if request.user.get("role") != "admin":
+    # if request.user.get("role") != "admin":
+    if request.user.get("role") not in ["admin", "manager"]:
         return jsonify({"message": "Unauthorized"}), 403
 
     rows = []
@@ -409,7 +414,8 @@ def admin_view_leaves():
 @app.route("/api/admin/leaves/<leave_id>", methods=["PUT"])
 @token_required
 def update_leave(leave_id):
-    if request.user.get("role") != "admin":
+    # if request.user.get("role") != "admin":
+    if request.user.get("role") not in ["admin", "manager"]:
         return jsonify({"message": "Unauthorized"}), 403
     data = request.json
     status = data.get("status")
@@ -499,8 +505,40 @@ def cleanup_old_attendance_photos():
         attendance_col.delete_one({"_id": record["_id"]})
         print("Deleted DB record:", record["_id"])
 
+@app.route("/api/admin/managers", methods=["GET"])
+@token_required
+def list_managers():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    
+    rows = []
+    for m in users_col.find({"role": "manager"}):
+        m["_id"] = str(m["_id"])
+        del m["password"]  # Don't expose password
+        rows.append(m)
+    
+    return jsonify(rows)
+@app.route("/api/admin/managers/<manager_id>", methods=["DELETE"])
+@token_required
+def delete_manager(manager_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    
+    users_col.delete_one({"_id": ObjectId(manager_id)})
+    
+    # Remove manager-linked data (if needed later)
+    leaves_col.update_many({"approved_by": manager_id}, {"$set": {"approved_by": None}})
+    
+    return jsonify({"message": "Manager deleted"})
+
+
+
+# if __name__ == "__main__":
+#     app.run(debug=True, port=int(os.getenv("PORT", 5000)))
 
 if __name__ == "__main__":
-    app.run(debug=True, port=int(os.getenv("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
