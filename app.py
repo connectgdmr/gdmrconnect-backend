@@ -26,8 +26,11 @@ CORS(app, resources={
     r"/*": {
         "origins": [
             "https://gdmrconnect.com",
-            "http://localhost:3000"  
-        ]
+            "https://*.netlify.app",
+            "http://localhost:3000"
+        ],
+        "supports_credentials": True,
+        "allow_headers": ["Content-Type", "Authorization"]
     }
 })
 
@@ -77,7 +80,7 @@ def format_datetime_ist(dt):
 
 @app.route("/")
 def home():
-    return jsonify({"message": "Backend LIVE "}), 200
+    return "Backend running ✅", 200
 
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):

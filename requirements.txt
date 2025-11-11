@@ -1,7 +1,18 @@
+# Flask
+# flask-cors
+# python-dotenv
+# pymongo
+# werkzeug
+# PyJWT
+# pytz
+# flask-bcrypt
+# gunicorn
+
 Flask
 flask-cors
 python-dotenv
-pymongo
+pymongo[srv]
+dnspython
 werkzeug
 PyJWT
 pytz
