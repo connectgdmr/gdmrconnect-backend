@@ -18,7 +18,19 @@ load_dotenv()
 
 app = Flask(__name__)
 bcrypt = Bcrypt(app)
-CORS(app)
+# CORS(app)
+
+from flask_cors import CORS
+
+CORS(app, resources={
+    r"/*": {
+        "origins": [
+            "https://gdmrconnect.com",
+            "http://localhost:3000"  
+        ]
+    }
+})
+
 
 
 app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "replace-this-secret")
@@ -62,6 +74,10 @@ def format_datetime_ist(dt):
     # Convert to IST
     ist_dt = dt.astimezone(IST)
     return ist_dt.isoformat()
+
+@app.route("/")
+def home():
+    return jsonify({"message": "Backend LIVE "}), 200
 
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
@@ -514,7 +530,12 @@ def delete_manager(manager_id):
 
 
 
+# if __name__ == "__main__":
+#     app.run(debug=True, port=int(os.getenv("PORT", 5000)))
+
 if __name__ == "__main__":
-    app.run(debug=True, port=int(os.getenv("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
