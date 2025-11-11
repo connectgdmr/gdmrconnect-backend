@@ -5,3 +5,4 @@ pymongo
 werkzeug
 PyJWT
 pytz
+flask-bcrypt
