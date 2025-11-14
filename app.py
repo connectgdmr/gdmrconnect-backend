@@ -27,17 +27,22 @@ CORS(app, resources={
         "origins": [
             "https://gdmrconnect.com",
             "https://*.netlify.app",
-            "http://localhost:3000"
+            "http://localhost:3000",
+            "http://localhost:5173",   # ADD THIS
+            "http://127.0.0.1:5173"    # ADD THIS TOO
         ],
         "supports_credentials": True,
-        "allow_headers": ["Content-Type", "Authorization"]
+        "allow_headers": ["Content-Type", "Authorization"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
     }
 })
 
 
 
+
 app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "replace-this-secret")
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://jinugdmr_db_user:jHVhucjfLIN1Q9Jz@cluster0.lwly6jg.mongodb.net/?appName=Cluster0")
+# MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://jinugdmr_db_user:jHVhucjfLIN1Q9Jz@cluster0.lwly6jg.mongodb.net/?appName=Cluster0")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 client = MongoClient(MONGO_URI)
 db = client["attendance_db"]
 
@@ -280,31 +285,77 @@ def checkin_photo():
     if request.user.get("role") != "employee":
         return jsonify({"message": "Unauthorized"}), 403
 
+    uid = str(request.user["_id"])
+
+    # Current IST time
+    now_ist = datetime.now(IST)
+    today = now_ist.date()
+
+    # Allowed time range: 9 AM to 11 AM
+    start_time = now_ist.replace(hour=9, minute=0, second=0, microsecond=0)
+    end_time = now_ist.replace(hour=10, minute=30, second=0, microsecond=0)
+
+    # ❗ Block early check-in
+    if now_ist < start_time:
+        return jsonify({"message": "Check-in allowed only after 9:00 AM"}), 400
+
+    # ❗ Block late check-in
+    if now_ist > end_time:
+        # Auto mark absent
+        existing_absent = attendance_col.find_one({
+            "user_id": uid,
+            "type": "absent",
+            "date": str(today)
+        })
+
+        if not existing_absent:
+            attendance_col.insert_one({
+                "user_id": uid,
+                "type": "absent",
+                "date": str(today),
+                "time": datetime.now(timezone.utc)
+            })
+
+        return jsonify({"message": "Check-in time closed (after 10 30 AM). Marked as Absent."}), 400
+
+    # ❗ Prevent double check-in
+    existing_checkin = attendance_col.find_one({
+        "user_id": uid,
+        "type": "checkin",
+        "time": {
+            "$gte": datetime.combine(today, datetime.min.time()),
+            "$lt": datetime.combine(today, datetime.max.time())
+        }
+    })
+
+    if existing_checkin:
+        return jsonify({"message": "You already checked in today!"}), 400
+
+    # ----- Continue: Process Image -----
     data = request.get_json()
     img_data = data.get("image")
     if not img_data:
         return jsonify({"message": "No image received"}), 400
 
-    # decode base64 string
     header, encoded = img_data.split(",", 1)
     image_bytes = base64.b64decode(encoded)
-    filename = f"{request.user['_id']}_checkin_{int(datetime.now(timezone.utc).timestamp())}.jpg"
+    filename = f"{uid}_checkin_{int(datetime.now(timezone.utc).timestamp())}.jpg"
     path = os.path.join(UPLOAD_FOLDER, filename)
 
     with open(path, "wb") as f:
         f.write(image_bytes)
 
     now_utc = datetime.now(timezone.utc)
-    record = {
-        "user_id": str(request.user["_id"]),
+
+    attendance_col.insert_one({
+        "user_id": uid,
         "type": "checkin",
         "time": now_utc,
         "photo_url": f"/attendance_photos/{filename}",
-    }
-    attendance_col.insert_one(record)
-    cleanup_old_attendance_photos()
-    ist_time = utc_to_ist(now_utc)
-    return jsonify({"message": "Checked in with photo", "time": ist_time.isoformat()})
+    })
+
+    return jsonify({"message": "Check-in successful"}), 200
+
 
 # ---- Check-out with photo ----
 @app.route("/api/attendance/checkout-photo", methods=["POST"])
@@ -313,6 +364,36 @@ def checkout_photo():
     if request.user.get("role") != "employee":
         return jsonify({"message": "Unauthorized"}), 403
 
+    uid = str(request.user["_id"])
+    today_date = datetime.now(IST).date()
+
+    # Check if check-in exists for today
+    existing_checkin = attendance_col.find_one({
+        "user_id": uid,
+        "type": "checkin",
+        "time": {
+            "$gte": datetime.combine(today_date, datetime.min.time()),
+            "$lt": datetime.combine(today_date, datetime.max.time())
+        }
+    })
+
+    if not existing_checkin:
+        return jsonify({"message": "You must check in before checking out!"}), 400
+
+    # Check if already checked out today
+    existing_checkout = attendance_col.find_one({
+        "user_id": uid,
+        "type": "checkout",
+        "time": {
+            "$gte": datetime.combine(today_date, datetime.min.time()),
+            "$lt": datetime.combine(today_date, datetime.max.time())
+        }
+    })
+
+    if existing_checkout:
+        return jsonify({"message": "You already checked out today!"}), 400
+
+    # ---- continue with existing logic ----
     data = request.get_json()
     img_data = data.get("image")
     if not img_data:
@@ -320,23 +401,23 @@ def checkout_photo():
 
     header, encoded = img_data.split(",", 1)
     image_bytes = base64.b64decode(encoded)
-    filename = f"{request.user['_id']}_checkout_{int(datetime.now(timezone.utc).timestamp())}.jpg"
+    filename = f"{uid}_checkout_{int(datetime.now(timezone.utc).timestamp())}.jpg"
     path = os.path.join(UPLOAD_FOLDER, filename)
 
     with open(path, "wb") as f:
         f.write(image_bytes)
 
     now_utc = datetime.now(timezone.utc)
-    record = {
-        "user_id": str(request.user["_id"]),
+    attendance_col.insert_one({
+        "user_id": uid,
         "type": "checkout",
         "time": now_utc,
         "photo_url": f"/attendance_photos/{filename}",
-    }
-    attendance_col.insert_one(record)
+    })
+
     cleanup_old_attendance_photos()
-    ist_time = utc_to_ist(now_utc)
-    return jsonify({"message": "Checked out with photo", "time": ist_time.isoformat()})
+    return jsonify({"message": "Checked out successfully"}), 200
+
 
 # serve photos
 @app.route("/attendance_photos/<path:filename>")
@@ -530,6 +611,109 @@ def delete_manager(manager_id):
     leaves_col.update_many({"approved_by": manager_id}, {"$set": {"approved_by": None}})
     
     return jsonify({"message": "Manager deleted"})
+
+
+@app.route("/api/attendance/auto-absent", methods=["POST"])
+def auto_mark_absent():
+    today = datetime.now(IST).date()
+
+    all_employees = users_col.find({"role": "employee"})
+
+    for emp in all_employees:
+        uid = str(emp["_id"])
+
+        # Check if employee already checked in today
+        checked_in = attendance_col.find_one({
+            "user_id": uid,
+            "type": "checkin",
+            "time": {
+                "$gte": datetime.combine(today, datetime.min.time()),
+                "$lt": datetime.combine(today, datetime.max.time())
+            }
+        })
+
+        if checked_in:
+            continue
+
+        # Check if already marked absent to avoid duplicates
+        already_absent = attendance_col.find_one({
+            "user_id": uid,
+            "type": "absent",
+            "date": str(today)
+        })
+
+        if not already_absent:
+            attendance_col.insert_one({
+                "user_id": uid,
+                "type": "absent",
+                "date": str(today),
+                "time": datetime.now(timezone.utc)
+            })
+
+    return jsonify({"message": "Absent auto-marking completed"}), 200
+
+
+@app.route("/api/admin/attendance-summary", methods=["GET"])
+@token_required
+def attendance_summary():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    month_param = request.args.get("month")  # format: YYYY-MM
+    if not month_param:
+        return jsonify({"message": "month=YYYY-MM required"}), 400
+
+    year, month = map(int, month_param.split("-"))
+
+    # Start & end of month (IST)
+    start_date = datetime(year, month, 1, tzinfo=IST)
+    next_month = month + 1 if month < 12 else 1
+    next_month_year = year if month < 12 else year + 1
+    end_date = datetime(next_month_year, next_month, 1, tzinfo=IST)
+
+    employees = list(users_col.find({"role": "employee"}))
+    emp_ids = [str(e["_id"]) for e in employees]
+
+    summary = {
+        "total_employees": len(employees),
+        "days": {}
+    }
+
+    current = start_date
+    while current < end_date:
+        day_str = current.date().isoformat()
+
+        # Fetch attendance records for this date
+        day_records = list(attendance_col.find({
+            "time": {
+                "$gte": datetime.combine(current.date(), datetime.min.time(), tzinfo=IST),
+                "$lt": datetime.combine(current.date(), datetime.max.time(), tzinfo=IST),
+            }
+        }))
+
+        # Categorize employees
+        present = {rec["user_id"] for rec in day_records if rec["type"] == "checkin"}
+        absent = {rec["user_id"] for rec in day_records if rec["type"] == "absent"}
+
+        leaves_today = {
+            l["user_id"] for l in leaves_col.find({
+                "date": day_str,
+                "status": "Approved"
+            })
+        }
+
+        not_checked_in = set(emp_ids) - present - leaves_today - absent
+
+        summary["days"][day_str] = {
+            "present": list(present),
+            "absent": list(absent),
+            "leave": list(leaves_today),
+            "not_checked_in": list(not_checked_in),
+        }
+
+        current += timedelta(days=1)
+
+    return jsonify(summary), 200
 
 
 
