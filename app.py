@@ -291,17 +291,37 @@ def checkin_photo():
     now_ist = datetime.now(IST)
     today = now_ist.date()
 
-    # Allowed time range: 9 AM to 11 AM
+    # Allowed full-day check-in time range: 9 AM to 11:30 AM
     start_time = now_ist.replace(hour=9, minute=0, second=0, microsecond=0)
-    end_time = now_ist.replace(hour=10, minute=30, second=0, microsecond=0)
+    end_time = now_ist.replace(hour=11, minute=30, second=0, microsecond=0)
 
-    # ❗ Block early check-in
+    # HALF-DAY check-in window: 1 PM to 2 PM
+    half_day_start = now_ist.replace(hour=13, minute=0, second=0, microsecond=0)
+    half_day_end = now_ist.replace(hour=14, minute=0, second=0, microsecond=0)
+
+    # ---- PREVENT DOUBLE CHECK-IN ----
+    existing_checkin = attendance_col.find_one({
+        "user_id": uid,
+        "type": "checkin",
+        "date": str(today)
+    })
+    if existing_checkin:
+        return jsonify({"message": "You already checked in today!"}), 400
+
+    # ---- BLOCK EARLY CHECK-IN ----
     if now_ist < start_time:
         return jsonify({"message": "Check-in allowed only after 9:00 AM"}), 400
 
-    # ❗ Block late check-in
-    if now_ist > end_time:
-        # Auto mark absent
+    # ---- FULL-DAY CHECK-IN WINDOW ----
+    if start_time <= now_ist <= end_time:
+        checkin_type = "full"
+
+    # ---- HALF-DAY CHECK-IN WINDOW ----
+    elif half_day_start <= now_ist <= half_day_end:
+        checkin_type = "half-day"
+
+    # ---- LATE CHECK-IN AFTER 11:30 AM → ABSENT ----
+    else:
         existing_absent = attendance_col.find_one({
             "user_id": uid,
             "type": "absent",
@@ -316,22 +336,11 @@ def checkin_photo():
                 "time": datetime.now(timezone.utc)
             })
 
-        return jsonify({"message": "Check-in time closed (after 10 30 AM). Marked as Absent."}), 400
+        return jsonify({
+            "message": "Check-in window closed. Marked as Absent."
+        }), 400
 
-    # ❗ Prevent double check-in
-    existing_checkin = attendance_col.find_one({
-        "user_id": uid,
-        "type": "checkin",
-        "time": {
-            "$gte": datetime.combine(today, datetime.min.time()),
-            "$lt": datetime.combine(today, datetime.max.time())
-        }
-    })
-
-    if existing_checkin:
-        return jsonify({"message": "You already checked in today!"}), 400
-
-    # ----- Continue: Process Image -----
+    # ---- IMAGE PROCESSING ----
     data = request.get_json()
     img_data = data.get("image")
     if not img_data:
@@ -347,14 +356,20 @@ def checkin_photo():
 
     now_utc = datetime.now(timezone.utc)
 
+    # ---- INSERT ATTENDANCE ----
     attendance_col.insert_one({
         "user_id": uid,
         "type": "checkin",
+        "date": str(today),
+        "day_type": checkin_type,   # <-- NEW FIELD: full or half-day
         "time": now_utc,
         "photo_url": f"/attendance_photos/{filename}",
     })
 
-    return jsonify({"message": "Check-in successful"}), 200
+    return jsonify({
+        "message": f"Check-in successful ({checkin_type})",
+        "day_type": checkin_type
+    }), 200
 
 
 # ---- Check-out with photo ----
@@ -365,16 +380,14 @@ def checkout_photo():
         return jsonify({"message": "Unauthorized"}), 403
 
     uid = str(request.user["_id"])
-    today_date = datetime.now(IST).date()
+    now_ist = datetime.now(IST)
+    today_date = now_ist.date()
 
     # Check if check-in exists for today
     existing_checkin = attendance_col.find_one({
         "user_id": uid,
         "type": "checkin",
-        "time": {
-            "$gte": datetime.combine(today_date, datetime.min.time()),
-            "$lt": datetime.combine(today_date, datetime.max.time())
-        }
+        "date": str(today_date)
     })
 
     if not existing_checkin:
@@ -384,16 +397,30 @@ def checkout_photo():
     existing_checkout = attendance_col.find_one({
         "user_id": uid,
         "type": "checkout",
-        "time": {
-            "$gte": datetime.combine(today_date, datetime.min.time()),
-            "$lt": datetime.combine(today_date, datetime.max.time())
-        }
+        "date": str(today_date)
     })
 
     if existing_checkout:
         return jsonify({"message": "You already checked out today!"}), 400
 
-    # ---- continue with existing logic ----
+    # ---- HALF-DAY CHECKOUT WINDOW ----
+    half_day_start = now_ist.replace(hour=13, minute=0, second=0, microsecond=0)
+    half_day_end = now_ist.replace(hour=14, minute=0, second=0, microsecond=0)
+
+    # determine default day type from checkin
+    day_type = existing_checkin.get("day_type", "full")
+
+    # If checkout is between 1 PM - 2 PM → mark half-day
+    if half_day_start <= now_ist <= half_day_end:
+        day_type = "half-day"
+
+        # update the original checkin record to half-day
+        attendance_col.update_one(
+            {"_id": existing_checkin["_id"]},
+            {"$set": {"day_type": "half-day"}}
+        )
+
+    # ---- process checkout image ----
     data = request.get_json()
     img_data = data.get("image")
     if not img_data:
@@ -411,12 +438,19 @@ def checkout_photo():
     attendance_col.insert_one({
         "user_id": uid,
         "type": "checkout",
+        "date": str(today_date),
         "time": now_utc,
         "photo_url": f"/attendance_photos/{filename}",
+        "day_type": day_type
     })
 
     cleanup_old_attendance_photos()
-    return jsonify({"message": "Checked out successfully"}), 200
+
+    return jsonify({
+        "message": f"Checked out successfully ({day_type})",
+        "day_type": day_type
+    }), 200
+
 
 
 # serve photos
@@ -714,6 +748,50 @@ def attendance_summary():
         current += timedelta(days=1)
 
     return jsonify(summary), 200
+
+
+@app.route("/api/admin/today-stats", methods=["GET"])
+@token_required
+def today_stats():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    today = datetime.now(IST).date()
+
+    # Fetch all employees
+    employees = list(users_col.find({"role": "employee"}))
+    emp_ids = [str(e["_id"]) for e in employees]
+
+    # Attendance Records
+    day_records = list(attendance_col.find({
+        "time": {
+            "$gte": datetime.combine(today, datetime.min.time(), tzinfo=IST),
+            "$lt": datetime.combine(today, datetime.max.time(), tzinfo=IST),
+        }
+    }))
+
+    present = {rec["user_id"] for rec in day_records if rec["type"] == "checkin"}
+    absent = {rec["user_id"] for rec in day_records if rec["type"] == "absent"}
+
+    leaves_today = {
+        l["user_id"] for l in leaves_col.find({
+            "date": str(today),
+            "status": "Approved"
+        })
+    }
+
+    not_checked_in = set(emp_ids) - present - leaves_today - absent
+
+    response = {
+        "present": len(present),
+        "absent": len(absent),
+        "leave": len(leaves_today),
+        "not_checked_in": len(not_checked_in),
+    }
+
+    return jsonify(response), 200
+
+
 
 
 
