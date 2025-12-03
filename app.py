@@ -41,8 +41,8 @@ CORS(app, resources={
 
 
 app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "replace-this-secret")
-# MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://jinugdmr_db_user:jHVhucjfLIN1Q9Jz@cluster0.lwly6jg.mongodb.net/?appName=Cluster0")
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://jinugdmr_db_user:jHVhucjfLIN1Q9Jz@cluster0.lwly6jg.mongodb.net/?appName=Cluster0")
+# MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 client = MongoClient(MONGO_URI)
 db = client["attendance_db"]
 
