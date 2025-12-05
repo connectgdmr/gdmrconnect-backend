@@ -1,52 +1,40 @@
 # utils.py
 import os
-import smtplib
-import ssl
-from email.message import EmailMessage
-import random
-import string
+import requests
 
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))   # 465 for SSL, 587 for STARTTLS
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASS = os.getenv("SMTP_PASS")
-SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "10"))  # seconds
+BREVO_API_KEY = os.getenv("BREVO_API_KEY")
+BREVO_URL = "https://api.brevo.com/v3/smtp/email"
 
-def send_email(to_email: str, subject: str, body: str, from_name: str = None) -> bool:
-    """Send email. Return True if success, False otherwise.
-       Important: never call sys.exit() here."""
-    if not (SMTP_USER and SMTP_PASS):
-        print("Email not sent: SMTP_USER or SMTP_PASS not configured.")
+def send_email(to_email: str, subject: str, body: str, from_name="GDMR Attendance App"):
+    """Send email via Brevo API. Returns True/False."""
+    if not BREVO_API_KEY:
+        print("Brevo API key missing")
         return False
+
+    headers = {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json",
+    }
+
+    payload = {
+        "sender": {"name": from_name, "email": "no-reply@gdmrconnect.com"},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "textContent": body
+    }
 
     try:
-        msg = EmailMessage()
-        msg["From"] = f"{from_name} <{SMTP_USER}>" if from_name else SMTP_USER
-        msg["To"] = to_email
-        msg["Subject"] = subject
-        msg.set_content(body)
-
-        # Use SMTP_SSL if port 465, otherwise use STARTTLS (587)
-        if SMTP_PORT == 465:
-            context = ssl.create_default_context()
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT, context=context) as smtp:
-                smtp.login(SMTP_USER, SMTP_PASS)
-                smtp.send_message(msg)
-        else:
-            # STARTTLS flow
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as smtp:
-                smtp.ehlo()
-                smtp.starttls(context=ssl.create_default_context())
-                smtp.ehlo()
-                smtp.login(SMTP_USER, SMTP_PASS)
-                smtp.send_message(msg)
-
-        return True
+        res = requests.post(BREVO_URL, headers=headers, json=payload, timeout=10)
+        print("Brevo response:", res.status_code, res.text)
+        return res.status_code in (200, 201)
     except Exception as e:
-        # Log details for debugging but DO NOT exit the process
-        print("send_email error:", repr(e))
+        print("Brevo email error:", e)
         return False
 
+
+# Password Generator
+import random, string
 def generate_random_password(length: int = 10) -> str:
     chars = string.ascii_letters + string.digits + "!@#$%&*"
     return "".join(random.choice(chars) for _ in range(length))
