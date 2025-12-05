@@ -6,3 +6,4 @@ gunicorn
 flask-bcrypt
 pytz
 requests
+PyJWT
