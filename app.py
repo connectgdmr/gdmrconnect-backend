@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from flask import send_from_directory
 import pytz
 from flask_bcrypt import Bcrypt
+import threading  # <--- ADDED THIS FOR BACKGROUND EMAILS
 
 load_dotenv()
 
@@ -174,7 +175,7 @@ def login():
         }
     })
 
-# Admin: add employee
+# Admin: add employee (UPDATED with Threading)
 @app.route("/api/admin/employees", methods=["POST"])
 @token_required
 def add_employee():
@@ -203,14 +204,13 @@ def add_employee():
         "created_at": now
     }
     res = users_col.insert_one(user_doc)
-    try:
-        send_email(
-            to_email=email,
-            subject="Your account created - Attendance App",
-            body=f"Hello {name},\n\nYour GDMR employee account has been created Successfully.\nEmail: {email}\nPassword: {password}\n\nPlease login."
-        )
-    except Exception as e:
-        print("Email send failed:", e)
+
+    # ✅ FIX: Send email in background thread so UI doesn't freeze
+    email_subject = "Your account created - Attendance App"
+    email_body = f"Hello {name},\n\nYour GDMR employee account has been created Successfully.\nEmail: {email}\nPassword: {password}\n\nPlease login."
+    
+    threading.Thread(target=send_email, args=(email, email_subject, email_body)).start()
+
     return jsonify({"message": "Employee created", "id": str(res.inserted_id)}), 201
 
 # Admin get employees (NOW INCLUDES MANAGERS)
@@ -570,7 +570,6 @@ def delete_manager(manager_id):
 @app.route("/api/attendance/auto-absent", methods=["POST"])
 def auto_mark_absent():
     today = datetime.now(IST).date()
-    # Check employees AND managers
     all_users = users_col.find({"role": {"$in": ["employee", "manager"]}})
 
     for emp in all_users:
