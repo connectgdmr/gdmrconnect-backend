@@ -1,48 +1,52 @@
-import smtplib
+# utils.py
 import os
-from email.mime.text import MIMEText
+import smtplib
+import ssl
+from email.message import EmailMessage
 import random
 import string
-from dotenv import load_dotenv
 
-load_dotenv()
-
-SMTP_HOST = os.getenv("SMTP_HOST")
-# Default to 465 if not set, as it's safer for Railway/Gmail
-SMTP_PORT = int(os.getenv("SMTP_PORT", 465)) 
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))   # 465 for SSL, 587 for STARTTLS
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
-FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USER)
+SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "10"))  # seconds
 
-# Debug print
-print(f"SMTP Config: Host={SMTP_HOST}, Port={SMTP_PORT}, User={SMTP_USER}, PassLoaded={bool(SMTP_PASS)}")
-
-def send_email(to_email, subject, body):
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-        print("❌ SMTP keys missing in environment variables.")
-        return # Don't crash the app, just log it
-
-    msg = MIMEText(body)
-    msg['Subject'] = subject
-    msg['From'] = FROM_EMAIL
-    msg['To'] = to_email
+def send_email(to_email: str, subject: str, body: str, from_name: str = None) -> bool:
+    """Send email. Return True if success, False otherwise.
+       Important: never call sys.exit() here."""
+    if not (SMTP_USER and SMTP_PASS):
+        print("Email not sent: SMTP_USER or SMTP_PASS not configured.")
+        return False
 
     try:
-        # ✅ AUTO-DETECT: Use SSL for Port 465, otherwise use TLS
+        msg = EmailMessage()
+        msg["From"] = f"{from_name} <{SMTP_USER}>" if from_name else SMTP_USER
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.set_content(body)
+
+        # Use SMTP_SSL if port 465, otherwise use STARTTLS (587)
         if SMTP_PORT == 465:
-            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT, context=context) as smtp:
+                smtp.login(SMTP_USER, SMTP_PASS)
+                smtp.send_message(msg)
         else:
-            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
-            server.starttls() # Upgrade connection for 587
+            # STARTTLS flow
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as smtp:
+                smtp.ehlo()
+                smtp.starttls(context=ssl.create_default_context())
+                smtp.ehlo()
+                smtp.login(SMTP_USER, SMTP_PASS)
+                smtp.send_message(msg)
 
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(FROM_EMAIL, [to_email], msg.as_string())
-        server.quit()
-        print(f"✅ Email sent successfully to {to_email}")
+        return True
     except Exception as e:
-        print(f"❌ Failed to send email: {e}")
-        # We catch the error so the User Add process doesn't crash
+        # Log details for debugging but DO NOT exit the process
+        print("send_email error:", repr(e))
+        return False
 
-def generate_random_password(length=10):
-    chars = string.ascii_letters + string.digits + "!@#$%&"
-    return ''.join(random.choice(chars) for _ in range(length))
+def generate_random_password(length: int = 10) -> str:
+    chars = string.ascii_letters + string.digits + "!@#$%&*"
+    return "".join(random.choice(chars) for _ in range(length))
