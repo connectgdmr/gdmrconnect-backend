@@ -1,20 +1,7 @@
-# Flask
-# flask-cors
-# python-dotenv
-# pymongo
-# werkzeug
-# PyJWT
-# pytz
-# flask-bcrypt
-# gunicorn
-
-Flask
-flask-cors
+flask
+pymongo
 python-dotenv
-pymongo[srv]
-dnspython
-werkzeug
-PyJWT
-pytz
-flask-bcrypt
 gunicorn
+flask-bcrypt
+pytz
+requests
