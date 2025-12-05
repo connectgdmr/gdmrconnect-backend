@@ -25,11 +25,11 @@ from flask_cors import CORS
 CORS(app, resources={
     r"/*": {
         "origins": [
-            "https://gdmrconnect.com",
-            "https://*.netlify.app",
-            "http://localhost:3000",
-            "http://localhost:5173",   # ADD THIS
-            "http://127.0.0.1:5173"    # ADD THIS TOO
+            "https://gdmrconnect.com",       # Your custom domain
+            "https://www.gdmrconnect.com",   # Also allow www
+            "https://*.netlify.app",         # Any Netlify preview URL
+            "http://localhost:5173",         # Local testing
+            "http://127.0.0.1:5173"
         ],
         "supports_credentials": True,
         "allow_headers": ["Content-Type", "Authorization"],
