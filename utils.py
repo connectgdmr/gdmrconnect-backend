@@ -28,8 +28,13 @@ def send_email(to_email, subject, body):
     msg['From'] = FROM_EMAIL
     msg['To'] = to_email
 
-    s = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
-    s.starttls()
+    # ✅ FIX: Automatically use SSL if Port is 465
+    if SMTP_PORT == 465:
+        s = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
+    else:
+        s = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        s.starttls()
+
     s.login(SMTP_USER, SMTP_PASS)
     s.sendmail(FROM_EMAIL, [to_email], msg.as_string())
     s.quit()
