@@ -22,10 +22,10 @@ bcrypt = Bcrypt(app)
 CORS(app, resources={
     r"/*": {
         "origins": [
-            "https://gdmrconnect.com",       
-            "https://www.gdmrconnect.com",   
-            "https://*.netlify.app",         
-            "http://localhost:5173",         
+            "https://gdmrconnect.com",       # Your custom domain
+            "https://www.gdmrconnect.com",   # Also allow www
+            "https://*.netlify.app",         # Any Netlify preview URL
+            "http://localhost:5173",         # Local testing
             "http://127.0.0.1:5173"
         ],
         "supports_credentials": True,
@@ -36,6 +36,7 @@ CORS(app, resources={
 
 app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "replace-this-secret")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://jinugdmr_db_user:jHVhucjfLIN1Q9Jz@cluster0.lwly6jg.mongodb.net/?appName=Cluster0")
+# MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 client = MongoClient(MONGO_URI)
 db = client["attendance_db"]
 
