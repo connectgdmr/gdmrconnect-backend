@@ -298,10 +298,10 @@ def checkin_photo():
     now_ist = datetime.now(IST)
     today = now_ist.date()
 
-    start_time = now_ist.replace(hour=9, minute=0, second=0, microsecond=0)
-    end_time = now_ist.replace(hour=11, minute=30, second=0, microsecond=0)
+    start_time = now_ist.replace(hour=9, minute=30, second=0, microsecond=0)
+    end_time = now_ist.replace(hour=10, minute=30, second=0, microsecond=0)
     half_day_start = now_ist.replace(hour=13, minute=0, second=0, microsecond=0)
-    half_day_end = now_ist.replace(hour=14, minute=0, second=0, microsecond=0)
+    half_day_end = now_ist.replace(hour=14, minute=30, second=0, microsecond=0)
 
     if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": str(today)}):
         return jsonify({"message": "Already checked in!"}), 400
@@ -369,7 +369,7 @@ def checkout_photo():
         return jsonify({"message": "Already checked out!"}), 400
 
     half_day_start = now_ist.replace(hour=13, minute=0, second=0, microsecond=0)
-    half_day_end = now_ist.replace(hour=14, minute=0, second=0, microsecond=0)
+    half_day_end = now_ist.replace(hour=14, minute=30, second=0, microsecond=0)
 
     day_type = checkin.get("day_type", "full")
 
