@@ -119,14 +119,16 @@ def register_admin():
         "password": hashed,
         "role": "admin",
         "department": "",
-        "position": ""
+        "position": "",
+        "late_checkin_count_monthly": 0,
+        "last_late_checkin_month": None,
     }
     res = users_col.insert_one(user_doc)
     return jsonify({"message": "Admin created", "id": str(res.inserted_id)}), 201
 
 
 # -------------------------------------------------------------
-# MANAGER REGISTER
+# MANAGER REGISTER (REVISION 3: Department field added)
 # -------------------------------------------------------------
 @app.route("/api/register-manager", methods=["POST"])
 @token_required
@@ -138,6 +140,7 @@ def register_manager():
     name = data.get("name")
     email = data.get("email")
     password = data.get("password")
+    department = data.get("department", "Management") # REVISION 3
 
     if not name or not email or not password:
         return jsonify({"message": "All fields are required"}), 400
@@ -152,9 +155,11 @@ def register_manager():
         "email": email,
         "password": hashed_pw,
         "role": "manager",
-        "department": "Management",
+        "department": department, # REVISION 3
         "position": "Manager",
-        "created_at": datetime.now(timezone.utc)
+        "created_at": datetime.now(timezone.utc),
+        "late_checkin_count_monthly": 0, # Initialize for Revision 1
+        "last_late_checkin_month": None, # Initialize for Revision 1
     }
 
     users_col.insert_one(new_user)
@@ -190,7 +195,7 @@ def login():
 
 
 # -------------------------------------------------------------
-# ADMIN: ADD EMPLOYEE
+# ADMIN: ADD EMPLOYEE (REVISION 3: Manager ID, REVISION 5: Email Template)
 # -------------------------------------------------------------
 @app.route("/api/admin/employees", methods=["POST"])
 @token_required
@@ -203,6 +208,7 @@ def add_employee():
     email = data.get("email")
     department = data.get("department", "")
     position = data.get("position", "")
+    manager_id = data.get("manager_id") # REVISION 3: Optional Manager ID
 
     if users_col.find_one({"email": email}):
         return jsonify({"message": "User with this email already exists"}), 400
@@ -217,14 +223,26 @@ def add_employee():
         "role": "employee",
         "department": department,
         "position": position,
-        "created_at": datetime.now(timezone.utc)
+        "created_at": datetime.now(timezone.utc),
+        "manager_id": manager_id, # REVISION 3: Store Manager ID (Optional)
+        "late_checkin_count_monthly": 0, # Initialize for Revision 1
+        "last_late_checkin_month": None, # Initialize for Revision 1
     }
 
     res = users_col.insert_one(user_doc)
 
-    # Background email
-    subject = "Your account created - Attendance App"
-    body = f"Hello {name},\n\nYour GDMR employee account has been created.\nEmail: {email}\nPassword: {password}\n\nPlease login."
+    # Background email (REVISION 5: Revised Template)
+    subject = "Welcome to GDMR Connect: Your New Account Credentials"
+    body = (
+        f"Dear {name},\n\n"
+        "Your new employee account for the GDMR Connect Attendance App has been successfully created.\n\n"
+        "Please use the following credentials to log in:\n"
+        f"Username (Email): {email}\n"
+        f"Temporary Password: {password}\n\n"
+        "We recommend logging in as soon as possible and updating your password.\n\n"
+        "Thank you,\n"
+        "The GDMR Connect Team"
+    )
 
     threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
 
@@ -232,7 +250,7 @@ def add_employee():
 
 
 # -------------------------------------------------------------
-# ADMIN: LIST EMPLOYEES
+# ADMIN: LIST EMPLOYEES (REVISION 3: Include manager_name)
 # -------------------------------------------------------------
 @app.route("/api/admin/employees", methods=["GET"])
 @token_required
@@ -240,17 +258,45 @@ def list_employees():
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
+    # Fetch all managers once for quick lookup (REVISION 3)
+    managers = {str(m["_id"]): m["name"] for m in users_col.find({"role": "manager"})}
+
     rows = []
     for u in users_col.find({"role": {"$in": ["employee", "manager"]}}):
         u["_id"] = str(u["_id"])
-        del u["password"]
+        if "password" in u:
+            del u["password"]
+        
+        # Add manager name to employee documents (REVISION 3)
+        manager_id = u.get("manager_id")
+        u["manager_name"] = managers.get(manager_id) if manager_id else None
+
         rows.append(u)
 
     return jsonify(rows)
 
 
 # -------------------------------------------------------------
-# EDIT EMPLOYEE
+# ADMIN: LIST MANAGERS (NEW ENDPOINT for frontend form - REVISION 3)
+# -------------------------------------------------------------
+@app.route("/api/admin/managers", methods=["GET"])
+@token_required
+def list_managers():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    managers = []
+    for m in users_col.find({"role": "manager"}):
+        m["_id"] = str(m["_id"])
+        if "password" in m:
+            del m["password"]
+        managers.append(m)
+
+    return jsonify(managers)
+
+
+# -------------------------------------------------------------
+# EDIT EMPLOYEE (REVISION 3: Allow updating manager_id)
 # -------------------------------------------------------------
 @app.route("/api/admin/employees/<emp_id>", methods=["PUT"])
 @token_required
@@ -261,11 +307,17 @@ def edit_employee(emp_id):
     data = request.json
     update = {}
 
-    for k in ["name", "department", "position", "email"]:
-        if data.get(k):
+    for k in ["name", "department", "position", "email", "manager_id"]: # manager_id added
+        if k in data:
             update[k] = data[k]
-
-    users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": update})
+    
+    # Handle case where manager_id is explicitly set to null/empty string to unassign
+    if "manager_id" in data and not data["manager_id"]:
+         update["manager_id"] = None
+         
+    if update:
+        users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": update})
+    
     return jsonify({"message": "Updated"})
 
 
@@ -286,7 +338,7 @@ def delete_employee(emp_id):
 
 
 # -------------------------------------------------------------
-# CHECK-IN WITH PHOTO
+# CHECK-IN WITH PHOTO (REVISION 1: Attendance Revision Limit)
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkin-photo", methods=["POST"])
 @token_required
@@ -298,16 +350,50 @@ def checkin_photo():
     now_ist = datetime.now(IST)
     today = now_ist.date()
 
-    start_time = now_ist.replace(hour=9, minute=30, second=0, microsecond=0)
-    end_time = now_ist.replace(hour=10, minute=30, second=0, microsecond=0)
+    start_time = now_ist.replace(hour=9, minute=0, second=0, microsecond=0)
+    end_time = now_ist.replace(hour=11, minute=30, second=0, microsecond=0)
     half_day_start = now_ist.replace(hour=13, minute=0, second=0, microsecond=0)
-    half_day_end = now_ist.replace(hour=14, minute=30, second=0, microsecond=0)
+    half_day_end = now_ist.replace(hour=14, minute=0, second=0, microsecond=0)
+    
+    # Standard check-in marker for determining late status
+    LATE_CHECKIN_TIME = now_ist.replace(hour=9, minute=0, second=0, microsecond=0)
+
 
     if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": str(today)}):
         return jsonify({"message": "Already checked in!"}), 400
 
     if now_ist < start_time:
         return jsonify({"message": "Check-in allowed after 9:00 AM"}), 400
+
+    # --- REVISION 1: Attendance Revision Limit (Late Check-in Limit) ---
+    is_late_checkin = now_ist > LATE_CHECKIN_TIME
+    user_doc = request.user
+    current_month = now_ist.strftime("%Y-%m")
+    status_indicator = "On Time"
+
+    if is_late_checkin:
+        count = user_doc.get("late_checkin_count_monthly", 0)
+        last_month = user_doc.get("last_late_checkin_month")
+
+        # Reset count if new month
+        if last_month != current_month:
+            count = 0
+        
+        new_count = count + 1
+
+        if new_count > 3:
+            return jsonify({
+                "message": f"Late Check-in failed. You have reached the maximum limit of 3 attendance revisions for the current month ({current_month})."
+            }), 403
+        
+        # Update counter and month
+        users_col.update_one({"_id": ObjectId(uid)}, {"$set": {
+            "late_checkin_count_monthly": new_count,
+            "last_late_checkin_month": current_month
+        }})
+        status_indicator = "Late" # For Revision 4
+    # --- END REVISION 1 ---
+
 
     if start_time <= now_ist <= end_time:
         checkin_type = "full"
@@ -342,14 +428,15 @@ def checkin_photo():
         "date": str(today),
         "day_type": checkin_type,
         "time": datetime.now(timezone.utc),
-        "photo_url": f"/attendance_photos/{filename}"
+        "photo_url": f"/attendance_photos/{filename}",
+        "status_indicator": status_indicator # For Revision 4
     })
 
     return jsonify({"message": f"Checked in ({checkin_type})"}), 200
 
 
 # -------------------------------------------------------------
-# CHECK-OUT PHOTO
+# CHECK-OUT PHOTO (REVISION 4: Early Checkout Indicator)
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkout-photo", methods=["POST"])
 @token_required
@@ -369,8 +456,16 @@ def checkout_photo():
         return jsonify({"message": "Already checked out!"}), 400
 
     half_day_start = now_ist.replace(hour=13, minute=0, second=0, microsecond=0)
-    half_day_end = now_ist.replace(hour=14, minute=30, second=0, microsecond=0)
+    half_day_end = now_ist.replace(hour=14, minute=0, second=0, microsecond=0)
+    
+    # Standard check-out marker for determining early status (Assuming full day ends at 5 PM IST)
+    STANDARD_CHECKOUT_TIME = now_ist.replace(hour=17, minute=0, second=0, microsecond=0)
+    is_early_checkout = now_ist < STANDARD_CHECKOUT_TIME
+    status_indicator = "On Time"
 
+    if is_early_checkout:
+        status_indicator = "Early" # For Revision 4
+        
     day_type = checkin.get("day_type", "full")
 
     if half_day_start <= now_ist <= half_day_end:
@@ -394,7 +489,8 @@ def checkout_photo():
         "date": str(today),
         "time": datetime.now(timezone.utc),
         "photo_url": f"/attendance_photos/{filename}",
-        "day_type": day_type
+        "day_type": day_type,
+        "status_indicator": status_indicator # For Revision 4
     })
 
     return jsonify({"message": f"Checked out ({day_type})"}), 200
@@ -406,7 +502,7 @@ def serve_attendance_photo(filename):
 
 
 # -------------------------------------------------------------
-# APPLY LEAVE
+# APPLY LEAVE (REVISION 2: 7-day retrospective limit)
 # -------------------------------------------------------------
 @app.route("/api/leaves", methods=["POST"])
 @token_required
@@ -414,12 +510,27 @@ def apply_leave():
     if request.user.get("role") not in ["employee", "manager"]:
         return jsonify({"message": "Unauthorized"}), 403
 
-    date = request.form.get("date")
+    date_str = request.form.get("date")
     leave_type = request.form.get("type", "full")
     reason = request.form.get("reason", "")
 
-    if not date:
+    if not date_str:
         return jsonify({"message": "Date required"}), 400
+
+    # --- REVISION 2: Post-Leave Application Limit (Max 7 days after leave date) ---
+    try:
+        leave_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({"message": "Invalid date format."}), 400
+
+    now_ist_date = datetime.now(IST).date()
+    max_past_date_for_application = now_ist_date - timedelta(days=7) 
+
+    if leave_date < max_past_date_for_application:
+        return jsonify({
+            "message": f"Leave application for past dates is limited to 7 days. Cannot apply for leave before {max_past_date_for_application.isoformat()}."
+        }), 400
+    # --- END REVISION 2 ---
 
     attachment_url = None
     file = request.files.get("attachment")
@@ -433,7 +544,7 @@ def apply_leave():
 
     leave = {
         "user_id": str(request.user["_id"]),
-        "date": date,
+        "date": date_str,
         "type": leave_type,
         "reason": reason,
         "status": "Pending",
@@ -457,14 +568,21 @@ def admin_view_leaves():
         return jsonify({"message": "Unauthorized"}), 403
 
     rows = []
+    # Fetch all employees/managers once for lookup
+    employees = {str(e["_id"]): e for e in users_col.find({"role": {"$in": ["employee", "manager"]}})}
+    
     for l in leaves_col.find():
         l["_id"] = str(l["_id"])
         user_id = l.get("user_id")
-        try:
-            user = users_col.find_one({"_id": ObjectId(user_id)})
-            l["employee_name"] = user["name"] if user else "Unknown"
-        except:
+        user = employees.get(user_id)
+        
+        if user:
+            l["employee_name"] = user["name"]
+            l["employee_department"] = user.get("department") # For Revision 3
+        else:
             l["employee_name"] = "Unknown"
+            l["employee_department"] = ""
+            
         rows.append(l)
 
     return jsonify(rows), 200
@@ -532,6 +650,28 @@ def update_leave(leave_id):
         print("Email error:", e)
 
     return jsonify({"message": "Updated"})
+
+
+# -------------------------------------------------------------
+# MANAGER: LIST MY EMPLOYEES (NEW ENDPOINT - REVISION 6)
+# -------------------------------------------------------------
+@app.route("/api/manager/my-employees", methods=["GET"])
+@token_required
+def manager_my_employees():
+    if request.user.get("role") != "manager":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    manager_id = str(request.user["_id"])
+    
+    rows = []
+    # Find employees whose manager_id matches the logged-in manager's _id
+    for u in users_col.find({"manager_id": manager_id, "role": "employee"}):
+        u["_id"] = str(u["_id"])
+        if "password" in u:
+            del u["password"]
+        rows.append(u)
+
+    return jsonify(rows)
 
 
 # -------------------------------------------------------------
