@@ -128,7 +128,7 @@ def register_admin():
 
 
 # -------------------------------------------------------------
-# MANAGER REGISTER (REVISION 3: Department field added)
+# MANAGER REGISTER (REVISION 3/New: Department field added)
 # -------------------------------------------------------------
 @app.route("/api/register-manager", methods=["POST"])
 @token_required
@@ -140,10 +140,10 @@ def register_manager():
     name = data.get("name")
     email = data.get("email")
     password = data.get("password")
-    department = data.get("department", "Management") # REVISION 3
+    department = data.get("department", "Management") # NEW: Manager Department
 
-    if not name or not email or not password:
-        return jsonify({"message": "All fields are required"}), 400
+    if not name or not email or not password or not department:
+        return jsonify({"message": "Name, Email, Password, and Department are required"}), 400
 
     if users_col.find_one({"email": email}):
         return jsonify({"message": "Email already exists"}), 400
@@ -155,11 +155,11 @@ def register_manager():
         "email": email,
         "password": hashed_pw,
         "role": "manager",
-        "department": department, # REVISION 3
+        "department": department,
         "position": "Manager",
         "created_at": datetime.now(timezone.utc),
-        "late_checkin_count_monthly": 0, # Initialize for Revision 1
-        "last_late_checkin_month": None, # Initialize for Revision 1
+        "late_checkin_count_monthly": 0, 
+        "last_late_checkin_month": None,
     }
 
     users_col.insert_one(new_user)
@@ -195,7 +195,7 @@ def login():
 
 
 # -------------------------------------------------------------
-# ADMIN: ADD EMPLOYEE (REVISION 3: Manager ID, REVISION 5: Email Template)
+# ADMIN: ADD EMPLOYEE
 # -------------------------------------------------------------
 @app.route("/api/admin/employees", methods=["POST"])
 @token_required
@@ -208,7 +208,7 @@ def add_employee():
     email = data.get("email")
     department = data.get("department", "")
     position = data.get("position", "")
-    manager_id = data.get("manager_id") # REVISION 3: Optional Manager ID
+    manager_id = data.get("manager_id") 
 
     if users_col.find_one({"email": email}):
         return jsonify({"message": "User with this email already exists"}), 400
@@ -224,9 +224,9 @@ def add_employee():
         "department": department,
         "position": position,
         "created_at": datetime.now(timezone.utc),
-        "manager_id": manager_id, # REVISION 3: Store Manager ID (Optional)
-        "late_checkin_count_monthly": 0, # Initialize for Revision 1
-        "last_late_checkin_month": None, # Initialize for Revision 1
+        "manager_id": manager_id,
+        "late_checkin_count_monthly": 0, 
+        "last_late_checkin_month": None,
     }
 
     res = users_col.insert_one(user_doc)
@@ -250,7 +250,7 @@ def add_employee():
 
 
 # -------------------------------------------------------------
-# ADMIN: LIST EMPLOYEES (REVISION 3: Include manager_name)
+# ADMIN: LIST EMPLOYEES
 # -------------------------------------------------------------
 @app.route("/api/admin/employees", methods=["GET"])
 @token_required
@@ -258,7 +258,6 @@ def list_employees():
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
-    # Fetch all managers once for quick lookup (REVISION 3)
     managers = {str(m["_id"]): m["name"] for m in users_col.find({"role": "manager"})}
 
     rows = []
@@ -267,7 +266,6 @@ def list_employees():
         if "password" in u:
             del u["password"]
         
-        # Add manager name to employee documents (REVISION 3)
         manager_id = u.get("manager_id")
         u["manager_name"] = managers.get(manager_id) if manager_id else None
 
@@ -277,7 +275,7 @@ def list_employees():
 
 
 # -------------------------------------------------------------
-# ADMIN: LIST MANAGERS (NEW ENDPOINT for frontend form - REVISION 3)
+# ADMIN: LIST MANAGERS
 # -------------------------------------------------------------
 @app.route("/api/admin/managers", methods=["GET"])
 @token_required
@@ -296,7 +294,7 @@ def list_managers():
 
 
 # -------------------------------------------------------------
-# EDIT EMPLOYEE (REVISION 3: Allow updating manager_id)
+# EDIT EMPLOYEE
 # -------------------------------------------------------------
 @app.route("/api/admin/employees/<emp_id>", methods=["PUT"])
 @token_required
@@ -307,11 +305,10 @@ def edit_employee(emp_id):
     data = request.json
     update = {}
 
-    for k in ["name", "department", "position", "email", "manager_id"]: # manager_id added
+    for k in ["name", "department", "position", "email", "manager_id"]:
         if k in data:
             update[k] = data[k]
     
-    # Handle case where manager_id is explicitly set to null/empty string to unassign
     if "manager_id" in data and not data["manager_id"]:
          update["manager_id"] = None
          
@@ -338,7 +335,7 @@ def delete_employee(emp_id):
 
 
 # -------------------------------------------------------------
-# CHECK-IN WITH PHOTO (REVISION 1: Attendance Revision Limit)
+# CHECK-IN WITH PHOTO (Revision 1/New: Late Check-in Status Timing)
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkin-photo", methods=["POST"])
 @token_required
@@ -350,28 +347,31 @@ def checkin_photo():
     now_ist = datetime.now(IST)
     today = now_ist.date()
 
-    start_time = now_ist.replace(hour=9, minute=0, second=0, microsecond=0)
-    end_time = now_ist.replace(hour=11, minute=30, second=0, microsecond=0)
-    half_day_start = now_ist.replace(hour=13, minute=0, second=0, microsecond=0)
-    half_day_end = now_ist.replace(hour=14, minute=0, second=0, microsecond=0)
+    # Define check-in times (IST)
+    START_TIME = now_ist.replace(hour=9, minute=0, second=0, microsecond=0)
+    END_TIME = now_ist.replace(hour=11, minute=30, second=0, microsecond=0)
+    HALF_DAY_START = now_ist.replace(hour=13, minute=0, second=0, microsecond=0)
+    HALF_DAY_END = now_ist.replace(hour=14, minute=0, second=0, microsecond=0)
     
-    # Standard check-in marker for determining late status
-    LATE_CHECKIN_TIME = now_ist.replace(hour=9, minute=0, second=0, microsecond=0)
-
-
+    # Check if already checked in
     if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": str(today)}):
         return jsonify({"message": "Already checked in!"}), 400
 
-    if now_ist < start_time:
+    # Check for early attempt
+    if now_ist < START_TIME:
         return jsonify({"message": "Check-in allowed after 9:00 AM"}), 400
 
-    # --- REVISION 1: Attendance Revision Limit (Late Check-in Limit) ---
-    is_late_checkin = now_ist > LATE_CHECKIN_TIME
-    user_doc = request.user
-    current_month = now_ist.strftime("%Y-%m")
+    # Determine status_indicator and check revision limit
     status_indicator = "On Time"
-
-    if is_late_checkin:
+    
+    # NEW LOGIC: Only mark as Late if it's AFTER START_TIME but BEFORE END_TIME
+    if now_ist > START_TIME and now_ist <= END_TIME:
+        status_indicator = "Late"
+        
+        # --- REVISION 1: Attendance Revision Limit (Late Check-in Limit) ---
+        user_doc = users_col.find_one({"_id": ObjectId(uid)})
+        current_month = now_ist.strftime("%Y-%m")
+        
         count = user_doc.get("late_checkin_count_monthly", 0)
         last_month = user_doc.get("last_late_checkin_month")
 
@@ -391,15 +391,16 @@ def checkin_photo():
             "late_checkin_count_monthly": new_count,
             "last_late_checkin_month": current_month
         }})
-        status_indicator = "Late" # For Revision 4
-    # --- END REVISION 1 ---
+        # --- END REVISION 1 ---
 
-
-    if start_time <= now_ist <= end_time:
+    # Determine checkin_type based on time window
+    if now_ist <= END_TIME:
         checkin_type = "full"
-    elif half_day_start <= now_ist <= half_day_end:
+    elif HALF_DAY_START <= now_ist <= HALF_DAY_END:
         checkin_type = "half-day"
+        status_indicator = "On Time" # Don't mark as late if half-day window starts much later
     else:
+        # Check-in window closed, mark absent
         if not attendance_col.find_one({"user_id": uid, "type": "absent", "date": str(today)}):
             attendance_col.insert_one({
                 "user_id": uid,
@@ -429,14 +430,14 @@ def checkin_photo():
         "day_type": checkin_type,
         "time": datetime.now(timezone.utc),
         "photo_url": f"/attendance_photos/{filename}",
-        "status_indicator": status_indicator # For Revision 4
+        "status_indicator": status_indicator 
     })
 
     return jsonify({"message": f"Checked in ({checkin_type})"}), 200
 
 
 # -------------------------------------------------------------
-# CHECK-OUT PHOTO (REVISION 4: Early Checkout Indicator)
+# CHECK-OUT PHOTO
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkout-photo", methods=["POST"])
 @token_required
@@ -455,20 +456,24 @@ def checkout_photo():
     if attendance_col.find_one({"user_id": uid, "type": "checkout", "date": str(today)}):
         return jsonify({"message": "Already checked out!"}), 400
 
-    half_day_start = now_ist.replace(hour=13, minute=0, second=0, microsecond=0)
-    half_day_end = now_ist.replace(hour=14, minute=0, second=0, microsecond=0)
-    
-    # Standard check-out marker for determining early status (Assuming full day ends at 5 PM IST)
+    HALF_DAY_START = now_ist.replace(hour=13, minute=0, second=0, microsecond=0)
+    HALF_DAY_END = now_ist.replace(hour=14, minute=0, second=0, microsecond=0)
+
+    # Standard check-out marker (Assuming full day ends at 5 PM IST)
     STANDARD_CHECKOUT_TIME = now_ist.replace(hour=17, minute=0, second=0, microsecond=0)
-    is_early_checkout = now_ist < STANDARD_CHECKOUT_TIME
+    
+    day_type = checkin.get("day_type", "full")
     status_indicator = "On Time"
 
-    if is_early_checkout:
-        status_indicator = "Early" # For Revision 4
-        
-    day_type = checkin.get("day_type", "full")
+    # Check for early checkout based on checkin's day_type
+    if day_type == "full" and now_ist < STANDARD_CHECKOUT_TIME:
+        status_indicator = "Early" 
+    elif day_type == "half-day":
+        # Adjust early check-out logic for half-day employees if needed, 
+        # or leave as "On Time" if they checked in during the half-day window.
+        pass
 
-    if half_day_start <= now_ist <= half_day_end:
+    if HALF_DAY_START <= now_ist <= HALF_DAY_END:
         day_type = "half-day"
         attendance_col.update_one({"_id": checkin["_id"]}, {"$set": {"day_type": "half-day"}})
 
@@ -490,7 +495,7 @@ def checkout_photo():
         "time": datetime.now(timezone.utc),
         "photo_url": f"/attendance_photos/{filename}",
         "day_type": day_type,
-        "status_indicator": status_indicator # For Revision 4
+        "status_indicator": status_indicator
     })
 
     return jsonify({"message": f"Checked out ({day_type})"}), 200
@@ -568,7 +573,6 @@ def admin_view_leaves():
         return jsonify({"message": "Unauthorized"}), 403
 
     rows = []
-    # Fetch all employees/managers once for lookup
     employees = {str(e["_id"]): e for e in users_col.find({"role": {"$in": ["employee", "manager"]}})}
     
     for l in leaves_col.find():
@@ -578,7 +582,7 @@ def admin_view_leaves():
         
         if user:
             l["employee_name"] = user["name"]
-            l["employee_department"] = user.get("department") # For Revision 3
+            l["employee_department"] = user.get("department")
         else:
             l["employee_name"] = "Unknown"
             l["employee_department"] = ""
@@ -653,7 +657,7 @@ def update_leave(leave_id):
 
 
 # -------------------------------------------------------------
-# MANAGER: LIST MY EMPLOYEES (NEW ENDPOINT - REVISION 6)
+# MANAGER: LIST MY EMPLOYEES
 # -------------------------------------------------------------
 @app.route("/api/manager/my-employees", methods=["GET"])
 @token_required
@@ -664,7 +668,6 @@ def manager_my_employees():
     manager_id = str(request.user["_id"])
     
     rows = []
-    # Find employees whose manager_id matches the logged-in manager's _id
     for u in users_col.find({"manager_id": manager_id, "role": "employee"}):
         u["_id"] = str(u["_id"])
         if "password" in u:
