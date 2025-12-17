@@ -7,3 +7,5 @@ flask-bcrypt
 pytz
 requests
 PyJWT
+Flask-Limiter
+Flask-Talisman
