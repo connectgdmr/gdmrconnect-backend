@@ -1,10 +1,7 @@
 # backend/app.py
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-from flask_talisman import Talisman
-import base64, os, logging
+import base64, os
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -12,66 +9,36 @@ import jwt
 from functools import wraps
 from utils import send_email, generate_random_password
 from bson import ObjectId
-from datetime import datetime, timedelta, timezone, time
+from datetime import datetime, timedelta, timezone, time  # Added 'time'
+from flask import send_from_directory
 import pytz
 from flask_bcrypt import Bcrypt
 import threading
-
-# 1. SETUP LOGGING (Commercial Requirement: System Logs)
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(levelname)s - %(module)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 load_dotenv()
 
 app = Flask(__name__)
 bcrypt = Bcrypt(app)
 
-# 2. SECURITY HEADERS (Commercial Requirement: OWASP Protection)
-# force_https=True ensures the API only responds over SSL in production.
-# content_security_policy=None allows the API to serve mixed content if absolutely necessary,
-# but strictly forces HTTPS for the connection itself.
-Talisman(app, content_security_policy=None, force_https=True)
-
-# 3. RATE LIMITING (Commercial Requirement: Anti-Brute Force)
-# Uses in-memory storage for simplicity. For multi-worker production (e.g., Gunicorn with multiple workers),
-# you should ideally use Redis: storage_uri="redis://localhost:6379"
-limiter = Limiter(
-    get_remote_address,
-    app=app,
-    default_limits=["2000 per day", "500 per hour"], # Global default
-    storage_uri="memory://"
-)
-
-# 4. DYNAMIC CORS (Commercial Requirement: Origin Restriction)
-# In your .env file, set ALLOWED_ORIGINS=https://gdmrconnect.com,https://your-app.netlify.app
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
-
 CORS(app, resources={
     r"/*": {
-        "origins": ALLOWED_ORIGINS,
+        "origins": [
+            "https://gdmrconnect.com",
+            "https://www.gdmrconnect.com",
+            "https://*.netlify.app",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173"
+        ],
         "supports_credentials": True,
         "allow_headers": ["Content-Type", "Authorization"],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
     }
 })
 
-app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "replace-this-secret-key-in-production")
+app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "replace-this-secret")
 MONGO_URI = os.getenv("MONGO_URI")
-
-# 5. ROBUST DATABASE CONNECTION
-try:
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    # Force a connection check
-    client.server_info()
-    db = client["attendance_db"]
-    logger.info("✅ Connected to MongoDB successfully")
-except Exception as e:
-    logger.critical(f"❌ Failed to connect to MongoDB: {e}")
-    # In a real production app, you might want to exit if DB is down
-    # exit(1) 
+client = MongoClient(MONGO_URI)
+db = client["attendance_db"]
 
 users_col = db["users"]
 attendance_col = db["attendance"]
@@ -81,6 +48,11 @@ UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 IST = pytz.timezone('Asia/Kolkata')
+
+def utc_to_ist(utc_datetime):
+    if utc_datetime.tzinfo is None:
+        utc_datetime = pytz.utc.localize(utc_datetime)
+    return utc_datetime.astimezone(IST)
 
 def format_datetime_ist(dt):
     if isinstance(dt, str):
@@ -94,12 +66,12 @@ def format_datetime_ist(dt):
 
 @app.route("/")
 def home():
-    return "GDMR ERP Backend Running (Production Mode)", 200
+    return "Backend running ✅", 200
 
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
-    uploads_dir = os.path.join(os.getcwd(), "uploads")
-    return send_from_directory(uploads_dir, filename)
+        uploads_dir = os.path.join(os.getcwd(), "uploads")
+        return send_from_directory(uploads_dir, filename)
 
 # -------------------------------------------------------------
 # AUTH MIDDLEWARE
@@ -109,9 +81,7 @@ def token_required(f):
     def decorated(*args, **kwargs):
         token = None
         if 'Authorization' in request.headers:
-            parts = request.headers['Authorization'].split(" ")
-            if len(parts) == 2:
-                token = parts[1]
+            token = request.headers['Authorization'].split(" ")[1]
 
         if not token:
             return jsonify({"message": "Token is missing!"}), 401
@@ -123,62 +93,33 @@ def token_required(f):
             if not current_user:
                 return jsonify({"message": "User not found"}), 401
             request.user = current_user
-        except jwt.ExpiredSignatureError:
-            return jsonify({"message": "Token has expired"}), 401
         except Exception as e:
-            logger.warning(f"Invalid token usage: {e}")
-            return jsonify({"message": "Token is invalid!"}), 401
+            return jsonify({"message": "Token is invalid!", "error": str(e)}), 401
         return f(*args, **kwargs)
     return decorated
 
+
 # -------------------------------------------------------------
-# AUTH ROUTES
+# FORGOT PASSWORD (NEW)
 # -------------------------------------------------------------
-
-@app.route("/api/login", methods=["POST"])
-@limiter.limit("10 per minute") # Rate Limit: Protect against brute force
-def login():
-    data = request.json
-    email = data.get("email")
-    password = data.get("password")
-
-    user = users_col.find_one({"email": email})
-    if not user or not bcrypt.check_password_hash(user["password"], password):
-        logger.warning(f"Failed login attempt for {email}")
-        return jsonify({"message": "Invalid credentials"}), 401
-
-    token = jwt.encode({
-        "user_id": str(user["_id"]),
-        "exp": datetime.now(timezone.utc) + timedelta(days=1)
-    }, app.config['SECRET_KEY'], algorithm="HS256")
-
-    logger.info(f"User logged in: {email}")
-    return jsonify({
-        "token": token,
-        "role": user.get("role", "employee"),
-        "user": {
-            "name": user.get("name"),
-            "email": user.get("email")
-        }
-    })
-
 @app.route("/api/forgot-password", methods=["POST"])
-@limiter.limit("3 per hour") # Rate Limit: Prevent email spam
 def forgot_password():
     data = request.json
     email = data.get("email")
 
     user = users_col.find_one({"email": email})
     if not user:
-        # Security: Do not reveal if email exists or not
-        logger.info(f"Forgot password attempt for non-existent email: {email}")
+        # Return success even if user not found for security
         return jsonify({"message": "If this email exists, a password reset has been sent."}), 200
 
+    # Generate temporary password
     temp_password = generate_random_password()
     hashed = bcrypt.generate_password_hash(temp_password).decode("utf-8")
     
+    # Update user password
     users_col.update_one({"_id": user["_id"]}, {"$set": {"password": hashed}})
 
+    # Send Email
     subject = "Password Reset Request"
     body = (
         f"Hello {user['name']},\n\n"
@@ -188,16 +129,14 @@ def forgot_password():
     )
     
     threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
-    logger.info(f"Password reset sent to {email}")
 
     return jsonify({"message": "Password reset email sent."}), 200
 
-# -------------------------------------------------------------
-# EMPLOYEE & ADMIN MANAGEMENT
-# -------------------------------------------------------------
 
+# -------------------------------------------------------------
+# ADMIN REGISTER
+# -------------------------------------------------------------
 @app.route("/api/register-admin", methods=["POST"])
-@limiter.limit("2 per day") # Strict limit for admin creation
 def register_admin():
     data = request.json
     email = data.get("email")
@@ -219,9 +158,12 @@ def register_admin():
         "last_late_checkin_month": None,
     }
     res = users_col.insert_one(user_doc)
-    logger.info(f"New Admin registered: {email}")
     return jsonify({"message": "Admin created", "id": str(res.inserted_id)}), 201
 
+
+# -------------------------------------------------------------
+# MANAGER REGISTER
+# -------------------------------------------------------------
 @app.route("/api/register-manager", methods=["POST"])
 @token_required
 def register_manager():
@@ -234,8 +176,8 @@ def register_manager():
     password = data.get("password")
     department = data.get("department", "Management") 
 
-    if not name or not email or not password:
-        return jsonify({"message": "Missing required fields"}), 400
+    if not name or not email or not password or not department:
+        return jsonify({"message": "Name, Email, Password, and Department are required"}), 400
 
     if users_col.find_one({"email": email}):
         return jsonify({"message": "Email already exists"}), 400
@@ -255,9 +197,40 @@ def register_manager():
     }
 
     users_col.insert_one(new_user)
-    logger.info(f"Manager created: {email} by {request.user['email']}")
     return jsonify({"message": "Manager created successfully!"}), 201
 
+
+# -------------------------------------------------------------
+# LOGIN
+# -------------------------------------------------------------
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.json
+    email = data.get("email")
+    password = data.get("password")
+
+    user = users_col.find_one({"email": email})
+    if not user or not bcrypt.check_password_hash(user["password"], password):
+        return jsonify({"message": "Invalid credentials"}), 401
+
+    token = jwt.encode({
+        "user_id": str(user["_id"]),
+        "exp": datetime.now(timezone.utc) + timedelta(days=1)
+    }, app.config['SECRET_KEY'], algorithm="HS256")
+
+    return jsonify({
+        "token": token,
+        "role": user.get("role", "employee"),
+        "user": {
+            "name": user.get("name"),
+            "email": user.get("email")
+        }
+    })
+
+
+# -------------------------------------------------------------
+# ADMIN: ADD EMPLOYEE
+# -------------------------------------------------------------
 @app.route("/api/admin/employees", methods=["POST"])
 @token_required
 def add_employee():
@@ -292,19 +265,26 @@ def add_employee():
 
     res = users_col.insert_one(user_doc)
 
-    subject = "Welcome to GDMR Connect"
+    subject = "Welcome to GDMR Connect: Your New Account Credentials"
     body = (
         f"Dear {name},\n\n"
-        "Your account has been created.\n"
-        f"Username: {email}\n"
-        f"Password: {password}\n\n"
-        "Please login and change your password."
+        "Your new employee account for the GDMR Connect Attendance App has been successfully created.\n\n"
+        "Please use the following credentials to log in:\n"
+        f"Username (Email): {email}\n"
+        f"Temporary Password: {password}\n\n"
+        "We recommend logging in as soon as possible and updating your password.\n\n"
+        "Thank you,\n"
+        "The GDMR Connect Team"
     )
+
     threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
-    logger.info(f"Employee added: {email}")
 
     return jsonify({"message": "Employee created", "id": str(res.inserted_id)}), 201
 
+
+# -------------------------------------------------------------
+# ADMIN: LIST EMPLOYEES
+# -------------------------------------------------------------
 @app.route("/api/admin/employees", methods=["GET"])
 @token_required
 def list_employees():
@@ -312,57 +292,84 @@ def list_employees():
         return jsonify({"message": "Unauthorized"}), 403
 
     managers = {str(m["_id"]): m["name"] for m in users_col.find({"role": "manager"})}
+
     rows = []
     for u in users_col.find({"role": {"$in": ["employee", "manager"]}}):
         u["_id"] = str(u["_id"])
-        if "password" in u: del u["password"]
-        u["manager_name"] = managers.get(u.get("manager_id")) if u.get("manager_id") else None
+        if "password" in u:
+            del u["password"]
+        
+        manager_id = u.get("manager_id")
+        u["manager_name"] = managers.get(manager_id) if manager_id else None
+
         rows.append(u)
 
     return jsonify(rows)
 
+
+# -------------------------------------------------------------
+# ADMIN: LIST MANAGERS
+# -------------------------------------------------------------
 @app.route("/api/admin/managers", methods=["GET"])
 @token_required
 def list_managers():
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
+
     managers = []
     for m in users_col.find({"role": "manager"}):
         m["_id"] = str(m["_id"])
-        if "password" in m: del m["password"]
+        if "password" in m:
+            del m["password"]
         managers.append(m)
+
     return jsonify(managers)
 
+
+# -------------------------------------------------------------
+# EDIT EMPLOYEE
+# -------------------------------------------------------------
 @app.route("/api/admin/employees/<emp_id>", methods=["PUT"])
 @token_required
 def edit_employee(emp_id):
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
+
     data = request.json
     update = {}
+
     for k in ["name", "department", "position", "email", "manager_id"]:
-        if k in data: update[k] = data[k]
-    if "manager_id" in data and not data["manager_id"]: update["manager_id"] = None
+        if k in data:
+            update[k] = data[k]
+    
+    if "manager_id" in data and not data["manager_id"]:
+         update["manager_id"] = None
          
     if update:
         users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": update})
+    
     return jsonify({"message": "Updated"})
 
+
+# -------------------------------------------------------------
+# DELETE EMPLOYEE
+# -------------------------------------------------------------
 @app.route("/api/admin/employees/<emp_id>", methods=["DELETE"])
 @token_required
 def delete_employee(emp_id):
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
+
     users_col.delete_one({"_id": ObjectId(emp_id)})
     attendance_col.delete_many({"user_id": emp_id})
     leaves_col.delete_many({"user_id": emp_id})
-    logger.info(f"Employee {emp_id} deleted by {request.user['email']}")
+
     return jsonify({"message": "Deleted"})
 
-# -------------------------------------------------------------
-# ATTENDANCE ROUTES (UPDATED TIME LIMITS)
-# -------------------------------------------------------------
 
+# -------------------------------------------------------------
+# CHECK-IN WITH PHOTO (UPDATED TIME LIMITS)
+# -------------------------------------------------------------
 @app.route("/api/attendance/checkin-photo", methods=["POST"])
 @token_required
 def checkin_photo():
@@ -371,45 +378,54 @@ def checkin_photo():
 
     uid = str(request.user["_id"])
     now_ist = datetime.now(IST)
-    current_time = now_ist.time()
+    current_time = now_ist.time() # Extract time
     today = now_ist.date()
 
-    # Time Windows
+    # Define Check-in Windows
     MORNING_OPEN = time(9, 0)
     MORNING_CLOSE = time(10, 15)
+    
     AFTERNOON_OPEN = time(13, 0)
     AFTERNOON_CLOSE = time(14, 0)
-
+    
+    # Check if already checked in
     if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": str(today)}):
         return jsonify({"message": "Already checked in!"}), 400
 
+    # Logic for Check-in Windows
     checkin_type = "full"
     status_indicator = "On Time"
 
     if MORNING_OPEN <= current_time <= MORNING_CLOSE:
         checkin_type = "full"
+        # Optional: Add Late logic here if needed (e.g. after 9:30)
+        # if current_time > time(9, 30): status_indicator = "Late"
+
+        # REVISION 1: Late checkin limit logic (only if marking late)
+        # ... existing revision limit logic if required ...
+
     elif AFTERNOON_OPEN <= current_time <= AFTERNOON_CLOSE:
         checkin_type = "half-day"
+        status_indicator = "On Time"
+        
     else:
         return jsonify({
-            "message": f"Check-in closed. Morning: {MORNING_OPEN.strftime('%I:%M %p')}-{MORNING_CLOSE.strftime('%I:%M %p')}, Afternoon: {AFTERNOON_OPEN.strftime('%I:%M %p')}-{AFTERNOON_CLOSE.strftime('%I:%M %p')}"
+            "message": f"Check-in not allowed. Morning: {MORNING_OPEN.strftime('%I:%M %p')}-{MORNING_CLOSE.strftime('%I:%M %p')}, Afternoon: {AFTERNOON_OPEN.strftime('%I:%M %p')}-{AFTERNOON_CLOSE.strftime('%I:%M %p')}"
         }), 400
 
+    # Process Image
     data = request.get_json()
     img_data = data.get("image")
     if not img_data:
         return jsonify({"message": "No image"}), 400
 
-    try:
-        header, encoded = img_data.split(",", 1)
-        image_bytes = base64.b64decode(encoded)
-        filename = f"{uid}_checkin_{int(datetime.now(timezone.utc).timestamp())}.jpg"
-        path = os.path.join(UPLOAD_FOLDER, filename)
-        with open(path, "wb") as f:
-            f.write(image_bytes)
-    except Exception as e:
-        logger.error(f"Image processing error: {e}")
-        return jsonify({"message": "Image error"}), 500
+    header, encoded = img_data.split(",", 1)
+    image_bytes = base64.b64decode(encoded)
+
+    filename = f"{uid}_checkin_{int(datetime.now(timezone.utc).timestamp())}.jpg"
+    path = os.path.join(UPLOAD_FOLDER, filename)
+    with open(path, "wb") as f:
+        f.write(image_bytes)
 
     attendance_col.insert_one({
         "user_id": uid,
@@ -423,6 +439,10 @@ def checkin_photo():
 
     return jsonify({"message": f"Checked in ({checkin_type})"}), 200
 
+
+# -------------------------------------------------------------
+# CHECK-OUT PHOTO (UPDATED TIME LIMITS)
+# -------------------------------------------------------------
 @app.route("/api/attendance/checkout-photo", methods=["POST"])
 @token_required
 def checkout_photo():
@@ -441,38 +461,40 @@ def checkout_photo():
     if attendance_col.find_one({"user_id": uid, "type": "checkout", "date": str(today)}):
         return jsonify({"message": "Already checked out!"}), 400
 
-    # Checkout Windows
+    # Define Checkout Windows
     HALF_DAY_LOGOUT_OPEN = time(13, 0)
     HALF_DAY_LOGOUT_CLOSE = time(14, 0)
+    
     FULL_DAY_LOGOUT_OPEN = time(18, 0)
     FULL_DAY_LOGOUT_CLOSE = time(19, 30)
 
     final_day_type = checkin.get("day_type", "full")
     status_indicator = "On Time"
 
+    # Check Windows
     if HALF_DAY_LOGOUT_OPEN <= current_time <= HALF_DAY_LOGOUT_CLOSE:
         final_day_type = "half-day"
+        # Update checkin to half-day if user logs out early
         attendance_col.update_one({"_id": checkin["_id"]}, {"$set": {"day_type": "half-day"}})
+        
     elif FULL_DAY_LOGOUT_OPEN <= current_time <= FULL_DAY_LOGOUT_CLOSE:
-        pass 
+        pass # full day, no change
+        
     else:
          return jsonify({
-            "message": f"Checkout closed. Half-Day: {HALF_DAY_LOGOUT_OPEN.strftime('%I:%M %p')}-{HALF_DAY_LOGOUT_CLOSE.strftime('%I:%M %p')}, Full-Day: {FULL_DAY_LOGOUT_OPEN.strftime('%I:%M %p')}-{FULL_DAY_LOGOUT_CLOSE.strftime('%I:%M %p')}"
+            "message": f"Checkout not allowed. Half-Day: {HALF_DAY_LOGOUT_OPEN.strftime('%I:%M %p')}-{HALF_DAY_LOGOUT_CLOSE.strftime('%I:%M %p')}, Full-Day: {FULL_DAY_LOGOUT_OPEN.strftime('%I:%M %p')}-{FULL_DAY_LOGOUT_CLOSE.strftime('%I:%M %p')}"
         }), 400
 
     data = request.get_json()
     img_data = data.get("image")
-    
-    try:
-        header, encoded = img_data.split(",", 1)
-        image_bytes = base64.b64decode(encoded)
-        filename = f"{uid}_checkout_{int(datetime.now(timezone.utc).timestamp())}.jpg"
-        path = os.path.join(UPLOAD_FOLDER, filename)
-        with open(path, "wb") as f:
-            f.write(image_bytes)
-    except Exception as e:
-        logger.error(f"Image processing error: {e}")
-        return jsonify({"message": "Image error"}), 500
+
+    header, encoded = img_data.split(",", 1)
+    image_bytes = base64.b64decode(encoded)
+
+    filename = f"{uid}_checkout_{int(datetime.now(timezone.utc).timestamp())}.jpg"
+    path = os.path.join(UPLOAD_FOLDER, filename)
+    with open(path, "wb") as f:
+        f.write(image_bytes)
 
     attendance_col.insert_one({
         "user_id": uid,
@@ -486,14 +508,15 @@ def checkout_photo():
 
     return jsonify({"message": f"Checked out ({final_day_type})"}), 200
 
+
 @app.route("/attendance_photos/<path:filename>")
 def serve_attendance_photo(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
-# -------------------------------------------------------------
-# LEAVE & OTHER ENDPOINTS
-# -------------------------------------------------------------
 
+# -------------------------------------------------------------
+# APPLY LEAVE
+# -------------------------------------------------------------
 @app.route("/api/leaves", methods=["POST"])
 @token_required
 def apply_leave():
@@ -507,7 +530,7 @@ def apply_leave():
     if not date_str:
         return jsonify({"message": "Date required"}), 400
 
-    # 7-day retrospective limit
+    # Revision 2: 7-day limit
     try:
         leave_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
@@ -517,7 +540,9 @@ def apply_leave():
     max_past_date = now_ist_date - timedelta(days=7) 
 
     if leave_date < max_past_date:
-        return jsonify({"message": "Leave application limited to past 7 days."}), 400
+        return jsonify({
+            "message": f"Leave application for past dates is limited to 7 days."
+        }), 400
 
     attachment_url = None
     file = request.files.get("attachment")
@@ -544,102 +569,157 @@ def apply_leave():
     res = leaves_col.insert_one(leave)
     return jsonify({"message": "Applied", "id": str(res.inserted_id)}), 201
 
+
+# -------------------------------------------------------------
+# ADMIN VIEW LEAVES
+# -------------------------------------------------------------
 @app.route("/api/admin/leaves", methods=["GET"])
 @token_required
 def admin_view_leaves():
     if request.user.get("role") not in ["admin", "manager"]:
         return jsonify({"message": "Unauthorized"}), 403
+
     rows = []
     employees = {str(e["_id"]): e for e in users_col.find({"role": {"$in": ["employee", "manager"]}})}
+    
     for l in leaves_col.find():
         l["_id"] = str(l["_id"])
-        user = employees.get(l.get("user_id"))
+        user_id = l.get("user_id")
+        user = employees.get(user_id)
+        
         if user:
             l["employee_name"] = user["name"]
             l["employee_department"] = user.get("department")
         else:
             l["employee_name"] = "Unknown"
             l["employee_department"] = ""
+            
         rows.append(l)
+
     return jsonify(rows), 200
 
+
+# -------------------------------------------------------------
+# UPDATE LEAVE STATUS
+# -------------------------------------------------------------
 @app.route("/api/admin/leaves/<leave_id>", methods=["PUT"])
 @token_required
 def update_leave(leave_id):
     role = request.user.get("role")
-    if role not in ["admin", "manager"]: return jsonify({"message": "Unauthorized"}), 403
+    if role not in ["admin", "manager"]:
+        return jsonify({"message": "Unauthorized"}), 403
 
     data = request.json
     action = data.get("status")
-    if action not in ("Approved", "Rejected", "Pending"): return jsonify({"message": "Invalid status"}), 400
+
+    if action not in ("Approved", "Rejected", "Pending"):
+        return jsonify({"message": "Invalid status"}), 400
 
     update_fields = {}
-    if role == "manager": update_fields["manager_status"] = action
-    elif role == "admin": update_fields["admin_status"] = action
+
+    if role == "manager":
+        update_fields["manager_status"] = action
+    elif role == "admin":
+        update_fields["admin_status"] = action
 
     leaves_col.update_one({"_id": ObjectId(leave_id)}, {"$set": update_fields})
+
     leave = leaves_col.find_one({"_id": ObjectId(leave_id)})
 
     ms = leave.get("manager_status", "Pending")
     as_ = leave.get("admin_status", "Pending")
 
-    if ms == "Rejected" or as_ == "Rejected": final_status = "Rejected"
-    elif ms == "Approved" and as_ == "Approved": final_status = "Approved"
-    else: final_status = "Pending"
+    if ms == "Rejected" or as_ == "Rejected":
+        final_status = "Rejected"
+    elif ms == "Approved" and as_ == "Approved":
+        final_status = "Approved"
+    else:
+        final_status = "Pending"
 
-    leaves_col.update_one({"_id": ObjectId(leave_id)}, {"$set": {"status": final_status}})
+    leaves_col.update_one({"_id": ObjectId(leave_id)}, {
+        "$set": {"status": final_status}
+    })
 
-    # Notify User
     try:
         user = users_col.find_one({"_id": ObjectId(leave["user_id"])})
         if user:
-            subject = "Leave Status Update"
-            body = f"Your leave for {leave.get('date')} is now: {final_status}"
+            subject = "Leave Update"
+            body = (
+                f"Your leave request for {leave.get('date')} has been updated.\n"
+                f"Manager: {ms}\nHR: {as_}\nFinal Status: {final_status}"
+            )
             threading.Thread(target=send_email, args=(user["email"], subject, body), daemon=True).start()
     except Exception as e:
-        logger.error(f"Email failed: {e}")
+        print("Email error:", e)
 
     return jsonify({"message": "Updated"})
 
+
+# -------------------------------------------------------------
+# MANAGER: LIST MY EMPLOYEES
+# -------------------------------------------------------------
 @app.route("/api/manager/my-employees", methods=["GET"])
 @token_required
 def manager_my_employees():
-    if request.user.get("role") != "manager": return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "manager":
+        return jsonify({"message": "Unauthorized"}), 403
+
     manager_id = str(request.user["_id"])
     rows = []
     for u in users_col.find({"manager_id": manager_id, "role": "employee"}):
         u["_id"] = str(u["_id"])
         if "password" in u: del u["password"]
         rows.append(u)
+
     return jsonify(rows)
 
+
+# -------------------------------------------------------------
+# MY ATTENDANCE
+# -------------------------------------------------------------
 @app.route("/api/my/attendance", methods=["GET"])
 @token_required
 def my_attendance():
     uid = str(request.user["_id"])
     rows = []
+
     for a in attendance_col.find({"user_id": uid}).sort("time", -1):
         a["_id"] = str(a["_id"])
         a["time"] = format_datetime_ist(a["time"])
         rows.append(a)
+
     return jsonify(rows)
 
+
+# -------------------------------------------------------------
+# MY LEAVES
+# -------------------------------------------------------------
 @app.route("/api/my/leaves", methods=["GET"])
 @token_required
 def my_leaves():
     uid = str(request.user["_id"])
     rows = []
+
     for l in leaves_col.find({"user_id": uid}).sort("applied_at", -1):
         l["_id"] = str(l["_id"])
         rows.append(l)
+
     return jsonify(rows)
 
+
+# -------------------------------------------------------------
+# ADMIN: EMPLOYEE ATTENDANCE
+# -------------------------------------------------------------
 @app.route("/api/admin/attendance/<emp_id>", methods=["GET"])
 @token_required
 def admin_employee_attendance(emp_id):
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
     emp = users_col.find_one({"_id": ObjectId(emp_id)})
-    if not emp: return jsonify({"message": "Not found"}), 404
+    if not emp:
+        return jsonify({"message": "Employee not found"}), 404
+
     records = []
     for a in attendance_col.find({"user_id": emp_id}).sort("time", -1):
         a["_id"] = str(a["_id"])
@@ -647,39 +727,55 @@ def admin_employee_attendance(emp_id):
         a["employee_name"] = emp.get("name")
         a["employee_email"] = emp.get("email")
         records.append(a)
+
     return jsonify(records)
 
+
+# -------------------------------------------------------------
+# AUTO ABSENT
+# -------------------------------------------------------------
 @app.route("/api/attendance/auto-absent", methods=["POST"])
 def auto_mark_absent():
     today = datetime.now(IST).date()
     all_users = users_col.find({"role": {"$in": ["employee", "manager"]}})
-    count = 0
+
     for emp in all_users:
         uid = str(emp["_id"])
-        if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": str(today)}): continue
+        checked_in = attendance_col.find_one({
+            "user_id": uid, "type": "checkin", "date": str(today)
+        })
+        if checked_in: continue
+
         if not attendance_col.find_one({"user_id": uid, "type": "absent", "date": str(today)}):
             attendance_col.insert_one({
                 "user_id": uid, "type": "absent", "date": str(today), "time": datetime.now(timezone.utc)
             })
-            count += 1
-    logger.info(f"Auto-marked {count} absent users")
-    return jsonify({"message": f"Marked {count} absent"}), 200
 
+    return jsonify({"message": "Absent auto-marking completed"}), 200
+
+
+# -------------------------------------------------------------
+# ADMIN MONTHLY SUMMARY
+# -------------------------------------------------------------
 @app.route("/api/admin/attendance-summary", methods=["GET"])
 @token_required
 def attendance_summary():
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
     month_param = request.args.get("month")
     if not month_param: return jsonify({"message": "month required"}), 400
 
     year, month = map(int, month_param.split("-"))
     start_date = datetime(year, month, 1, tzinfo=IST)
+
     next_month = month + 1 if month < 12 else 1
     next_year = year if month < 12 else year + 1
     end_date = datetime(next_year, next_month, 1, tzinfo=IST)
 
     employees = list(users_col.find({"role": {"$in": ["employee", "manager"]}}))
     emp_ids = [str(e["_id"]) for e in employees]
+
     summary = {"total_employees": len(employees), "days": {}}
 
     current = start_date
@@ -691,6 +787,7 @@ def attendance_summary():
                 "$lt": datetime.combine(current.date(), datetime.max.time(), tzinfo=IST),
             }
         }))
+
         present = {rec["user_id"] for rec in day_records if rec["type"] == "checkin"}
         absent = {rec["user_id"] for rec in day_records if rec["type"] == "absent"}
         leaves_today = {l["user_id"] for l in leaves_col.find({"date": day_str, "status": "Approved"})}
@@ -701,31 +798,44 @@ def attendance_summary():
             "leave": list(leaves_today), "not_checked_in": list(not_checked_in),
         }
         current += timedelta(days=1)
+
     return jsonify(summary), 200
 
+
+# -------------------------------------------------------------
+# TODAY STATS
+# -------------------------------------------------------------
 @app.route("/api/admin/today-stats", methods=["GET"])
 @token_required
 def today_stats():
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
     today = datetime.now(IST).date()
     employees = list(users_col.find({"role": {"$in": ["employee", "manager"]}}))
     emp_ids = [str(e["_id"]) for e in employees]
+
     day_records = list(attendance_col.find({
         "time": {
             "$gte": datetime.combine(today, datetime.min.time(), tzinfo=IST),
             "$lt": datetime.combine(today, datetime.max.time(), tzinfo=IST),
         }
     }))
+
     present = {rec["user_id"] for rec in day_records if rec["type"] == "checkin"}
     absent = {rec["user_id"] for rec in day_records if rec["type"] == "absent"}
     leaves_today = {l["user_id"] for l in leaves_col.find({"date": str(today), "status": "Approved"})}
     not_checked_in = set(emp_ids) - present - leaves_today - absent
+
     return jsonify({
         "present": len(present), "absent": len(absent),
         "leave": len(leaves_today), "not_checked_in": len(not_checked_in),
     }), 200
 
+
+# -------------------------------------------------------------
+# RUN SERVER
+# -------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    # Security: Ensure debug is False in production
     app.run(host="0.0.0.0", port=port, debug=False)
