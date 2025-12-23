@@ -1,4 +1,3 @@
-# backend/app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import base64, os
@@ -9,7 +8,7 @@ import jwt
 from functools import wraps
 from utils import send_email, generate_random_password
 from bson import ObjectId
-from datetime import datetime, timedelta, timezone, time  # Added 'time'
+from datetime import datetime, timedelta, timezone, time
 from flask import send_from_directory
 import pytz
 from flask_bcrypt import Bcrypt
@@ -100,7 +99,7 @@ def token_required(f):
 
 
 # -------------------------------------------------------------
-# FORGOT PASSWORD (NEW)
+# FORGOT PASSWORD
 # -------------------------------------------------------------
 @app.route("/api/forgot-password", methods=["POST"])
 def forgot_password():
@@ -109,17 +108,13 @@ def forgot_password():
 
     user = users_col.find_one({"email": email})
     if not user:
-        # Return success even if user not found for security
         return jsonify({"message": "If this email exists, a password reset has been sent."}), 200
 
-    # Generate temporary password
     temp_password = generate_random_password()
     hashed = bcrypt.generate_password_hash(temp_password).decode("utf-8")
     
-    # Update user password
     users_col.update_one({"_id": user["_id"]}, {"$set": {"password": hashed}})
 
-    # Send Email
     subject = "Password Reset Request"
     body = (
         f"Hello {user['name']},\n\n"
@@ -342,6 +337,7 @@ def edit_employee(emp_id):
         if k in data:
             update[k] = data[k]
     
+    # Allow clearing manager
     if "manager_id" in data and not data["manager_id"]:
          update["manager_id"] = None
          
@@ -349,6 +345,26 @@ def edit_employee(emp_id):
         users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": update})
     
     return jsonify({"message": "Updated"})
+
+# -------------------------------------------------------------
+# EDIT MANAGER
+# -------------------------------------------------------------
+@app.route("/api/admin/managers/<man_id>", methods=["PUT"])
+@token_required
+def edit_manager(man_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data = request.json
+    update = {}
+    for k in ["name", "department", "email"]:
+        if k in data:
+            update[k] = data[k]
+
+    if update:
+        users_col.update_one({"_id": ObjectId(man_id)}, {"$set": update})
+
+    return jsonify({"message": "Manager Updated"})
 
 
 # -------------------------------------------------------------
@@ -366,9 +382,24 @@ def delete_employee(emp_id):
 
     return jsonify({"message": "Deleted"})
 
+# -------------------------------------------------------------
+# DELETE MANAGER (Existing endpoint updated to be specific)
+# -------------------------------------------------------------
+@app.route("/api/admin/managers/<man_id>", methods=["DELETE"])
+@token_required
+def delete_manager(man_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    users_col.delete_one({"_id": ObjectId(man_id)})
+    # Also unassign this manager from any employees
+    users_col.update_many({"manager_id": man_id}, {"$set": {"manager_id": None}})
+    
+    return jsonify({"message": "Deleted"})
+
 
 # -------------------------------------------------------------
-# CHECK-IN WITH PHOTO (UPDATED TIME LIMITS)
+# CHECK-IN WITH PHOTO
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkin-photo", methods=["POST"])
 @token_required
@@ -378,42 +409,29 @@ def checkin_photo():
 
     uid = str(request.user["_id"])
     now_ist = datetime.now(IST)
-    current_time = now_ist.time() # Extract time
+    current_time = now_ist.time()
     today = now_ist.date()
 
-    # Define Check-in Windows
     MORNING_OPEN = time(9, 0)
     MORNING_CLOSE = time(10, 15)
-    
     AFTERNOON_OPEN = time(13, 0)
     AFTERNOON_CLOSE = time(14, 0)
     
-    # Check if already checked in
     if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": str(today)}):
         return jsonify({"message": "Already checked in!"}), 400
 
-    # Logic for Check-in Windows
     checkin_type = "full"
     status_indicator = "On Time"
 
     if MORNING_OPEN <= current_time <= MORNING_CLOSE:
         checkin_type = "full"
-        # Optional: Add Late logic here if needed (e.g. after 9:30)
-        # if current_time > time(9, 30): status_indicator = "Late"
-
-        # REVISION 1: Late checkin limit logic (only if marking late)
-        # ... existing revision limit logic if required ...
-
     elif AFTERNOON_OPEN <= current_time <= AFTERNOON_CLOSE:
         checkin_type = "half-day"
-        status_indicator = "On Time"
-        
     else:
         return jsonify({
             "message": f"Check-in not allowed. Morning: {MORNING_OPEN.strftime('%I:%M %p')}-{MORNING_CLOSE.strftime('%I:%M %p')}, Afternoon: {AFTERNOON_OPEN.strftime('%I:%M %p')}-{AFTERNOON_CLOSE.strftime('%I:%M %p')}"
         }), 400
 
-    # Process Image
     data = request.get_json()
     img_data = data.get("image")
     if not img_data:
@@ -441,7 +459,7 @@ def checkin_photo():
 
 
 # -------------------------------------------------------------
-# CHECK-OUT PHOTO (UPDATED TIME LIMITS)
+# CHECK-OUT PHOTO
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkout-photo", methods=["POST"])
 @token_required
@@ -461,25 +479,19 @@ def checkout_photo():
     if attendance_col.find_one({"user_id": uid, "type": "checkout", "date": str(today)}):
         return jsonify({"message": "Already checked out!"}), 400
 
-    # Define Checkout Windows
     HALF_DAY_LOGOUT_OPEN = time(13, 0)
     HALF_DAY_LOGOUT_CLOSE = time(14, 0)
-    
     FULL_DAY_LOGOUT_OPEN = time(18, 0)
     FULL_DAY_LOGOUT_CLOSE = time(19, 30)
 
     final_day_type = checkin.get("day_type", "full")
     status_indicator = "On Time"
 
-    # Check Windows
     if HALF_DAY_LOGOUT_OPEN <= current_time <= HALF_DAY_LOGOUT_CLOSE:
         final_day_type = "half-day"
-        # Update checkin to half-day if user logs out early
         attendance_col.update_one({"_id": checkin["_id"]}, {"$set": {"day_type": "half-day"}})
-        
     elif FULL_DAY_LOGOUT_OPEN <= current_time <= FULL_DAY_LOGOUT_CLOSE:
-        pass # full day, no change
-        
+        pass 
     else:
          return jsonify({
             "message": f"Checkout not allowed. Half-Day: {HALF_DAY_LOGOUT_OPEN.strftime('%I:%M %p')}-{HALF_DAY_LOGOUT_CLOSE.strftime('%I:%M %p')}, Full-Day: {FULL_DAY_LOGOUT_OPEN.strftime('%I:%M %p')}-{FULL_DAY_LOGOUT_CLOSE.strftime('%I:%M %p')}"
@@ -515,7 +527,7 @@ def serve_attendance_photo(filename):
 
 
 # -------------------------------------------------------------
-# APPLY LEAVE
+# APPLY LEAVE (UPDATED FOR MULTIPLE DAYS)
 # -------------------------------------------------------------
 @app.route("/api/leaves", methods=["POST"])
 @token_required
@@ -523,23 +535,35 @@ def apply_leave():
     if request.user.get("role") not in ["employee", "manager"]:
         return jsonify({"message": "Unauthorized"}), 403
 
-    date_str = request.form.get("date")
+    # New fields: from_date, to_date. Fallback to 'date' for old single day logic support if needed
+    from_date = request.form.get("from_date")
+    to_date = request.form.get("to_date")
+    
+    # Backward compatibility or Single Day
+    if not from_date and request.form.get("date"):
+        from_date = request.form.get("date")
+        to_date = request.form.get("date")
+
     leave_type = request.form.get("type", "full")
     reason = request.form.get("reason", "")
 
-    if not date_str:
-        return jsonify({"message": "Date required"}), 400
+    if not from_date or not to_date:
+        return jsonify({"message": "Start and End dates are required"}), 400
 
-    # Revision 2: 7-day limit
     try:
-        leave_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        f_date = datetime.strptime(from_date, "%Y-%m-%d").date()
+        t_date = datetime.strptime(to_date, "%Y-%m-%d").date()
     except ValueError:
         return jsonify({"message": "Invalid date format."}), 400
 
+    if t_date < f_date:
+        return jsonify({"message": "End date cannot be before start date"}), 400
+
+    # 7-day past limit check
     now_ist_date = datetime.now(IST).date()
     max_past_date = now_ist_date - timedelta(days=7) 
 
-    if leave_date < max_past_date:
+    if f_date < max_past_date:
         return jsonify({
             "message": f"Leave application for past dates is limited to 7 days."
         }), 400
@@ -556,7 +580,9 @@ def apply_leave():
 
     leave = {
         "user_id": str(request.user["_id"]),
-        "date": date_str,
+        "from_date": from_date,
+        "to_date": to_date,
+        "date": from_date, # Keep for sorting/simple view fallback
         "type": leave_type,
         "reason": reason,
         "status": "Pending",
@@ -644,8 +670,9 @@ def update_leave(leave_id):
         user = users_col.find_one({"_id": ObjectId(leave["user_id"])})
         if user:
             subject = "Leave Update"
+            date_info = f"{leave.get('from_date')} to {leave.get('to_date')}" if leave.get('from_date') != leave.get('to_date') else leave.get('date')
             body = (
-                f"Your leave request for {leave.get('date')} has been updated.\n"
+                f"Your leave request for {date_info} has been updated.\n"
                 f"Manager: {ms}\nHR: {as_}\nFinal Status: {final_status}"
             )
             threading.Thread(target=send_email, args=(user["email"], subject, body), daemon=True).start()
@@ -833,9 +860,6 @@ def today_stats():
     }), 200
 
 
-# -------------------------------------------------------------
-# RUN SERVER
-# -------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
