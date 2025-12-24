@@ -13,11 +13,20 @@ from flask import send_from_directory
 import pytz
 from flask_bcrypt import Bcrypt
 import threading
+import cloudinary
+import cloudinary.uploader
 
 load_dotenv()
 
 app = Flask(__name__)
 bcrypt = Bcrypt(app)
+
+# --- CLOUDINARY CONFIG ---
+cloudinary.config(
+    cloud_name = os.getenv('CLOUDINARY_CLOUD_NAME'),
+    api_key = os.getenv('CLOUDINARY_API_KEY'),
+    api_secret = os.getenv('CLOUDINARY_API_SECRET')
+)
 
 CORS(app, resources={
     r"/*": {
@@ -588,13 +597,16 @@ def apply_leave():
 
     attachment_url = None
     file = request.files.get("attachment")
+    
+    # --- CLOUDINARY UPLOAD CHANGE ---
     if file:
-        from werkzeug.utils import secure_filename
-        filename = secure_filename(file.filename)
-        os.makedirs("uploads", exist_ok=True)
-        file_path = os.path.join("uploads", filename)
-        file.save(file_path)
-        attachment_url = f"/uploads/{filename}"
+        try:
+            upload_result = cloudinary.uploader.upload(file, folder="leave_attachments")
+            attachment_url = upload_result.get("secure_url")
+        except Exception as e:
+            print("Cloudinary Upload Error:", e)
+            return jsonify({"message": "File upload failed"}), 500
+    # --------------------------------
 
     leave = {
         "user_id": str(request.user["_id"]),
