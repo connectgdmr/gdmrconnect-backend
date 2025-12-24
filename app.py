@@ -399,7 +399,7 @@ def delete_manager(man_id):
 
 
 # -------------------------------------------------------------
-# CHECK-IN WITH PHOTO
+# CHECK-IN WITH PHOTO (UPDATED RULES)
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkin-photo", methods=["POST"])
 @token_required
@@ -412,25 +412,29 @@ def checkin_photo():
     current_time = now_ist.time()
     today = now_ist.date()
 
-    MORNING_OPEN = time(9, 0)
-    MORNING_CLOSE = time(10, 15)
-    AFTERNOON_OPEN = time(13, 0)
-    AFTERNOON_CLOSE = time(14, 0)
-    
+    # Define Times
+    MORNING_LATE_CUTOFF = time(10, 15)
+    AFTERNOON_START_THRESHOLD = time(13, 0)
+    AFTERNOON_LATE_CUTOFF = time(14, 0)
+
+    # Check for existing checkin
     if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": str(today)}):
         return jsonify({"message": "Already checked in!"}), 400
 
+    # Determine Day Type and Status
     checkin_type = "full"
     status_indicator = "On Time"
 
-    if MORNING_OPEN <= current_time <= MORNING_CLOSE:
+    if current_time < AFTERNOON_START_THRESHOLD:
+        # Morning Session
         checkin_type = "full"
-    elif AFTERNOON_OPEN <= current_time <= AFTERNOON_CLOSE:
-        checkin_type = "half-day"
+        if current_time > MORNING_LATE_CUTOFF:
+            status_indicator = "Late" # Frontend shows "Late Check-in"
     else:
-        return jsonify({
-            "message": f"Check-in not allowed. Morning: {MORNING_OPEN.strftime('%I:%M %p')}-{MORNING_CLOSE.strftime('%I:%M %p')}, Afternoon: {AFTERNOON_OPEN.strftime('%I:%M %p')}-{AFTERNOON_CLOSE.strftime('%I:%M %p')}"
-        }), 400
+        # Afternoon Session
+        checkin_type = "half-day"
+        if current_time > AFTERNOON_LATE_CUTOFF:
+             status_indicator = "Late"
 
     data = request.get_json()
     img_data = data.get("image")
@@ -455,11 +459,11 @@ def checkin_photo():
         "status_indicator": status_indicator 
     })
 
-    return jsonify({"message": f"Checked in ({checkin_type})"}), 200
+    return jsonify({"message": f"Checked in ({checkin_type}, {status_indicator})"}), 200
 
 
 # -------------------------------------------------------------
-# CHECK-OUT PHOTO
+# CHECK-OUT PHOTO (UPDATED RULES)
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkout-photo", methods=["POST"])
 @token_required
@@ -479,23 +483,37 @@ def checkout_photo():
     if attendance_col.find_one({"user_id": uid, "type": "checkout", "date": str(today)}):
         return jsonify({"message": "Already checked out!"}), 400
 
-    HALF_DAY_LOGOUT_OPEN = time(13, 0)
-    HALF_DAY_LOGOUT_CLOSE = time(14, 0)
-    FULL_DAY_LOGOUT_OPEN = time(18, 0)
-    FULL_DAY_LOGOUT_CLOSE = time(19, 30)
+    # Define Times
+    HALF_DAY_OUT_START = time(13, 0)
+    HALF_DAY_OUT_END = time(14, 0)
+    FULL_DAY_OUT_START = time(18, 0)
+    LATE_CHECKOUT_START = time(19, 30)
+
+    # Convert checkin time to IST to compare
+    checkin_dt = utc_to_ist(checkin["time"])
+    checkin_time = checkin_dt.time()
 
     final_day_type = checkin.get("day_type", "full")
     status_indicator = "On Time"
 
-    if HALF_DAY_LOGOUT_OPEN <= current_time <= HALF_DAY_LOGOUT_CLOSE:
+    # --- Day Type Logic ---
+    # If checked in morning (< 1 PM) AND checking out between 1 PM and 2 PM -> Half Day
+    if checkin_time < time(13, 0) and (HALF_DAY_OUT_START <= current_time <= HALF_DAY_OUT_END):
         final_day_type = "half-day"
         attendance_col.update_one({"_id": checkin["_id"]}, {"$set": {"day_type": "half-day"}})
-    elif FULL_DAY_LOGOUT_OPEN <= current_time <= FULL_DAY_LOGOUT_CLOSE:
-        pass 
+    
+    # --- Status Logic ---
+    # "if checkout late show late checkout" -> > 7:30 PM
+    if current_time > LATE_CHECKOUT_START:
+        status_indicator = "Late Checkout" # or just "Late"
+    elif current_time < FULL_DAY_OUT_START:
+        # Check if it is a valid Half Day checkout time (1-2 PM)
+        if final_day_type == "half-day" and (HALF_DAY_OUT_START <= current_time <= HALF_DAY_OUT_END):
+             status_indicator = "On Time"
+        else:
+             status_indicator = "Early" # Frontend shows "Early Checkout"
     else:
-         return jsonify({
-            "message": f"Checkout not allowed. Half-Day: {HALF_DAY_LOGOUT_OPEN.strftime('%I:%M %p')}-{HALF_DAY_LOGOUT_CLOSE.strftime('%I:%M %p')}, Full-Day: {FULL_DAY_LOGOUT_OPEN.strftime('%I:%M %p')}-{FULL_DAY_LOGOUT_CLOSE.strftime('%I:%M %p')}"
-        }), 400
+        status_indicator = "On Time"
 
     data = request.get_json()
     img_data = data.get("image")
@@ -518,7 +536,7 @@ def checkout_photo():
         "status_indicator": status_indicator
     })
 
-    return jsonify({"message": f"Checked out ({final_day_type})"}), 200
+    return jsonify({"message": f"Checked out ({final_day_type}, {status_indicator})"}), 200
 
 
 @app.route("/attendance_photos/<path:filename>")
