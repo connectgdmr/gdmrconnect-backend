@@ -52,6 +52,7 @@ users_col = db["users"]
 attendance_col = db["attendance"]
 leaves_col = db["leaves"]
 
+# UPLOAD_FOLDER is no longer strictly needed for persistent storage if using Cloudinary
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -76,6 +77,7 @@ def format_datetime_ist(dt):
 def home():
     return "Backend running ✅", 200
 
+# Keep this for backward compatibility if old files still exist locally
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
         uploads_dir = os.path.join(os.getcwd(), "uploads")
@@ -408,7 +410,7 @@ def delete_manager(man_id):
 
 
 # -------------------------------------------------------------
-# CHECK-IN WITH PHOTO (UPDATED RULES)
+# CHECK-IN WITH PHOTO (UPDATED RULES + CLOUDINARY)
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkin-photo", methods=["POST"])
 @token_required
@@ -450,13 +452,15 @@ def checkin_photo():
     if not img_data:
         return jsonify({"message": "No image"}), 400
 
-    header, encoded = img_data.split(",", 1)
-    image_bytes = base64.b64decode(encoded)
-
-    filename = f"{uid}_checkin_{int(datetime.now(timezone.utc).timestamp())}.jpg"
-    path = os.path.join(UPLOAD_FOLDER, filename)
-    with open(path, "wb") as f:
-        f.write(image_bytes)
+    # --- CLOUDINARY UPLOAD START ---
+    # img_data comes as "data:image/jpeg;base64,....." which Cloudinary supports directly
+    try:
+        upload_result = cloudinary.uploader.upload(img_data, folder="attendance_photos")
+        photo_url = upload_result.get("secure_url")
+    except Exception as e:
+        print("Cloudinary Upload Error:", e)
+        return jsonify({"message": "Image upload failed"}), 500
+    # --- CLOUDINARY UPLOAD END ---
 
     attendance_col.insert_one({
         "user_id": uid,
@@ -464,7 +468,7 @@ def checkin_photo():
         "date": str(today),
         "day_type": checkin_type,
         "time": datetime.now(timezone.utc),
-        "photo_url": f"/attendance_photos/{filename}",
+        "photo_url": photo_url, # Now storing Cloudinary URL
         "status_indicator": status_indicator 
     })
 
@@ -472,7 +476,7 @@ def checkin_photo():
 
 
 # -------------------------------------------------------------
-# CHECK-OUT PHOTO (UPDATED RULES)
+# CHECK-OUT PHOTO (UPDATED RULES + CLOUDINARY)
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkout-photo", methods=["POST"])
 @token_required
@@ -526,21 +530,24 @@ def checkout_photo():
 
     data = request.get_json()
     img_data = data.get("image")
+    if not img_data:
+        return jsonify({"message": "No image"}), 400
 
-    header, encoded = img_data.split(",", 1)
-    image_bytes = base64.b64decode(encoded)
-
-    filename = f"{uid}_checkout_{int(datetime.now(timezone.utc).timestamp())}.jpg"
-    path = os.path.join(UPLOAD_FOLDER, filename)
-    with open(path, "wb") as f:
-        f.write(image_bytes)
+    # --- CLOUDINARY UPLOAD START ---
+    try:
+        upload_result = cloudinary.uploader.upload(img_data, folder="attendance_photos")
+        photo_url = upload_result.get("secure_url")
+    except Exception as e:
+        print("Cloudinary Upload Error:", e)
+        return jsonify({"message": "Image upload failed"}), 500
+    # --- CLOUDINARY UPLOAD END ---
 
     attendance_col.insert_one({
         "user_id": uid,
         "type": "checkout",
         "date": str(today),
         "time": datetime.now(timezone.utc),
-        "photo_url": f"/attendance_photos/{filename}",
+        "photo_url": photo_url, # Now storing Cloudinary URL
         "day_type": final_day_type,
         "status_indicator": status_indicator
     })
