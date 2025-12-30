@@ -18,7 +18,7 @@ def send_email(to_email: str, subject: str, body: str, from_name="GDMR Attendanc
     }
 
     payload = {
-        "sender": {"name": from_name, "email": "jinu.gdmr@gmail.com"},
+        "sender": {"name": from_name, "email": "connect.gdmr@gmail.com"},
         "to": [{"email": to_email}],
         "subject": subject,
         "textContent": body
