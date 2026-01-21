@@ -236,7 +236,8 @@ def login():
         "role": user.get("role", "employee"),
         "user": {
             "name": user.get("name"),
-            "email": user.get("email")
+            "email": user.get("email"),
+            "department": user.get("department", "") # Added department to response
         }
     })
 
@@ -417,7 +418,7 @@ def delete_manager(man_id):
 
 
 # -------------------------------------------------------------
-# PHASE 2: ATTENDANCE CORRECTION (3x PER MONTH LIMIT)
+# PHASE 2: ATTENDANCE CORRECTIONS (USER & MANAGER)
 # -------------------------------------------------------------
 @app.route("/api/attendance/request-correction", methods=["POST"])
 @token_required
@@ -449,6 +450,85 @@ def request_correction():
     corrections_col.insert_one(correction)
     return jsonify({"message": "Correction request sent to manager"}), 201
 
+# NEW: Fetch My Corrections (Employee History)
+@app.route("/api/my/corrections", methods=["GET"])
+@token_required
+def my_corrections():
+    uid = str(request.user["_id"])
+    rows = []
+    for c in corrections_col.find({"user_id": uid}).sort("created_at", -1):
+        c["_id"] = str(c["_id"])
+        rows.append(c)
+    return jsonify(rows)
+
+# NEW: Manager Corrections (Department Filtered)
+@app.route("/api/manager/corrections", methods=["GET"])
+@token_required
+def manager_corrections():
+    if request.user.get("role") != "manager": return jsonify({"message": "Unauthorized"}), 403
+    
+    my_dept = request.user.get("department")
+    # Find all user IDs in this department
+    dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept})]
+    
+    # Show requests from own department OR strictly assigned to manager
+    query = {"$or": [
+        {"manager_id": str(request.user["_id"])},
+        {"user_id": {"$in": dept_users}}
+    ]}
+    
+    rows = []
+    for c in corrections_col.find(query).sort("created_at", -1):
+        c["_id"] = str(c["_id"])
+        u = users_col.find_one({"_id": ObjectId(c["user_id"])})
+        c["employee_name"] = u["name"] if u else "Unknown"
+        rows.append(c)
+    return jsonify(rows)
+
+# NEW: Approve/Reject Correction (Updates Attendance Log)
+@app.route("/api/manager/approve-correction", methods=["POST"])
+@token_required
+def approve_correction():
+    if request.user.get("role") != "manager": return jsonify({"message": "Unauthorized"}), 403
+    data = request.json
+    cid = data.get("id")
+    action = data.get("action") # "Approved" or "Rejected"
+    
+    correction = corrections_col.find_one({"_id": ObjectId(cid)})
+    if not correction: return jsonify({"message": "Not found"}), 404
+    
+    corrections_col.update_one({"_id": ObjectId(cid)}, {"$set": {"status": action}})
+    
+    # --- UPDATE ATTENDANCE LOG ON APPROVAL ---
+    if action == "Approved":
+        try:
+            # Parse the new time string from frontend (e.g. 2025-01-21T09:00)
+            new_time_str = correction["new_time"]
+            if "T" in new_time_str and not new_time_str.endswith("Z") and "+" not in new_time_str:
+                 # Simple local time string
+                 new_dt = datetime.fromisoformat(new_time_str)
+            else:
+                 # ISO or Z formatted
+                 new_dt = datetime.fromisoformat(new_time_str.replace("Z", "+00:00"))
+            
+            today_str = str(new_dt.date())
+            
+            # Insert valid attendance record
+            attendance_col.insert_one({
+                "user_id": correction["user_id"],
+                "type": "checkin", # Default to checkin for correction
+                "date": today_str,
+                "time": new_dt,
+                "photo_url": None, # Manual correction
+                "status_indicator": "Corrected",
+                "correction_ref": cid
+            })
+        except Exception as e:
+            print("Error updating attendance log:", e)
+    # -----------------------------------------
+    
+    return jsonify({"message": f"Correction {action}"}), 200
+
 
 # -------------------------------------------------------------
 # PHASE 2: PMS (PERFORMANCE MANAGEMENT SYSTEM)
@@ -468,12 +548,60 @@ def submit_pms():
         "user_id": uid,
         "manager_id": request.user.get("manager_id"),
         "month": month,
-        "self_evaluation": data.get("evaluation_data"), # Array of {kra, score, remarks}
+        "self_evaluation": data.get("evaluation"), # Store scores
         "status": "Submitted_by_Employee",
         "submitted_at": datetime.now(timezone.utc)
     }
     pms_submissions_col.insert_one(submission)
     return jsonify({"message": "PMS Evaluation Submitted"}), 201
+
+# NEW: Get My PMS History
+@app.route("/api/my/pms", methods=["GET"])
+@token_required
+def my_pms():
+    uid = str(request.user["_id"])
+    rows = []
+    for p in pms_submissions_col.find({"user_id": uid}).sort("month", -1):
+        p["_id"] = str(p["_id"])
+        rows.append(p)
+    return jsonify(rows)
+
+# NEW: Manager View PMS (Department Filtered)
+@app.route("/api/manager/pms", methods=["GET"])
+@token_required
+def manager_pms():
+    if request.user.get("role") != "manager": return jsonify({"message": "Unauthorized"}), 403
+    
+    my_dept = request.user.get("department")
+    dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept})]
+    
+    query = {"$or": [
+        {"manager_id": str(request.user["_id"])},
+        {"user_id": {"$in": dept_users}}
+    ]}
+    
+    rows = []
+    for p in pms_submissions_col.find(query).sort("submitted_at", -1):
+        p["_id"] = str(p["_id"])
+        u = users_col.find_one({"_id": ObjectId(p["user_id"])})
+        p["employee_name"] = u["name"] if u else "Unknown"
+        rows.append(p)
+    return jsonify(rows)
+
+# NEW: Manager Finalize PMS
+@app.route("/api/manager/finalize-pms", methods=["POST"])
+@token_required
+def finalize_pms():
+    if request.user.get("role") != "manager": return jsonify({"message": "Unauthorized"}), 403
+    data = request.json
+    pid = data.get("id")
+    score = data.get("manager_score")
+    
+    pms_submissions_col.update_one(
+        {"_id": ObjectId(pid)}, 
+        {"$set": {"manager_score": score, "status": "Approved"}}
+    )
+    return jsonify({"message": "PMS Finalized"}), 200
 
 
 # -------------------------------------------------------------
@@ -732,7 +860,7 @@ def apply_leave():
 
 
 # -------------------------------------------------------------
-# ADMIN VIEW LEAVES
+# ADMIN VIEW LEAVES (UPDATED: DEPT FILTER)
 # -------------------------------------------------------------
 @app.route("/api/admin/leaves", methods=["GET"])
 @token_required
@@ -740,10 +868,20 @@ def admin_view_leaves():
     if request.user.get("role") not in ["admin", "manager"]:
         return jsonify({"message": "Unauthorized"}), 403
 
-    rows = []
-    employees = {str(e["_id"]): e for e in users_col.find({"role": {"$in": ["employee", "manager"]}})}
+    query = {}
     
-    for l in leaves_col.find():
+    # --- REQUIREMENT: DEPT FILTER FOR MANAGERS ---
+    if request.user.get("role") == "manager":
+        my_dept = request.user.get("department")
+        # Find all user IDs in this department
+        dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept})]
+        query = {"user_id": {"$in": dept_users}}
+    # ---------------------------------------------
+
+    rows = []
+    employees = {str(e["_id"]): e for e in users_col.find()}
+    
+    for l in leaves_col.find(query).sort("applied_at", -1):
         l["_id"] = str(l["_id"])
         user_id = l.get("user_id")
         user = employees.get(user_id)
@@ -828,7 +966,8 @@ def manager_my_employees():
 
     manager_id = str(request.user["_id"])
     rows = []
-    for u in users_col.find({"manager_id": manager_id, "role": "employee"}):
+    # Filter by department (Requirement)
+    for u in users_col.find({"department": request.user.get("department"), "role": "employee"}):
         u["_id"] = str(u["_id"])
         if "password" in u: del u["password"]
         rows.append(u)
