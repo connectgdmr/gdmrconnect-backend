@@ -28,6 +28,7 @@ cloudinary.config(
     api_secret = os.getenv('CLOUDINARY_API_SECRET')
 )
 
+# --- CORS CONFIG ---
 CORS(app, resources={
     r"/*": {
         "origins": [
@@ -48,16 +49,22 @@ MONGO_URI = os.getenv("MONGO_URI")
 client = MongoClient(MONGO_URI)
 db = client["attendance_db"]
 
+# --- COLLECTIONS ---
 users_col = db["users"]
 attendance_col = db["attendance"]
 leaves_col = db["leaves"]
 
-# UPLOAD_FOLDER is no longer strictly needed for persistent storage if using Cloudinary
+# --- PHASE 2 COLLECTIONS ---
+pms_submissions_col = db["pms_submissions"]
+corrections_col = db["attendance_corrections"]
+pip_records_col = db["pip_records"]
+
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 IST = pytz.timezone('Asia/Kolkata')
 
+# --- HELPERS ---
 def utc_to_ist(utc_datetime):
     if utc_datetime.tzinfo is None:
         utc_datetime = pytz.utc.localize(utc_datetime)
@@ -407,6 +414,97 @@ def delete_manager(man_id):
     users_col.update_many({"manager_id": man_id}, {"$set": {"manager_id": None}})
     
     return jsonify({"message": "Deleted"})
+
+
+# -------------------------------------------------------------
+# PHASE 2: ATTENDANCE CORRECTION (3x PER MONTH LIMIT)
+# -------------------------------------------------------------
+@app.route("/api/attendance/request-correction", methods=["POST"])
+@token_required
+def request_correction():
+    uid = str(request.user["_id"])
+    now_ist = datetime.now(IST)
+    month_str = now_ist.strftime("%Y-%m")
+    
+    # Check current month usage
+    usage_count = corrections_col.count_documents({
+        "user_id": uid, 
+        "month": month_str
+    })
+    
+    if usage_count >= 3:
+        return jsonify({"message": "Monthly limit of 3 corrections reached"}), 400
+
+    data = request.json
+    correction = {
+        "user_id": uid,
+        "manager_id": request.user.get("manager_id"),
+        "attendance_id": data.get("attendance_id"),
+        "new_time": data.get("new_time"),
+        "reason": data.get("reason"),
+        "status": "Pending",
+        "month": month_str,
+        "created_at": datetime.now(timezone.utc)
+    }
+    corrections_col.insert_one(correction)
+    return jsonify({"message": "Correction request sent to manager"}), 201
+
+
+# -------------------------------------------------------------
+# PHASE 2: PMS (PERFORMANCE MANAGEMENT SYSTEM)
+# -------------------------------------------------------------
+@app.route("/api/pms/submit", methods=["POST"])
+@token_required
+def submit_pms():
+    uid = str(request.user["_id"])
+    data = request.json
+    month = data.get("month") # e.g., "2025-12"
+
+    # Check if already submitted
+    if pms_submissions_col.find_one({"user_id": uid, "month": month}):
+        return jsonify({"message": "Evaluation already submitted for this month"}), 400
+
+    submission = {
+        "user_id": uid,
+        "manager_id": request.user.get("manager_id"),
+        "month": month,
+        "self_evaluation": data.get("evaluation_data"), # Array of {kra, score, remarks}
+        "status": "Submitted_by_Employee",
+        "submitted_at": datetime.now(timezone.utc)
+    }
+    pms_submissions_col.insert_one(submission)
+    return jsonify({"message": "PMS Evaluation Submitted"}), 201
+
+
+# -------------------------------------------------------------
+# PHASE 2: PIP (PERFORMANCE IMPROVEMENT PLAN)
+# -------------------------------------------------------------
+@app.route("/api/pip/initiate", methods=["POST"])
+@token_required
+def initiate_pip():
+    if request.user.get("role") != "manager":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data = request.json
+    pip_record = {
+        "employee_id": data.get("employee_id"),
+        "manager_id": str(request.user["_id"]),
+        "start_date": data.get("start_date"),
+        "end_date": data.get("end_date"),
+        "reason": data.get("reason"),
+        "status": "Active",
+        "weekly_updates": []
+    }
+    pip_records_col.insert_one(pip_record)
+    
+    # Notify Employee & HR (Optional Enhancement)
+    emp = users_col.find_one({"_id": ObjectId(data.get("employee_id"))})
+    if emp:
+        subject = "Action Required: Performance Improvement Plan Initiated"
+        body = f"Hello {emp['name']},\nA PIP has been initiated. Please check your dashboard for details."
+        threading.Thread(target=send_email, args=(emp["email"], subject, body), daemon=True).start()
+
+    return jsonify({"message": "PIP Initiated"}), 201
 
 
 # -------------------------------------------------------------
@@ -819,7 +917,7 @@ def auto_mark_absent():
 
 
 # -------------------------------------------------------------
-# ADMIN MONTHLY SUMMARY
+# ADMIN MONTHLY SUMMARY (UPDATED FOR PHASE 2: LEAVE NAMES)
 # -------------------------------------------------------------
 @app.route("/api/admin/attendance-summary", methods=["GET"])
 @token_required
@@ -854,12 +952,26 @@ def attendance_summary():
 
         present = {rec["user_id"] for rec in day_records if rec["type"] == "checkin"}
         absent = {rec["user_id"] for rec in day_records if rec["type"] == "absent"}
-        leaves_today = {l["user_id"] for l in leaves_col.find({"date": day_str, "status": "Approved"})}
-        not_checked_in = set(emp_ids) - present - leaves_today - absent
+        
+        # --- PHASE 2 UPDATE: GET NAMES OF PEOPLE ON LEAVE ---
+        leaves_today_docs = list(leaves_col.find({"date": day_str, "status": "Approved"}))
+        leaves_today_ids = set()
+        leave_names = []
+        
+        for l in leaves_today_docs:
+            leaves_today_ids.add(l["user_id"])
+            user_info = users_col.find_one({"_id": ObjectId(l["user_id"])})
+            if user_info:
+                leave_names.append(user_info["name"])
+
+        not_checked_in = set(emp_ids) - present - leaves_today_ids - absent
 
         summary["days"][day_str] = {
-            "present": list(present), "absent": list(absent),
-            "leave": list(leaves_today), "not_checked_in": list(not_checked_in),
+            "present": list(present), 
+            "absent": list(absent),
+            "leave": list(leaves_today_ids), 
+            "leave_names": leave_names, # Added for Export
+            "not_checked_in": list(not_checked_in),
         }
         current += timedelta(days=1)
 
