@@ -56,6 +56,7 @@ leaves_col = db["leaves"]
 
 # --- PHASE 2 COLLECTIONS ---
 pms_submissions_col = db["pms_submissions"]
+pms_assignments_col = db["pms_assignments"] # NEW: Manager assigns questions here
 corrections_col = db["attendance_corrections"]
 pip_records_col = db["pip_records"]
 
@@ -237,7 +238,7 @@ def login():
         "user": {
             "name": user.get("name"),
             "email": user.get("email"),
-            "department": user.get("department", "") # Added department to response
+            "department": user.get("department", "")
         }
     })
 
@@ -402,7 +403,7 @@ def delete_employee(emp_id):
     return jsonify({"message": "Deleted"})
 
 # -------------------------------------------------------------
-# DELETE MANAGER (Existing endpoint updated to be specific)
+# DELETE MANAGER
 # -------------------------------------------------------------
 @app.route("/api/admin/managers/<man_id>", methods=["DELETE"])
 @token_required
@@ -417,9 +418,9 @@ def delete_manager(man_id):
     return jsonify({"message": "Deleted"})
 
 
-# -------------------------------------------------------------
-# PHASE 2: ATTENDANCE CORRECTIONS (USER & MANAGER)
-# -------------------------------------------------------------
+# ==============================================================================
+#  PHASE 2: ATTENDANCE CORRECTIONS
+# ==============================================================================
 @app.route("/api/attendance/request-correction", methods=["POST"])
 @token_required
 def request_correction():
@@ -427,7 +428,7 @@ def request_correction():
     now_ist = datetime.now(IST)
     month_str = now_ist.strftime("%Y-%m")
     
-    # Check current month usage
+    # 3x Monthly Limit Check
     usage_count = corrections_col.count_documents({
         "user_id": uid, 
         "month": month_str
@@ -450,7 +451,7 @@ def request_correction():
     corrections_col.insert_one(correction)
     return jsonify({"message": "Correction request sent to manager"}), 201
 
-# NEW: Fetch My Corrections (Employee History)
+# User: Fetch own corrections
 @app.route("/api/my/corrections", methods=["GET"])
 @token_required
 def my_corrections():
@@ -461,7 +462,7 @@ def my_corrections():
         rows.append(c)
     return jsonify(rows)
 
-# NEW: Manager Corrections (Department Filtered)
+# Manager: Fetch pending (Filtered by Department)
 @app.route("/api/manager/corrections", methods=["GET"])
 @token_required
 def manager_corrections():
@@ -471,7 +472,6 @@ def manager_corrections():
     # Find all user IDs in this department
     dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept})]
     
-    # Show requests from own department OR strictly assigned to manager
     query = {"$or": [
         {"manager_id": str(request.user["_id"])},
         {"user_id": {"$in": dept_users}}
@@ -485,7 +485,7 @@ def manager_corrections():
         rows.append(c)
     return jsonify(rows)
 
-# NEW: Approve/Reject Correction (Updates Attendance Log)
+# Manager: Approve/Reject Correction (Updates Attendance Log)
 @app.route("/api/manager/approve-correction", methods=["POST"])
 @token_required
 def approve_correction():
@@ -499,46 +499,75 @@ def approve_correction():
     
     corrections_col.update_one({"_id": ObjectId(cid)}, {"$set": {"status": action}})
     
-    # --- UPDATE ATTENDANCE LOG ON APPROVAL ---
+    # --- IF APPROVED, UPDATE ATTENDANCE TABLE ---
     if action == "Approved":
         try:
-            # Parse the new time string from frontend (e.g. 2025-01-21T09:00)
             new_time_str = correction["new_time"]
             if "T" in new_time_str and not new_time_str.endswith("Z") and "+" not in new_time_str:
-                 # Simple local time string
                  new_dt = datetime.fromisoformat(new_time_str)
             else:
-                 # ISO or Z formatted
                  new_dt = datetime.fromisoformat(new_time_str.replace("Z", "+00:00"))
             
-            today_str = str(new_dt.date())
-            
-            # Insert valid attendance record
             attendance_col.insert_one({
                 "user_id": correction["user_id"],
-                "type": "checkin", # Default to checkin for correction
-                "date": today_str,
+                "type": "checkin", 
+                "date": str(new_dt.date()),
                 "time": new_dt,
-                "photo_url": None, # Manual correction
+                "photo_url": None, 
                 "status_indicator": "Corrected",
                 "correction_ref": cid
             })
         except Exception as e:
             print("Error updating attendance log:", e)
-    # -----------------------------------------
     
     return jsonify({"message": f"Correction {action}"}), 200
 
 
-# -------------------------------------------------------------
-# PHASE 2: PMS (PERFORMANCE MANAGEMENT SYSTEM)
-# -------------------------------------------------------------
+# ==============================================================================
+#  PHASE 2: DYNAMIC PMS (MANAGER ASSIGN & REVIEW)
+# ==============================================================================
+
+# 1. Manager Assigns Questions
+@app.route("/api/manager/assign-pms", methods=["POST"])
+@token_required
+def assign_pms():
+    if request.user.get("role") != "manager": return jsonify({"message": "Unauthorized"}), 403
+    data = request.json
+    employee_id = data.get("employee_id")
+    questions = data.get("questions") # List of strings
+    month = data.get("month") # YYYY-MM
+    
+    # Update or Insert Assignment
+    pms_assignments_col.update_one(
+        {"employee_id": employee_id, "month": month},
+        {"$set": {
+            "manager_id": str(request.user["_id"]),
+            "questions": questions,
+            "created_at": datetime.now(timezone.utc)
+        }},
+        upsert=True
+    )
+    return jsonify({"message": "PMS Questions Assigned"}), 200
+
+# 2. Employee Fetches Assigned Questions
+@app.route("/api/employee/pms-assignment", methods=["GET"])
+@token_required
+def get_pms_assignment():
+    uid = str(request.user["_id"])
+    month = datetime.now(IST).strftime("%Y-%m")
+    
+    assignment = pms_assignments_col.find_one({"employee_id": uid, "month": month})
+    
+    questions = assignment.get("questions", []) if assignment else []
+    return jsonify({"questions": questions}), 200
+
+# 3. Employee Submits Responses
 @app.route("/api/pms/submit", methods=["POST"])
 @token_required
 def submit_pms():
     uid = str(request.user["_id"])
     data = request.json
-    month = data.get("month") # e.g., "2025-12"
+    month = data.get("month")
 
     # Check if already submitted
     if pms_submissions_col.find_one({"user_id": uid, "month": month}):
@@ -548,25 +577,14 @@ def submit_pms():
         "user_id": uid,
         "manager_id": request.user.get("manager_id"),
         "month": month,
-        "self_evaluation": data.get("evaluation"), # Store scores
+        "responses": data.get("responses"), # Answers keyed by question
         "status": "Submitted_by_Employee",
         "submitted_at": datetime.now(timezone.utc)
     }
     pms_submissions_col.insert_one(submission)
     return jsonify({"message": "PMS Evaluation Submitted"}), 201
 
-# NEW: Get My PMS History
-@app.route("/api/my/pms", methods=["GET"])
-@token_required
-def my_pms():
-    uid = str(request.user["_id"])
-    rows = []
-    for p in pms_submissions_col.find({"user_id": uid}).sort("month", -1):
-        p["_id"] = str(p["_id"])
-        rows.append(p)
-    return jsonify(rows)
-
-# NEW: Manager View PMS (Department Filtered)
+# 4. Manager Reviews (Filtered by Dept)
 @app.route("/api/manager/pms", methods=["GET"])
 @token_required
 def manager_pms():
@@ -588,7 +606,7 @@ def manager_pms():
         rows.append(p)
     return jsonify(rows)
 
-# NEW: Manager Finalize PMS
+# 5. Manager Finalizes Score
 @app.route("/api/manager/finalize-pms", methods=["POST"])
 @token_required
 def finalize_pms():
@@ -602,6 +620,17 @@ def finalize_pms():
         {"$set": {"manager_score": score, "status": "Approved"}}
     )
     return jsonify({"message": "PMS Finalized"}), 200
+
+# 6. Employee History
+@app.route("/api/my/pms", methods=["GET"])
+@token_required
+def my_pms():
+    uid = str(request.user["_id"])
+    rows = []
+    for p in pms_submissions_col.find({"user_id": uid}).sort("month", -1):
+        p["_id"] = str(p["_id"])
+        rows.append(p)
+    return jsonify(rows)
 
 
 # -------------------------------------------------------------
@@ -625,18 +654,17 @@ def initiate_pip():
     }
     pip_records_col.insert_one(pip_record)
     
-    # Notify Employee & HR (Optional Enhancement)
     emp = users_col.find_one({"_id": ObjectId(data.get("employee_id"))})
     if emp:
-        subject = "Action Required: Performance Improvement Plan Initiated"
-        body = f"Hello {emp['name']},\nA PIP has been initiated. Please check your dashboard for details."
+        subject = "Performance Improvement Plan Initiated"
+        body = f"Hello {emp['name']},\nA PIP has been initiated. Please check your dashboard."
         threading.Thread(target=send_email, args=(emp["email"], subject, body), daemon=True).start()
 
     return jsonify({"message": "PIP Initiated"}), 201
 
 
 # -------------------------------------------------------------
-# CHECK-IN WITH PHOTO (UPDATED RULES + CLOUDINARY)
+# CHECK-IN WITH PHOTO
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkin-photo", methods=["POST"])
 @token_required
@@ -663,12 +691,10 @@ def checkin_photo():
     status_indicator = "On Time"
 
     if current_time < AFTERNOON_START_THRESHOLD:
-        # Morning Session
         checkin_type = "full"
         if current_time > MORNING_LATE_CUTOFF:
-            status_indicator = "Late" # Frontend shows "Late Check-in"
+            status_indicator = "Late"
     else:
-        # Afternoon Session
         checkin_type = "half-day"
         if current_time > AFTERNOON_LATE_CUTOFF:
              status_indicator = "Late"
@@ -678,15 +704,13 @@ def checkin_photo():
     if not img_data:
         return jsonify({"message": "No image"}), 400
 
-    # --- CLOUDINARY UPLOAD START ---
-    # img_data comes as "data:image/jpeg;base64,....." which Cloudinary supports directly
+    # --- CLOUDINARY UPLOAD ---
     try:
         upload_result = cloudinary.uploader.upload(img_data, folder="attendance_photos")
         photo_url = upload_result.get("secure_url")
     except Exception as e:
         print("Cloudinary Upload Error:", e)
         return jsonify({"message": "Image upload failed"}), 500
-    # --- CLOUDINARY UPLOAD END ---
 
     attendance_col.insert_one({
         "user_id": uid,
@@ -694,15 +718,15 @@ def checkin_photo():
         "date": str(today),
         "day_type": checkin_type,
         "time": datetime.now(timezone.utc),
-        "photo_url": photo_url, # Now storing Cloudinary URL
+        "photo_url": photo_url, 
         "status_indicator": status_indicator 
     })
 
-    return jsonify({"message": f"Checked in ({checkin_type}, {status_indicator})"}), 200
+    return jsonify({"message": f"Checked in ({status_indicator})"}), 200
 
 
 # -------------------------------------------------------------
-# CHECK-OUT PHOTO (UPDATED RULES + CLOUDINARY)
+# CHECK-OUT PHOTO
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkout-photo", methods=["POST"])
 @token_required
@@ -728,7 +752,7 @@ def checkout_photo():
     FULL_DAY_OUT_START = time(18, 0)
     LATE_CHECKOUT_START = time(19, 30)
 
-    # Convert checkin time to IST to compare
+    # Convert checkin time to IST
     checkin_dt = utc_to_ist(checkin["time"])
     checkin_time = checkin_dt.time()
 
@@ -736,21 +760,18 @@ def checkout_photo():
     status_indicator = "On Time"
 
     # --- Day Type Logic ---
-    # If checked in morning (< 1 PM) AND checking out between 1 PM and 2 PM -> Half Day
     if checkin_time < time(13, 0) and (HALF_DAY_OUT_START <= current_time <= HALF_DAY_OUT_END):
         final_day_type = "half-day"
         attendance_col.update_one({"_id": checkin["_id"]}, {"$set": {"day_type": "half-day"}})
     
     # --- Status Logic ---
-    # "if checkout late show late checkout" -> > 7:30 PM
     if current_time > LATE_CHECKOUT_START:
-        status_indicator = "Late Checkout" # or just "Late"
+        status_indicator = "Late Checkout"
     elif current_time < FULL_DAY_OUT_START:
-        # Check if it is a valid Half Day checkout time (1-2 PM)
         if final_day_type == "half-day" and (HALF_DAY_OUT_START <= current_time <= HALF_DAY_OUT_END):
              status_indicator = "On Time"
         else:
-             status_indicator = "Early" # Frontend shows "Early Checkout"
+             status_indicator = "Early"
     else:
         status_indicator = "On Time"
 
@@ -759,21 +780,19 @@ def checkout_photo():
     if not img_data:
         return jsonify({"message": "No image"}), 400
 
-    # --- CLOUDINARY UPLOAD START ---
     try:
         upload_result = cloudinary.uploader.upload(img_data, folder="attendance_photos")
         photo_url = upload_result.get("secure_url")
     except Exception as e:
         print("Cloudinary Upload Error:", e)
         return jsonify({"message": "Image upload failed"}), 500
-    # --- CLOUDINARY UPLOAD END ---
 
     attendance_col.insert_one({
         "user_id": uid,
         "type": "checkout",
         "date": str(today),
         "time": datetime.now(timezone.utc),
-        "photo_url": photo_url, # Now storing Cloudinary URL
+        "photo_url": photo_url,
         "day_type": final_day_type,
         "status_indicator": status_indicator
     })
@@ -787,7 +806,7 @@ def serve_attendance_photo(filename):
 
 
 # -------------------------------------------------------------
-# APPLY LEAVE (UPDATED FOR MULTIPLE DAYS)
+# APPLY LEAVE
 # -------------------------------------------------------------
 @app.route("/api/leaves", methods=["POST"])
 @token_required
@@ -795,11 +814,10 @@ def apply_leave():
     if request.user.get("role") not in ["employee", "manager"]:
         return jsonify({"message": "Unauthorized"}), 403
 
-    # New fields: from_date, to_date. Fallback to 'date' for old single day logic support if needed
     from_date = request.form.get("from_date")
     to_date = request.form.get("to_date")
     
-    # Backward compatibility or Single Day
+    # Backward compatibility
     if not from_date and request.form.get("date"):
         from_date = request.form.get("date")
         to_date = request.form.get("date")
@@ -824,28 +842,23 @@ def apply_leave():
     max_past_date = now_ist_date - timedelta(days=7) 
 
     if f_date < max_past_date:
-        return jsonify({
-            "message": f"Leave application for past dates is limited to 7 days."
-        }), 400
+        return jsonify({"message": f"Leave application for past dates is limited to 7 days."}), 400
 
     attachment_url = None
     file = request.files.get("attachment")
     
-    # --- CLOUDINARY UPLOAD CHANGE ---
     if file:
         try:
             upload_result = cloudinary.uploader.upload(file, folder="leave_attachments")
             attachment_url = upload_result.get("secure_url")
         except Exception as e:
-            print("Cloudinary Upload Error:", e)
             return jsonify({"message": "File upload failed"}), 500
-    # --------------------------------
 
     leave = {
         "user_id": str(request.user["_id"]),
         "from_date": from_date,
         "to_date": to_date,
-        "date": from_date, # Keep for sorting/simple view fallback
+        "date": from_date, 
         "type": leave_type,
         "reason": reason,
         "status": "Pending",
@@ -860,7 +873,7 @@ def apply_leave():
 
 
 # -------------------------------------------------------------
-# ADMIN VIEW LEAVES (UPDATED: DEPT FILTER)
+# ADMIN VIEW LEAVES (UPDATED: APPLIED DATE + DEPT FILTER)
 # -------------------------------------------------------------
 @app.route("/api/admin/leaves", methods=["GET"])
 @token_required
@@ -870,21 +883,18 @@ def admin_view_leaves():
 
     query = {}
     
-    # --- REQUIREMENT: DEPT FILTER FOR MANAGERS ---
+    # --- DEPT FILTER FOR MANAGERS ---
     if request.user.get("role") == "manager":
         my_dept = request.user.get("department")
-        # Find all user IDs in this department
         dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept})]
         query = {"user_id": {"$in": dept_users}}
-    # ---------------------------------------------
 
     rows = []
     employees = {str(e["_id"]): e for e in users_col.find()}
     
     for l in leaves_col.find(query).sort("applied_at", -1):
         l["_id"] = str(l["_id"])
-        user_id = l.get("user_id")
-        user = employees.get(user_id)
+        user = employees.get(l.get("user_id"))
         
         if user:
             l["employee_name"] = user["name"]
@@ -892,6 +902,9 @@ def admin_view_leaves():
         else:
             l["employee_name"] = "Unknown"
             l["employee_department"] = ""
+        
+        # --- APPLIED DATE VISIBILITY ---
+        l["applied_at_str"] = l["applied_at"].strftime("%Y-%m-%d") if l.get("applied_at") else l.get("date")
             
         rows.append(l)
 
@@ -905,8 +918,7 @@ def admin_view_leaves():
 @token_required
 def update_leave(leave_id):
     role = request.user.get("role")
-    if role not in ["admin", "manager"]:
-        return jsonify({"message": "Unauthorized"}), 403
+    if role not in ["admin", "manager"]: return jsonify({"message": "Unauthorized"}), 403
 
     data = request.json
     action = data.get("status")
@@ -942,13 +954,7 @@ def update_leave(leave_id):
     try:
         user = users_col.find_one({"_id": ObjectId(leave["user_id"])})
         if user:
-            subject = "Leave Update"
-            date_info = f"{leave.get('from_date')} to {leave.get('to_date')}" if leave.get('from_date') != leave.get('to_date') else leave.get('date')
-            body = (
-                f"Your leave request for {date_info} has been updated.\n"
-                f"Manager: {ms}\nHR: {as_}\nFinal Status: {final_status}"
-            )
-            threading.Thread(target=send_email, args=(user["email"], subject, body), daemon=True).start()
+            threading.Thread(target=send_email, args=(user["email"], "Leave Update", f"Status: {final_status}"), daemon=True).start()
     except Exception as e:
         print("Email error:", e)
 
@@ -964,7 +970,6 @@ def manager_my_employees():
     if request.user.get("role") != "manager":
         return jsonify({"message": "Unauthorized"}), 403
 
-    manager_id = str(request.user["_id"])
     rows = []
     # Filter by department (Requirement)
     for u in users_col.find({"department": request.user.get("department"), "role": "employee"}):
@@ -1014,12 +1019,10 @@ def my_leaves():
 @app.route("/api/admin/attendance/<emp_id>", methods=["GET"])
 @token_required
 def admin_employee_attendance(emp_id):
-    if request.user.get("role") != "admin":
-        return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
 
     emp = users_col.find_one({"_id": ObjectId(emp_id)})
-    if not emp:
-        return jsonify({"message": "Employee not found"}), 404
+    if not emp: return jsonify({"message": "Employee not found"}), 404
 
     records = []
     for a in attendance_col.find({"user_id": emp_id}).sort("time", -1):
@@ -1033,24 +1036,39 @@ def admin_employee_attendance(emp_id):
 
 
 # -------------------------------------------------------------
-# AUTO ABSENT
+# AUTO ABSENT (UPDATED: Creates Leave Record)
 # -------------------------------------------------------------
 @app.route("/api/attendance/auto-absent", methods=["POST"])
 def auto_mark_absent():
     today = datetime.now(IST).date()
+    today_str = str(today)
     all_users = users_col.find({"role": {"$in": ["employee", "manager"]}})
 
     for emp in all_users:
         uid = str(emp["_id"])
-        checked_in = attendance_col.find_one({
-            "user_id": uid, "type": "checkin", "date": str(today)
-        })
-        if checked_in: continue
-
-        if not attendance_col.find_one({"user_id": uid, "type": "absent", "date": str(today)}):
-            attendance_col.insert_one({
-                "user_id": uid, "type": "absent", "date": str(today), "time": datetime.now(timezone.utc)
-            })
+        
+        # If no check-in today
+        if not attendance_col.find_one({"user_id": uid, "type": "checkin", "date": today_str}):
+            
+            # If no approved leave already exists
+            if not leaves_col.find_one({"user_id": uid, "status": "Approved", "date": today_str}):
+                
+                # 1. Attendance Log (Absent)
+                if not attendance_col.find_one({"user_id": uid, "type": "absent", "date": today_str}):
+                    attendance_col.insert_one({
+                        "user_id": uid, "type": "absent", "date": today_str, "time": datetime.now(timezone.utc)
+                    })
+                
+                # 2. Leaves Record (System Absent) -> Shows in "My Leaves"
+                if not leaves_col.find_one({"user_id": uid, "type": "System Absent", "date": today_str}):
+                    leaves_col.insert_one({
+                        "user_id": uid,
+                        "from_date": today_str, "to_date": today_str, "date": today_str,
+                        "type": "System Absent",
+                        "reason": "Not checked in",
+                        "status": "Absent", 
+                        "applied_at": datetime.now(timezone.utc)
+                    })
 
     return jsonify({"message": "Absent auto-marking completed"}), 200
 
@@ -1068,51 +1086,39 @@ def attendance_summary():
     if not month_param: return jsonify({"message": "month required"}), 400
 
     year, month = map(int, month_param.split("-"))
-    start_date = datetime(year, month, 1, tzinfo=IST)
-
-    next_month = month + 1 if month < 12 else 1
-    next_year = year if month < 12 else year + 1
-    end_date = datetime(next_year, next_month, 1, tzinfo=IST)
+    start = datetime(year, month, 1, tzinfo=IST)
+    end = (start + timedelta(days=32)).replace(day=1)
 
     employees = list(users_col.find({"role": {"$in": ["employee", "manager"]}}))
     emp_ids = [str(e["_id"]) for e in employees]
 
     summary = {"total_employees": len(employees), "days": {}}
 
-    current = start_date
-    while current < end_date:
-        day_str = current.date().isoformat()
-        day_records = list(attendance_col.find({
-            "time": {
-                "$gte": datetime.combine(current.date(), datetime.min.time(), tzinfo=IST),
-                "$lt": datetime.combine(current.date(), datetime.max.time(), tzinfo=IST),
-            }
-        }))
-
-        present = {rec["user_id"] for rec in day_records if rec["type"] == "checkin"}
-        absent = {rec["user_id"] for rec in day_records if rec["type"] == "absent"}
+    curr = start
+    while curr < end:
+        day_str = curr.date().isoformat()
+        recs = list(attendance_col.find({"date": day_str}))
+        present = {r["user_id"] for r in recs if r["type"] == "checkin"}
+        # Include Approved and Auto-Absent leaves
+        leaves_today_docs = list(leaves_col.find({"date": day_str, "status": {"$in": ["Approved", "Absent"]}}))
         
-        # --- PHASE 2 UPDATE: GET NAMES OF PEOPLE ON LEAVE ---
-        leaves_today_docs = list(leaves_col.find({"date": day_str, "status": "Approved"}))
-        leaves_today_ids = set()
         leave_names = []
-        
+        leave_ids = set()
         for l in leaves_today_docs:
-            leaves_today_ids.add(l["user_id"])
-            user_info = users_col.find_one({"_id": ObjectId(l["user_id"])})
-            if user_info:
-                leave_names.append(user_info["name"])
+            leave_ids.add(l["user_id"])
+            u = users_col.find_one({"_id": ObjectId(l["user_id"])})
+            if u: leave_names.append(u["name"])
 
-        not_checked_in = set(emp_ids) - present - leaves_today_ids - absent
+        not_checked_in = set(emp_ids) - present - leave_ids
 
         summary["days"][day_str] = {
             "present": list(present), 
-            "absent": list(absent),
-            "leave": list(leaves_today_ids), 
-            "leave_names": leave_names, # Added for Export
+            "absent": [], 
+            "leave": list(leave_ids), 
+            "leave_names": leave_names,
             "not_checked_in": list(not_checked_in),
         }
-        current += timedelta(days=1)
+        curr += timedelta(days=1)
 
     return jsonify(summary), 200
 
@@ -1123,28 +1129,16 @@ def attendance_summary():
 @app.route("/api/admin/today-stats", methods=["GET"])
 @token_required
 def today_stats():
-    if request.user.get("role") != "admin":
-        return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
 
-    today = datetime.now(IST).date()
-    employees = list(users_col.find({"role": {"$in": ["employee", "manager"]}}))
-    emp_ids = [str(e["_id"]) for e in employees]
-
-    day_records = list(attendance_col.find({
-        "time": {
-            "$gte": datetime.combine(today, datetime.min.time(), tzinfo=IST),
-            "$lt": datetime.combine(today, datetime.max.time(), tzinfo=IST),
-        }
-    }))
-
-    present = {rec["user_id"] for rec in day_records if rec["type"] == "checkin"}
-    absent = {rec["user_id"] for rec in day_records if rec["type"] == "absent"}
-    leaves_today = {l["user_id"] for l in leaves_col.find({"date": str(today), "status": "Approved"})}
-    not_checked_in = set(emp_ids) - present - leaves_today - absent
+    today = str(datetime.now(IST).date())
+    present = attendance_col.count_documents({"date": today, "type": "checkin"})
+    leaves = leaves_col.count_documents({"date": today, "status": {"$in": ["Approved", "Absent"]}})
+    total = users_col.count_documents({"role": {"$in": ["employee", "manager"]}})
+    not_in = total - present - leaves
 
     return jsonify({
-        "present": len(present), "absent": len(absent),
-        "leave": len(leaves_today), "not_checked_in": len(not_checked_in),
+        "present": present, "leave": leaves, "not_checked_in": not_in,
     }), 200
 
 
