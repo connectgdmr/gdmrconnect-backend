@@ -56,7 +56,7 @@ leaves_col = db["leaves"]
 
 # --- PHASE 2 COLLECTIONS ---
 pms_submissions_col = db["pms_submissions"]
-pms_assignments_col = db["pms_assignments"] # NEW: Stores Manager Questions
+pms_assignments_col = db["pms_assignments"] # NEW: Manager assigns questions here
 corrections_col = db["attendance_corrections"]
 pip_records_col = db["pip_records"]
 
@@ -85,10 +85,11 @@ def format_datetime_ist(dt):
 def home():
     return "Backend running ✅", 200
 
+# Keep this for backward compatibility if old files still exist locally
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
-    uploads_dir = os.path.join(os.getcwd(), "uploads")
-    return send_from_directory(uploads_dir, filename)
+        uploads_dir = os.path.join(os.getcwd(), "uploads")
+        return send_from_directory(uploads_dir, filename)
 
 # -------------------------------------------------------------
 # AUTH MIDDLEWARE
@@ -117,7 +118,104 @@ def token_required(f):
 
 
 # -------------------------------------------------------------
-# AUTH & USER MANAGEMENT ROUTES
+# FORGOT PASSWORD
+# -------------------------------------------------------------
+@app.route("/api/forgot-password", methods=["POST"])
+def forgot_password():
+    data = request.json
+    email = data.get("email")
+
+    user = users_col.find_one({"email": email})
+    if not user:
+        return jsonify({"message": "If this email exists, a password reset has been sent."}), 200
+
+    temp_password = generate_random_password()
+    hashed = bcrypt.generate_password_hash(temp_password).decode("utf-8")
+    
+    users_col.update_one({"_id": user["_id"]}, {"$set": {"password": hashed}})
+
+    subject = "Password Reset Request"
+    body = (
+        f"Hello {user['name']},\n\n"
+        "We received a request to reset your password.\n"
+        f"Your new temporary password is: {temp_password}\n\n"
+        "Please login and change your password immediately."
+    )
+    
+    threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
+
+    return jsonify({"message": "Password reset email sent."}), 200
+
+
+# -------------------------------------------------------------
+# ADMIN REGISTER
+# -------------------------------------------------------------
+@app.route("/api/register-admin", methods=["POST"])
+def register_admin():
+    data = request.json
+    email = data.get("email")
+    name = data.get("name", "Admin")
+    password = data.get("password", "admin123")
+
+    if users_col.find_one({"email": email}):
+        return jsonify({"message": "Admin already exists"}), 400
+
+    hashed = bcrypt.generate_password_hash(password).decode("utf-8")
+    user_doc = {
+        "name": name,
+        "email": email,
+        "password": hashed,
+        "role": "admin",
+        "department": "",
+        "position": "",
+        "late_checkin_count_monthly": 0,
+        "last_late_checkin_month": None,
+    }
+    res = users_col.insert_one(user_doc)
+    return jsonify({"message": "Admin created", "id": str(res.inserted_id)}), 201
+
+
+# -------------------------------------------------------------
+# MANAGER REGISTER
+# -------------------------------------------------------------
+@app.route("/api/register-manager", methods=["POST"])
+@token_required
+def register_manager():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data = request.get_json()
+    name = data.get("name")
+    email = data.get("email")
+    password = data.get("password")
+    department = data.get("department", "Management") 
+
+    if not name or not email or not password or not department:
+        return jsonify({"message": "Name, Email, Password, and Department are required"}), 400
+
+    if users_col.find_one({"email": email}):
+        return jsonify({"message": "Email already exists"}), 400
+
+    hashed_pw = bcrypt.generate_password_hash(password).decode("utf-8")
+
+    new_user = {
+        "name": name,
+        "email": email,
+        "password": hashed_pw,
+        "role": "manager",
+        "department": department,
+        "position": "Manager",
+        "created_at": datetime.now(timezone.utc),
+        "late_checkin_count_monthly": 0, 
+        "last_late_checkin_month": None,
+    }
+
+    users_col.insert_one(new_user)
+    return jsonify({"message": "Manager created successfully!"}), 201
+
+
+# -------------------------------------------------------------
+# LOGIN
 # -------------------------------------------------------------
 @app.route("/api/login", methods=["POST"])
 def login():
@@ -144,155 +242,185 @@ def login():
         }
     })
 
-@app.route("/api/forgot-password", methods=["POST"])
-def forgot_password():
-    data = request.json
-    email = data.get("email")
-    user = users_col.find_one({"email": email})
-    if not user:
-        return jsonify({"message": "If this email exists, a password reset has been sent."}), 200
 
-    temp_password = generate_random_password()
-    hashed = bcrypt.generate_password_hash(temp_password).decode("utf-8")
-    users_col.update_one({"_id": user["_id"]}, {"$set": {"password": hashed}})
-
-    subject = "Password Reset Request"
-    body = f"Hello {user['name']},\n\nYour new temporary password is: {temp_password}\n\nPlease login immediately."
-    threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
-    return jsonify({"message": "Password reset email sent."}), 200
-
-@app.route("/api/register-admin", methods=["POST"])
-def register_admin():
-    data = request.json
-    email = data.get("email")
-    if users_col.find_one({"email": email}):
-        return jsonify({"message": "Admin already exists"}), 400
-
-    hashed = bcrypt.generate_password_hash(data.get("password", "admin123")).decode("utf-8")
-    users_col.insert_one({
-        "name": data.get("name", "Admin"),
-        "email": email,
-        "password": hashed,
-        "role": "admin",
-        "department": "",
-        "position": "",
-        "late_checkin_count_monthly": 0,
-        "last_late_checkin_month": None,
-    })
-    return jsonify({"message": "Admin created"}), 201
-
-@app.route("/api/register-manager", methods=["POST"])
-@token_required
-def register_manager():
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
-    data = request.get_json()
-    if users_col.find_one({"email": data.get("email")}): return jsonify({"message": "Email already exists"}), 400
-
-    hashed = bcrypt.generate_password_hash(data.get("password")).decode("utf-8")
-    users_col.insert_one({
-        "name": data.get("name"),
-        "email": data.get("email"),
-        "password": hashed,
-        "role": "manager",
-        "department": data.get("department", "Management"),
-        "position": "Manager",
-        "created_at": datetime.now(timezone.utc),
-        "late_checkin_count_monthly": 0,
-        "last_late_checkin_month": None,
-    })
-    return jsonify({"message": "Manager created successfully!"}), 201
-
+# -------------------------------------------------------------
+# ADMIN: ADD EMPLOYEE
+# -------------------------------------------------------------
 @app.route("/api/admin/employees", methods=["POST"])
 @token_required
 def add_employee():
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
     data = request.json
-    if users_col.find_one({"email": data.get("email")}): return jsonify({"message": "User exists"}), 400
+    name = data.get("name")
+    email = data.get("email")
+    department = data.get("department", "")
+    position = data.get("position", "")
+    manager_id = data.get("manager_id") 
+
+    if users_col.find_one({"email": email}):
+        return jsonify({"message": "User with this email already exists"}), 400
 
     password = generate_random_password()
     hashed = bcrypt.generate_password_hash(password).decode("utf-8")
-    res = users_col.insert_one({
-        "name": data.get("name"),
-        "email": data.get("email"),
+
+    user_doc = {
+        "name": name,
+        "email": email,
         "password": hashed,
         "role": "employee",
-        "department": data.get("department"),
-        "position": data.get("position"),
-        "manager_id": data.get("manager_id"),
+        "department": department,
+        "position": position,
         "created_at": datetime.now(timezone.utc),
-        "late_checkin_count_monthly": 0,
+        "manager_id": manager_id,
+        "late_checkin_count_monthly": 0, 
         "last_late_checkin_month": None,
-    })
-    
-    subject = "Welcome to GDMR Connect"
-    body = f"Dear {data.get('name')},\n\nUsername: {data.get('email')}\nPassword: {password}\n\nLogin immediately."
-    threading.Thread(target=send_email, args=(data.get("email"), subject, body), daemon=True).start()
+    }
+
+    res = users_col.insert_one(user_doc)
+
+    subject = "Welcome to GDMR Connect: Your New Account Credentials"
+    body = (
+        f"Dear {name},\n\n"
+        "Your new employee account for the GDMR Connect Attendance App has been successfully created.\n\n"
+        "Please use the following credentials to log in:\n"
+        f"Username (Email): {email}\n"
+        f"Temporary Password: {password}\n\n"
+        "We recommend logging in as soon as possible and updating your password.\n\n"
+        "Thank you,\n"
+        "The GDMR Connect Team"
+    )
+
+    threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
+
     return jsonify({"message": "Employee created", "id": str(res.inserted_id)}), 201
 
+
+# -------------------------------------------------------------
+# ADMIN: LIST EMPLOYEES
+# -------------------------------------------------------------
 @app.route("/api/admin/employees", methods=["GET"])
 @token_required
 def list_employees():
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
     managers = {str(m["_id"]): m["name"] for m in users_col.find({"role": "manager"})}
+
     rows = []
     for u in users_col.find({"role": {"$in": ["employee", "manager"]}}):
         u["_id"] = str(u["_id"])
-        if "password" in u: del u["password"]
-        u["manager_name"] = managers.get(u.get("manager_id")) if u.get("manager_id") else None
+        if "password" in u:
+            del u["password"]
+        
+        manager_id = u.get("manager_id")
+        u["manager_name"] = managers.get(manager_id) if manager_id else None
+
         rows.append(u)
+
     return jsonify(rows)
 
+
+# -------------------------------------------------------------
+# ADMIN: LIST MANAGERS
+# -------------------------------------------------------------
 @app.route("/api/admin/managers", methods=["GET"])
 @token_required
 def list_managers():
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
     managers = []
     for m in users_col.find({"role": "manager"}):
         m["_id"] = str(m["_id"])
-        if "password" in m: del m["password"]
+        if "password" in m:
+            del m["password"]
         managers.append(m)
+
     return jsonify(managers)
 
+
+# -------------------------------------------------------------
+# EDIT EMPLOYEE
+# -------------------------------------------------------------
 @app.route("/api/admin/employees/<emp_id>", methods=["PUT"])
 @token_required
 def edit_employee(emp_id):
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
     data = request.json
-    update = {k: data[k] for k in ["name", "department", "position", "email", "manager_id"] if k in data}
-    if "manager_id" in data and not data["manager_id"]: update["manager_id"] = None
-    if update: users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": update})
+    update = {}
+
+    for k in ["name", "department", "position", "email", "manager_id"]:
+        if k in data:
+            update[k] = data[k]
+    
+    # Allow clearing manager
+    if "manager_id" in data and not data["manager_id"]:
+         update["manager_id"] = None
+         
+    if update:
+        users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": update})
+    
     return jsonify({"message": "Updated"})
 
+# -------------------------------------------------------------
+# EDIT MANAGER
+# -------------------------------------------------------------
 @app.route("/api/admin/managers/<man_id>", methods=["PUT"])
 @token_required
 def edit_manager(man_id):
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
-    data = request.json
-    update = {k: data[k] for k in ["name", "department", "email"] if k in data}
-    if update: users_col.update_one({"_id": ObjectId(man_id)}, {"$set": update})
-    return jsonify({"message": "Updated"})
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
 
+    data = request.json
+    update = {}
+    for k in ["name", "department", "email"]:
+        if k in data:
+            update[k] = data[k]
+
+    if update:
+        users_col.update_one({"_id": ObjectId(man_id)}, {"$set": update})
+
+    return jsonify({"message": "Manager Updated"})
+
+
+# -------------------------------------------------------------
+# DELETE EMPLOYEE
+# -------------------------------------------------------------
 @app.route("/api/admin/employees/<emp_id>", methods=["DELETE"])
 @token_required
 def delete_employee(emp_id):
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
     users_col.delete_one({"_id": ObjectId(emp_id)})
     attendance_col.delete_many({"user_id": emp_id})
     leaves_col.delete_many({"user_id": emp_id})
+
     return jsonify({"message": "Deleted"})
 
+# -------------------------------------------------------------
+# DELETE MANAGER
+# -------------------------------------------------------------
 @app.route("/api/admin/managers/<man_id>", methods=["DELETE"])
 @token_required
 def delete_manager(man_id):
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
     users_col.delete_one({"_id": ObjectId(man_id)})
+    # Also unassign this manager from any employees
     users_col.update_many({"manager_id": man_id}, {"$set": {"manager_id": None}})
+    
     return jsonify({"message": "Deleted"})
 
 
-# -------------------------------------------------------------
-# PHASE 2: ATTENDANCE CORRECTIONS (USER & MANAGER)
-# -------------------------------------------------------------
+# ==============================================================================
+#  PHASE 2: ATTENDANCE CORRECTIONS
+# ==============================================================================
 @app.route("/api/attendance/request-correction", methods=["POST"])
 @token_required
 def request_correction():
@@ -380,13 +508,10 @@ def approve_correction():
             else:
                  new_dt = datetime.fromisoformat(new_time_str.replace("Z", "+00:00"))
             
-            today_str = str(new_dt.date())
-            
-            # Insert valid attendance record
             attendance_col.insert_one({
                 "user_id": correction["user_id"],
                 "type": "checkin", 
-                "date": today_str,
+                "date": str(new_dt.date()),
                 "time": new_dt,
                 "photo_url": None, 
                 "status_indicator": "Corrected",
@@ -446,7 +571,7 @@ def submit_pms():
 
     # Check if already submitted
     if pms_submissions_col.find_one({"user_id": uid, "month": month}):
-        return jsonify({"message": "Already submitted for this month"}), 400
+        return jsonify({"message": "Evaluation already submitted for this month"}), 400
 
     submission = {
         "user_id": uid,
@@ -692,6 +817,7 @@ def apply_leave():
     from_date = request.form.get("from_date")
     to_date = request.form.get("to_date")
     
+    # Backward compatibility
     if not from_date and request.form.get("date"):
         from_date = request.form.get("date")
         to_date = request.form.get("date")
@@ -711,6 +837,7 @@ def apply_leave():
     if t_date < f_date:
         return jsonify({"message": "End date cannot be before start date"}), 400
 
+    # 7-day past limit check
     now_ist_date = datetime.now(IST).date()
     max_past_date = now_ist_date - timedelta(days=7) 
 
@@ -755,6 +882,8 @@ def admin_view_leaves():
         return jsonify({"message": "Unauthorized"}), 403
 
     query = {}
+    
+    # --- DEPT FILTER FOR MANAGERS ---
     if request.user.get("role") == "manager":
         my_dept = request.user.get("department")
         dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept})]
@@ -774,11 +903,8 @@ def admin_view_leaves():
             l["employee_name"] = "Unknown"
             l["employee_department"] = ""
         
-        # --- NEW: Applied Date ---
-        if l.get("applied_at"):
-            l["applied_at_str"] = l["applied_at"].strftime("%Y-%m-%d")
-        else:
-            l["applied_at_str"] = l.get("date", "N/A")
+        # --- APPLIED DATE VISIBILITY ---
+        l["applied_at_str"] = l["applied_at"].strftime("%Y-%m-%d") if l.get("applied_at") else l.get("date")
             
         rows.append(l)
 
@@ -792,8 +918,7 @@ def admin_view_leaves():
 @token_required
 def update_leave(leave_id):
     role = request.user.get("role")
-    if role not in ["admin", "manager"]:
-        return jsonify({"message": "Unauthorized"}), 403
+    if role not in ["admin", "manager"]: return jsonify({"message": "Unauthorized"}), 403
 
     data = request.json
     action = data.get("status")
@@ -894,12 +1019,10 @@ def my_leaves():
 @app.route("/api/admin/attendance/<emp_id>", methods=["GET"])
 @token_required
 def admin_employee_attendance(emp_id):
-    if request.user.get("role") != "admin":
-        return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
 
     emp = users_col.find_one({"_id": ObjectId(emp_id)})
-    if not emp:
-        return jsonify({"message": "Employee not found"}), 404
+    if not emp: return jsonify({"message": "Employee not found"}), 404
 
     records = []
     for a in attendance_col.find({"user_id": emp_id}).sort("time", -1):
@@ -913,7 +1036,7 @@ def admin_employee_attendance(emp_id):
 
 
 # -------------------------------------------------------------
-# AUTO ABSENT (UPDATED: CREATES LEAVE RECORD)
+# AUTO ABSENT (UPDATED: Creates Leave Record)
 # -------------------------------------------------------------
 @app.route("/api/attendance/auto-absent", methods=["POST"])
 def auto_mark_absent():
@@ -924,25 +1047,25 @@ def auto_mark_absent():
     for emp in all_users:
         uid = str(emp["_id"])
         
-        # If not checked in
+        # If no check-in today
         if not attendance_col.find_one({"user_id": uid, "type": "checkin", "date": today_str}):
             
-            # If no approved leave exists
+            # If no approved leave already exists
             if not leaves_col.find_one({"user_id": uid, "status": "Approved", "date": today_str}):
                 
-                # 1. Insert into Attendance as Absent
+                # 1. Attendance Log (Absent)
                 if not attendance_col.find_one({"user_id": uid, "type": "absent", "date": today_str}):
                     attendance_col.insert_one({
                         "user_id": uid, "type": "absent", "date": today_str, "time": datetime.now(timezone.utc)
                     })
                 
-                # 2. Insert into LEAVES so it shows in "My Leaves" (NEW REQUIREMENT)
+                # 2. Leaves Record (System Absent) -> Shows in "My Leaves"
                 if not leaves_col.find_one({"user_id": uid, "type": "System Absent", "date": today_str}):
                     leaves_col.insert_one({
-                        "user_id": uid, 
+                        "user_id": uid,
                         "from_date": today_str, "to_date": today_str, "date": today_str,
-                        "type": "System Absent", 
-                        "reason": "Not checked in by cutoff time", 
+                        "type": "System Absent",
+                        "reason": "Not checked in",
                         "status": "Absent", 
                         "applied_at": datetime.now(timezone.utc)
                     })
@@ -976,7 +1099,7 @@ def attendance_summary():
         day_str = curr.date().isoformat()
         recs = list(attendance_col.find({"date": day_str}))
         present = {r["user_id"] for r in recs if r["type"] == "checkin"}
-        # Include Approved and System Absent
+        # Include Approved and Auto-Absent leaves
         leaves_today_docs = list(leaves_col.find({"date": day_str, "status": {"$in": ["Approved", "Absent"]}}))
         
         leave_names = []
@@ -990,7 +1113,7 @@ def attendance_summary():
 
         summary["days"][day_str] = {
             "present": list(present), 
-            "absent": list(absent),
+            "absent": [], 
             "leave": list(leave_ids), 
             "leave_names": leave_names,
             "not_checked_in": list(not_checked_in),
@@ -1006,8 +1129,7 @@ def attendance_summary():
 @app.route("/api/admin/today-stats", methods=["GET"])
 @token_required
 def today_stats():
-    if request.user.get("role") != "admin":
-        return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
 
     today = str(datetime.now(IST).date())
     present = attendance_col.count_documents({"date": today, "type": "checkin"})
