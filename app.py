@@ -635,11 +635,16 @@ def submit_pms():
     if pms_submissions_col.find_one({"user_id": uid, "month": month}):
         return jsonify({"message": "Evaluation already submitted for this month"}), 400
 
+    # FIX FOR PAYLOAD MISMATCH (responses vs evaluation)
+    # The frontend was sending 'evaluation', but backend expected 'responses'
+    # We now accept either.
+    submission_data = data.get("responses") or data.get("evaluation")
+
     submission = {
         "user_id": uid,
         "manager_id": request.user.get("manager_id"),
         "month": month,
-        "responses": data.get("responses"), # Answers keyed by question
+        "responses": submission_data, # Answers keyed by question
         "status": "Submitted_by_Employee",
         "submitted_at": datetime.now(timezone.utc)
     }
@@ -738,29 +743,58 @@ def checkin_photo():
     now_ist = datetime.now(IST)
     current_time = now_ist.time()
     today = now_ist.date()
+    today_str = str(today)
 
-    # Define Times
-    MORNING_LATE_CUTOFF = time(10, 15)
-    AFTERNOON_START_THRESHOLD = time(13, 0)
-    AFTERNOON_LATE_CUTOFF = time(14, 0)
+    # 1. Leave Priority Rule: If approved leave exists, ignore attendance
+    if leaves_col.find_one({"user_id": uid, "status": "Approved", "date": today_str}):
+        return jsonify({"message": "You have an approved leave for today. Attendance not required."}), 200
 
     # Check for existing checkin
-    if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": str(today)}):
+    if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": today_str}):
         return jsonify({"message": "Already checked in!"}), 400
 
-    # Determine Day Type and Status
-    checkin_type = "full"
-    status_indicator = "On Time"
+    # --- NEW ATTENDANCE EVALUATION RULES ---
+    
+    # Define Time Boundaries
+    TIME_0900 = time(9, 0)
+    TIME_1000 = time(10, 0)
+    TIME_1015 = time(10, 15)
+    TIME_1300 = time(13, 0)
+    TIME_1400 = time(14, 0)
 
-    if current_time < AFTERNOON_START_THRESHOLD:
-        checkin_type = "full"
-        if current_time > MORNING_LATE_CUTOFF:
-            status_indicator = "Late"
-    else:
-        checkin_type = "half-day"
-        if current_time > AFTERNOON_LATE_CUTOFF:
-             status_indicator = "Late"
+    status_indicator = "Unknown"
+    day_type = "full"
+    
+    # Rule: On-Time Check-In (9:00 AM - 10:00 AM)
+    # We also allow earlier than 9 AM as On-Time
+    if current_time < TIME_1000:
+        status_indicator = "Present (On-Time)"
+        day_type = "full"
+        
+    # Rule: Late Check-In (10:00 AM - 10:15 AM)
+    elif TIME_1000 <= current_time < TIME_1015:
+        status_indicator = "Present (Late)"
+        day_type = "full"
+        
+    # Rule: Blocked Check-In Window (10:15 AM - 1:00 PM)
+    elif TIME_1015 <= current_time < TIME_1300:
+        return jsonify({
+            "message": "Check-in blocked. You missed the morning window (ended 10:15 AM). Please wait until 1:00 PM for Half Day check-in."
+        }), 400
 
+    # Rule: Half-Day Check-In Override (1:00 PM - 2:00 PM)
+    elif TIME_1300 <= current_time < TIME_1400:
+        status_indicator = "Half Day"
+        day_type = "half-day"
+        
+    # Rule: Full-Day Absent Conversion (After 2:00 PM)
+    else: 
+        # current_time >= 14:00
+        return jsonify({
+            "message": "Check-in closed for the day. Marked as Absent (Full Day)."
+        }), 400
+
+    # Process Upload
     data = request.get_json()
     img_data = data.get("image")
     if not img_data:
@@ -777,8 +811,8 @@ def checkin_photo():
     attendance_col.insert_one({
         "user_id": uid,
         "type": "checkin",
-        "date": str(today),
-        "day_type": checkin_type,
+        "date": today_str,
+        "day_type": day_type,
         "time": datetime.now(timezone.utc),
         "photo_url": photo_url, 
         "status_indicator": status_indicator 
