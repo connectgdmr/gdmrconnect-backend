@@ -479,6 +479,7 @@ def get_notification_counts():
             "user_id": {"$in": dept_users},
             "status": "Pending"
         })
+        counts["announcements"] = announcements_col.count_documents({})
         
     return jsonify(counts)
 
