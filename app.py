@@ -142,8 +142,9 @@ def forgot_password():
         f"Your new temporary password is: {temp_password}\n\n"
         "Please login and change your password immediately."
     )
-    
-    threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
+
+    # Send directly (no thread)
+    send_email(email, subject, body)
 
     return jsonify({"message": "Password reset email sent."}), 200
 
@@ -1245,3 +1246,4 @@ def today_stats():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
