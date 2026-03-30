@@ -1,6 +1,6 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-import base64, os
+import base64, os, re, csv, io
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -15,6 +15,7 @@ from flask_bcrypt import Bcrypt
 import threading
 import cloudinary
 import cloudinary.uploader
+from apscheduler.schedulers.background import BackgroundScheduler
 
 load_dotenv()
 
@@ -55,11 +56,13 @@ attendance_col = db["attendance"]
 leaves_col = db["leaves"]
 
 # --- PHASE 2 & 3 COLLECTIONS ---
-pms_submissions_col = db["pms_submissions"]
-pms_assignments_col = db["pms_assignments"] # NEW: For Manager Questions
 corrections_col = db["attendance_corrections"]
 pip_records_col = db["pip_records"]
-announcements_col = db["announcements"] # NEW: For Admin Announcements
+announcements_col = db["announcements"]
+
+# --- NEW PMS COLLECTIONS ---
+pms_templates_col = db["pms_templates"] # Stores Admin Sessions & Questions
+pms_reviews_col = db["pms_reviews"] # Stores actual employee and manager evaluations
 
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -81,6 +84,15 @@ def format_datetime_ist(dt):
     if dt.tzinfo is None:
         dt = pytz.utc.localize(dt)
     return dt.astimezone(IST).isoformat()
+
+def is_strong_password(password):
+    """Requires 8+ chars, 1 uppercase, 1 lowercase, 1 number, 1 special char"""
+    if len(password) < 8: return False
+    if not re.search(r"[a-z]", password): return False
+    if not re.search(r"[A-Z]", password): return False
+    if not re.search(r"\d", password): return False
+    if not re.search(r"[@$!%*?&#^_\-]", password): return False
+    return True
 
 @app.route("/")
 def home():
@@ -119,6 +131,27 @@ def token_required(f):
 
 
 # -------------------------------------------------------------
+# SET OWN STRONG PASSWORD (NEW)
+# -------------------------------------------------------------
+@app.route("/api/my/set-password", methods=["POST"])
+@token_required
+def set_own_password():
+    data = request.json
+    new_password = data.get("password")
+    
+    if not new_password or not is_strong_password(new_password):
+        return jsonify({"message": "Password must be at least 8 characters and contain 1 uppercase, 1 lowercase, 1 number, and 1 special character."}), 400
+        
+    hashed = bcrypt.generate_password_hash(new_password).decode("utf-8")
+    users_col.update_one(
+        {"_id": request.user["_id"]}, 
+        {"$set": {"password": hashed, "password_changed": True}}
+    )
+    
+    return jsonify({"message": "Password updated successfully!"}), 200
+
+
+# -------------------------------------------------------------
 # FORGOT PASSWORD
 # -------------------------------------------------------------
 @app.route("/api/forgot-password", methods=["POST"])
@@ -133,7 +166,8 @@ def forgot_password():
     temp_password = generate_random_password()
     hashed = bcrypt.generate_password_hash(temp_password).decode("utf-8")
     
-    users_col.update_one({"_id": user["_id"]}, {"$set": {"password": hashed}})
+    # Reset password_changed flag so they are forced to set a strong one again
+    users_col.update_one({"_id": user["_id"]}, {"$set": {"password": hashed, "password_changed": False}})
 
     subject = "Password Reset Request"
     body = (
@@ -143,9 +177,7 @@ def forgot_password():
         "Please login and change your password immediately."
     )
 
-    # Send directly (no thread)
     send_email(email, subject, body)
-
     return jsonify({"message": "Password reset email sent."}), 200
 
 
@@ -167,6 +199,7 @@ def register_admin():
         "name": name,
         "email": email,
         "password": hashed,
+        "password_changed": True, # Admins exempt from force change on register
         "role": "admin",
         "department": "",
         "position": "",
@@ -204,6 +237,7 @@ def register_manager():
         "name": name,
         "email": email,
         "password": hashed_pw,
+        "password_changed": False, # Force strong password on first login
         "role": "manager",
         "department": department,
         "position": "Manager",
@@ -237,6 +271,7 @@ def login():
     return jsonify({
         "token": token,
         "role": user.get("role", "employee"),
+        "password_changed": user.get("password_changed", False), # Front-end checks this to show Set Password Modal
         "user": {
             "name": user.get("name"),
             "email": user.get("email"),
@@ -271,6 +306,7 @@ def add_employee():
         "name": name,
         "email": email,
         "password": hashed,
+        "password_changed": False, # Will trigger strong password modal
         "role": "employee",
         "department": department,
         "position": position,
@@ -289,7 +325,7 @@ def add_employee():
         "Please use the following credentials to log in:\n"
         f"Username (Email): {email}\n"
         f"Temporary Password: {password}\n\n"
-        "We recommend logging in as soon as possible and updating your password.\n\n"
+        "We recommend logging in as soon as possible and updating your password to a strong format.\n\n"
         "Thank you,\n"
         "The GDMR Connect Team"
     )
@@ -368,6 +404,7 @@ def edit_employee(emp_id):
     
     return jsonify({"message": "Updated"})
 
+
 # -------------------------------------------------------------
 # EDIT MANAGER
 # -------------------------------------------------------------
@@ -404,6 +441,7 @@ def delete_employee(emp_id):
 
     return jsonify({"message": "Deleted"})
 
+
 # -------------------------------------------------------------
 # DELETE MANAGER
 # -------------------------------------------------------------
@@ -414,14 +452,13 @@ def delete_manager(man_id):
         return jsonify({"message": "Unauthorized"}), 403
 
     users_col.delete_one({"_id": ObjectId(man_id)})
-    # Also unassign this manager from any employees
     users_col.update_many({"manager_id": man_id}, {"$set": {"manager_id": None}})
     
     return jsonify({"message": "Deleted"})
 
 
 # -------------------------------------------------------------
-# PHASE 3: ANNOUNCEMENTS (NEW)
+# PHASE 3: ANNOUNCEMENTS
 # -------------------------------------------------------------
 @app.route("/api/announcements", methods=["POST"])
 @token_required
@@ -462,20 +499,17 @@ def get_notification_counts():
         my_dept = request.user.get("department")
         dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept})]
         
-        # Pending Leaves in Dept
         counts["leaves"] = leaves_col.count_documents({
             "user_id": {"$in": dept_users},
             "status": "Pending",
             "manager_status": "Pending" 
         })
         
-        # Pending PMS Reviews
-        counts["pms"] = pms_submissions_col.count_documents({
+        counts["pms"] = pms_reviews_col.count_documents({
             "user_id": {"$in": dept_users},
-            "status": "Submitted_by_Employee"
+            "status": "Pending Review"
         })
         
-        # Pending Corrections
         counts["corrections"] = corrections_col.count_documents({
             "user_id": {"$in": dept_users},
             "status": "Pending"
@@ -495,7 +529,6 @@ def request_correction():
     now_ist = datetime.now(IST)
     month_str = now_ist.strftime("%Y-%m")
     
-    # 3x Monthly Limit Check
     usage_count = corrections_col.count_documents({
         "user_id": uid, 
         "month": month_str
@@ -562,11 +595,9 @@ def approve_correction():
     
     corrections_col.update_one({"_id": ObjectId(cid)}, {"$set": {"status": action}})
     
-    # --- IF APPROVED, UPDATE ATTENDANCE TABLE ---
     if action == "Approved":
         try:
             new_time_str = correction["new_time"]
-            # Handle ISO vs simple string
             if "T" in new_time_str and not new_time_str.endswith("Z") and "+" not in new_time_str:
                  new_dt = datetime.fromisoformat(new_time_str)
             else:
@@ -588,123 +619,207 @@ def approve_correction():
 
 
 # ==============================================================================
-#  PHASE 2: DYNAMIC PMS (MANAGER ASSIGN & REVIEW)
+#  PMS MODULE 2.0 (SESSIONS, QUESTIONS, AND REVIEWS)
 # ==============================================================================
 
-# 1. Manager Assigns Questions (NEW)
-@app.route("/api/manager/assign-pms", methods=["POST"])
+# Req 2.1: Admin Controls - Create PMS Template Form
+@app.route("/api/admin/pms-template", methods=["POST"])
 @token_required
-def assign_pms():
-    if request.user.get("role") != "manager": return jsonify({"message": "Unauthorized"}), 403
-    data = request.json
-    employee_id = data.get("employee_id")
-    questions = data.get("questions") # List of strings
-    month = data.get("month") # YYYY-MM
+def save_pms_template():
+    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    data = request.json 
+    # Data Format expected:
+    # { "department": "All", "sessions": [ { "name": "Work Productivity", "questions": [ {"text": "What were achievements?", "type": "descriptive", "requires_remarks": True} ] } ] }
     
-    # Update or Insert Assignment
-    pms_assignments_col.update_one(
-        {"employee_id": employee_id, "month": month},
+    pms_templates_col.update_one(
+        {"department": data.get("department", "All")},
         {"$set": {
-            "manager_id": str(request.user["_id"]),
-            "questions": questions,
-            "created_at": datetime.now(timezone.utc)
+            "sessions": data.get("sessions", []), 
+            "updated_at": datetime.now(timezone.utc)
         }},
         upsert=True
     )
-    return jsonify({"message": "PMS Questions Assigned"}), 200
+    return jsonify({"message": "PMS Evaluation Form Template Saved!"}), 200
 
-# 2. Employee Fetches Assigned Questions (NEW)
-@app.route("/api/employee/pms-assignment", methods=["GET"])
+# Fetch Template for Employees to fill out
+@app.route("/api/pms-template", methods=["GET"])
 @token_required
-def get_pms_assignment():
-    uid = str(request.user["_id"])
-    month = datetime.now(IST).strftime("%Y-%m")
+def get_pms_template():
+    dept = request.user.get("department", "All")
+    # First try fetching a department-specific template, fallback to "All"
+    template = pms_templates_col.find_one({"department": dept}, {"_id": 0})
+    if not template:
+        template = pms_templates_col.find_one({"department": "All"}, {"_id": 0})
     
-    assignment = pms_assignments_col.find_one({"employee_id": uid, "month": month})
-    
-    questions = assignment.get("questions", []) if assignment else []
-    return jsonify({"questions": questions}), 200
+    if not template:
+        return jsonify({"sessions": []}), 200
+    return jsonify(template), 200
 
-# 3. Employee Submits Responses
+
+# Req 2.3: Employee Self-Assessment Submission
 @app.route("/api/pms/submit", methods=["POST"])
 @token_required
-def submit_pms():
+def submit_pms_review():
     uid = str(request.user["_id"])
     data = request.json
-    month = data.get("month")
+    month = datetime.now(IST).strftime("%Y-%m")
 
-    # Check if already submitted
-    if pms_submissions_col.find_one({"user_id": uid, "month": month}):
-        return jsonify({"message": "Evaluation already submitted for this month"}), 400
-
-    # FIX FOR PAYLOAD MISMATCH (responses vs evaluation)
-    # The frontend was sending 'evaluation', but backend expected 'responses'
-    # We now accept either.
-    submission_data = data.get("responses") or data.get("evaluation")
+    # Employees can only submit once per month
+    if pms_reviews_col.find_one({"user_id": uid, "month": month}):
+        return jsonify({"message": "You have already submitted your Self Assessment for this month."}), 400
 
     submission = {
         "user_id": uid,
+        "department": request.user.get("department"),
         "manager_id": request.user.get("manager_id"),
         "month": month,
-        "responses": submission_data, # Answers keyed by question
-        "status": "Submitted_by_Employee",
-        "submitted_at": datetime.now(timezone.utc)
+        "responses": data.get("responses", []), # List containing self_score (1-10), descriptive answers, and remarks
+        "status": "Pending Review", 
+        "self_assessment_date": datetime.now(timezone.utc),
+        "manager_review_date": None,
+        "manager_scores": [],
+        "manager_feedback": ""
     }
-    pms_submissions_col.insert_one(submission)
-    return jsonify({"message": "PMS Evaluation Submitted"}), 201
+    
+    pms_reviews_col.insert_one(submission)
+    return jsonify({"message": "Self Assessment Submitted for Manager Review."}), 201
 
-# 4. Manager Reviews (Filtered by Dept)
+
+# Req 2.4: Manager Review - Fetch pending reviews
 @app.route("/api/manager/pms", methods=["GET"])
 @token_required
-def manager_pms():
-    if request.user.get("role") != "manager": return jsonify({"message": "Unauthorized"}), 403
+def get_manager_pms():
+    if request.user.get("role") not in ["manager", "admin"]: return jsonify({"message": "Unauthorized"}), 403
     
     my_dept = request.user.get("department")
-    dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept})]
-    
-    query = {"$or": [
-        {"manager_id": str(request.user["_id"])},
-        {"user_id": {"$in": dept_users}}
-    ]}
+    query = {"department": my_dept} if request.user.get("role") == "manager" else {}
     
     rows = []
-    for p in pms_submissions_col.find(query).sort("submitted_at", -1):
-        p["_id"] = str(p["_id"])
-        u = users_col.find_one({"_id": ObjectId(p["user_id"])})
-        p["employee_name"] = u["name"] if u else "Unknown"
-        rows.append(p)
-    return jsonify(rows)
+    for r in pms_reviews_col.find(query).sort("self_assessment_date", -1):
+        r["_id"] = str(r["_id"])
+        emp = users_col.find_one({"_id": ObjectId(r["user_id"])})
+        r["employee_name"] = emp["name"] if emp else "Unknown"
+        rows.append(r)
+    return jsonify(rows), 200
 
-# 5. Manager Finalizes Score
+
+# Req 2.4: Manager Finalizes Score and Comments
 @app.route("/api/manager/finalize-pms", methods=["POST"])
 @token_required
-def finalize_pms():
-    if request.user.get("role") != "manager": return jsonify({"message": "Unauthorized"}), 403
+def finalize_pms_review():
+    if request.user.get("role") not in ["manager", "admin"]: return jsonify({"message": "Unauthorized"}), 403
     data = request.json
-    pid = data.get("id")
-    score = data.get("manager_score")
     
-    pms_submissions_col.update_one(
-        {"_id": ObjectId(pid)}, 
-        {"$set": {"manager_score": score, "status": "Approved"}}
+    review_id = data.get("review_id")
+    
+    pms_reviews_col.update_one(
+        {"_id": ObjectId(review_id)},
+        {"$set": {
+            "manager_scores": data.get("manager_scores", []), # List mapping to questions
+            "manager_feedback": data.get("manager_feedback", ""),
+            "status": "Manager Review Completed",
+            "manager_review_date": datetime.now(timezone.utc)
+        }}
     )
-    return jsonify({"message": "PMS Finalized"}), 200
+    return jsonify({"message": "PMS Evaluation Review Completed successfully!"}), 200
 
-# 6. Employee History
+
+# Req 2.7: PMS History Tracking (Employee View)
 @app.route("/api/my/pms", methods=["GET"])
 @token_required
 def my_pms():
     uid = str(request.user["_id"])
     rows = []
-    for p in pms_submissions_col.find({"user_id": uid}).sort("month", -1):
+    for p in pms_reviews_col.find({"user_id": uid}).sort("month", -1):
         p["_id"] = str(p["_id"])
         rows.append(p)
     return jsonify(rows)
 
 
-# -------------------------------------------------------------
-# PHASE 2: PIP (PERFORMANCE IMPROVEMENT PLAN)
-# -------------------------------------------------------------
+# Req 2.8: Department Wise Performance Dashboard (Admin)
+@app.route("/api/admin/pms-dashboard", methods=["GET"])
+@token_required
+def pms_dashboard():
+    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    
+    month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
+    
+    dashboard_data = {}
+    
+    # Initialize depts
+    departments = users_col.distinct("department")
+    for d in departments:
+        if d: # exclude empty
+            total_emps = users_col.count_documents({"department": d, "role": "employee"})
+            dashboard_data[d] = {"total_employees": total_emps, "completed_pms": 0, "total_score": 0, "avg_score": 0}
+            
+    # Calculate Completion and Averages
+    reviews = pms_reviews_col.find({"month": month, "status": "Manager Review Completed"})
+    for r in reviews:
+        dept = r.get("department")
+        if dept and dept in dashboard_data:
+            dashboard_data[dept]["completed_pms"] += 1
+            
+            # Sum up manager scores for linear scale questions
+            mgr_total = sum([int(ms.get('score', 0)) for ms in r.get('manager_scores', []) if str(ms.get('score')).isdigit()])
+            dashboard_data[dept]["total_score"] += mgr_total
+
+    # Format final output
+    final_output = []
+    for dept, data in dashboard_data.items():
+        if data["completed_pms"] > 0:
+            data["avg_score"] = round(data["total_score"] / data["completed_pms"], 2)
+        else:
+            data["avg_score"] = 0
+            
+        final_output.append({
+            "department": dept,
+            "average_score": data["avg_score"],
+            "total_employees": data["total_employees"],
+            "completed_pms": data["completed_pms"]
+        })
+        
+    return jsonify(final_output), 200
+
+
+# Req 2.9 & 3.0: Export Analytics (CSV/Excel Download)
+@app.route("/api/admin/export-pms", methods=["GET"])
+@token_required
+def export_pms():
+    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    
+    month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
+    
+    si = io.StringIO()
+    cw = csv.writer(si)
+    # Header
+    cw.writerow(["Employee Name", "Department", "Month", "Status", "Self Score Total", "Manager Score Total", "Manager Feedback"])
+    
+    for r in pms_reviews_col.find({"month": month}).sort("department", 1):
+        emp = users_col.find_one({"_id": ObjectId(r["user_id"])})
+        emp_name = emp["name"] if emp else "Unknown"
+        
+        # Calculate totals
+        self_total = sum([int(res.get('self_score', 0)) for res in r.get('responses', []) if str(res.get('self_score')).isdigit()])
+        mgr_total = sum([int(ms.get('score', 0)) for ms in r.get('manager_scores', []) if str(ms.get('score')).isdigit()])
+        
+        cw.writerow([
+            emp_name, 
+            r.get("department"), 
+            r.get("month"), 
+            r.get("status"), 
+            self_total, 
+            mgr_total, 
+            r.get("manager_feedback", "")
+        ])
+    
+    output = io.BytesIO(si.getvalue().encode('utf-8'))
+    return send_file(output, mimetype='text/csv', as_attachment=True, download_name=f'PMS_Report_{month}.csv')
+
+
+# ==============================================================================
+#  PERFORMANCE IMPROVEMENT PLAN (PIP)
+# ==============================================================================
 @app.route("/api/pip/initiate", methods=["POST"])
 @token_required
 def initiate_pip():
@@ -747,17 +862,12 @@ def checkin_photo():
     today = now_ist.date()
     today_str = str(today)
 
-    # 1. Leave Priority Rule: If approved leave exists, ignore attendance
     if leaves_col.find_one({"user_id": uid, "status": "Approved", "date": today_str}):
         return jsonify({"message": "You have an approved leave for today. Attendance not required."}), 200
 
-    # Check for existing checkin
     if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": today_str}):
         return jsonify({"message": "Already checked in!"}), 400
 
-    # --- NEW ATTENDANCE EVALUATION RULES ---
-    
-    # Define Time Boundaries
     TIME_0900 = time(9, 0)
     TIME_1000 = time(10, 0)
     TIME_1015 = time(10, 15)
@@ -767,42 +877,29 @@ def checkin_photo():
     status_indicator = "Unknown"
     day_type = "full"
     
-    # Rule: On-Time Check-In (9:00 AM - 10:00 AM)
-    # We also allow earlier than 9 AM as On-Time
     if current_time < TIME_1000:
         status_indicator = "Present (On-Time)"
         day_type = "full"
-        
-    # Rule: Late Check-In (10:00 AM - 10:15 AM)
     elif TIME_1000 <= current_time < TIME_1015:
         status_indicator = "Present (Late)"
         day_type = "full"
-        
-    # Rule: Blocked Check-In Window (10:15 AM - 1:00 PM)
     elif TIME_1015 <= current_time < TIME_1300:
         return jsonify({
             "message": "Check-in blocked. You missed the morning window (ended 10:15 AM). Please wait until 1:00 PM for Half Day check-in."
         }), 400
-
-    # Rule: Half-Day Check-In Override (1:00 PM - 2:00 PM)
     elif TIME_1300 <= current_time < TIME_1400:
         status_indicator = "Half Day"
         day_type = "half-day"
-        
-    # Rule: Full-Day Absent Conversion (After 2:00 PM)
     else: 
-        # current_time >= 14:00
         return jsonify({
             "message": "Check-in closed for the day. Marked as Absent (Full Day)."
         }), 400
 
-    # Process Upload
     data = request.get_json()
     img_data = data.get("image")
     if not img_data:
         return jsonify({"message": "No image"}), 400
 
-    # --- CLOUDINARY UPLOAD ---
     try:
         upload_result = cloudinary.uploader.upload(img_data, folder="attendance_photos")
         photo_url = upload_result.get("secure_url")
@@ -844,25 +941,21 @@ def checkout_photo():
     if attendance_col.find_one({"user_id": uid, "type": "checkout", "date": str(today)}):
         return jsonify({"message": "Already checked out!"}), 400
 
-    # Define Times
     HALF_DAY_OUT_START = time(13, 0)
     HALF_DAY_OUT_END = time(14, 0)
     FULL_DAY_OUT_START = time(18, 0)
     LATE_CHECKOUT_START = time(19, 30)
 
-    # Convert checkin time to IST
     checkin_dt = utc_to_ist(checkin["time"])
     checkin_time = checkin_dt.time()
 
     final_day_type = checkin.get("day_type", "full")
     status_indicator = "On Time"
 
-    # --- Day Type Logic ---
     if checkin_time < time(13, 0) and (HALF_DAY_OUT_START <= current_time <= HALF_DAY_OUT_END):
         final_day_type = "half-day"
         attendance_col.update_one({"_id": checkin["_id"]}, {"$set": {"day_type": "half-day"}})
     
-    # --- Status Logic ---
     if current_time > LATE_CHECKOUT_START:
         status_indicator = "Late Checkout"
     elif current_time < FULL_DAY_OUT_START:
@@ -904,7 +997,7 @@ def serve_attendance_photo(filename):
 
 
 # -------------------------------------------------------------
-# APPLY LEAVE (Fix #5: Half Day Period)
+# APPLY LEAVE
 # -------------------------------------------------------------
 @app.route("/api/leaves", methods=["POST"])
 @token_required
@@ -920,7 +1013,7 @@ def apply_leave():
         to_date = request.form.get("date")
 
     leave_type = request.form.get("type", "full")
-    period = request.form.get("period") # NEW: "First Half", "Second Half"
+    period = request.form.get("period")
     reason = request.form.get("reason", "")
 
     if not from_date or not to_date:
@@ -957,7 +1050,7 @@ def apply_leave():
         "to_date": to_date,
         "date": from_date, 
         "type": leave_type,
-        "period": period, # Saved Here
+        "period": period,
         "reason": reason,
         "status": "Pending",
         "manager_status": "Pending",
@@ -971,7 +1064,7 @@ def apply_leave():
 
 
 # -------------------------------------------------------------
-# ADMIN VIEW LEAVES (Fix #1: Applied Date + Dept Filter)
+# ADMIN VIEW LEAVES
 # -------------------------------------------------------------
 @app.route("/api/admin/leaves", methods=["GET"])
 @token_required
@@ -1000,7 +1093,6 @@ def admin_view_leaves():
             l["employee_name"] = "Unknown"
             l["employee_department"] = ""
         
-        # --- Fix #1: Return applied date ---
         l["applied_at_str"] = l["applied_at"].strftime("%Y-%m-%d") if l.get("applied_at") else l.get("date")
             
         rows.append(l)
@@ -1069,7 +1161,6 @@ def manager_my_employees():
         return jsonify({"message": "Unauthorized"}), 403
 
     rows = []
-    # Filter by department (Requirement)
     for u in users_col.find({"department": request.user.get("department"), "role": "employee"}):
         u["_id"] = str(u["_id"])
         if "password" in u: del u["password"]
@@ -1136,7 +1227,7 @@ def admin_employee_attendance(emp_id):
 
 
 # -------------------------------------------------------------
-# AUTO ABSENT (Fix #6: Reflect in My Leaves)
+# AUTO ABSENT
 # -------------------------------------------------------------
 @app.route("/api/attendance/auto-absent", methods=["POST"])
 def auto_mark_absent():
@@ -1147,19 +1238,14 @@ def auto_mark_absent():
     for emp in all_users:
         uid = str(emp["_id"])
         
-        # If not checked in
         if not attendance_col.find_one({"user_id": uid, "type": "checkin", "date": today_str}):
-            
-            # If no approved leave exists
             if not leaves_col.find_one({"user_id": uid, "status": "Approved", "date": today_str}):
                 
-                # 1. Insert into Attendance as Absent
                 if not attendance_col.find_one({"user_id": uid, "type": "absent", "date": today_str}):
                     attendance_col.insert_one({
                         "user_id": uid, "type": "absent", "date": today_str, "time": datetime.now(timezone.utc)
                     })
                 
-                # 2. Insert into LEAVES so it shows in "My Leaves" (NEW REQUIREMENT)
                 if not leaves_col.find_one({"user_id": uid, "type": "System Absent", "date": today_str}):
                     leaves_col.insert_one({
                         "user_id": uid, 
@@ -1174,7 +1260,7 @@ def auto_mark_absent():
 
 
 # -------------------------------------------------------------
-# ADMIN MONTHLY SUMMARY (UPDATED FOR PHASE 2: LEAVE NAMES)
+# ADMIN MONTHLY SUMMARY
 # -------------------------------------------------------------
 @app.route("/api/admin/attendance-summary", methods=["GET"])
 @token_required
@@ -1199,7 +1285,7 @@ def attendance_summary():
         day_str = curr.date().isoformat()
         recs = list(attendance_col.find({"date": day_str}))
         present = {r["user_id"] for r in recs if r["type"] == "checkin"}
-        # Include Approved and System Absent
+        
         leaves_today_docs = list(leaves_col.find({"date": day_str, "status": {"$in": ["Approved", "Absent"]}}))
         
         leave_names = []
@@ -1215,7 +1301,7 @@ def attendance_summary():
             "present": list(present), 
             "absent": [], 
             "leave": list(leave_ids), 
-            "leave_names": leave_names, # Added for Export
+            "leave_names": leave_names, 
             "not_checked_in": list(not_checked_in),
         }
         curr += timedelta(days=1)
@@ -1243,7 +1329,38 @@ def today_stats():
     }), 200
 
 
+# ==============================================================================
+# Req 2.5: AUTOMATED PMS REMINDER SCHEDULER (BACKGROUND JOB)
+# ==============================================================================
+def send_pms_reminders():
+    print("Running Automated PMS Reminder Job...")
+    now = datetime.now(IST)
+    
+    # Send reminders only from the 28th to the end of the month
+    if now.day >= 28:
+        pending_reviews = pms_reviews_col.find({"status": "Pending Review"})
+        for rev in pending_reviews:
+            manager = users_col.find_one({"_id": ObjectId(rev["manager_id"])})
+            emp = users_col.find_one({"_id": ObjectId(rev["user_id"])})
+            if manager and emp:
+                subject = f"Action Required: Pending PMS Review for {emp['name']}"
+                body = (
+                    f"Hello {manager['name']},\n\n"
+                    f"This is an automated reminder that you have a pending PMS review for {emp['name']} "
+                    f"in the {emp['department']} department for the month of {rev['month']}.\n\n"
+                    f"Please log in to the HRMS portal to complete the evaluation.\n\n"
+                    f"Thank you,\n"
+                    f"GDMR Connect Automated System"
+                )
+                threading.Thread(target=send_email, args=(manager["email"], subject, body), daemon=True).start()
+
+# Initialize Background Scheduler
+scheduler = BackgroundScheduler(timezone=IST)
+# Runs every day at 10:00 AM IST
+scheduler.add_job(func=send_pms_reminders, trigger="cron", hour=10, minute=0)
+scheduler.start()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
