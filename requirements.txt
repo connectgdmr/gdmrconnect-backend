@@ -10,3 +10,4 @@ PyJWT
 Flask-Limiter
 Flask-Talisman
 cloudinary
+apscheduler
