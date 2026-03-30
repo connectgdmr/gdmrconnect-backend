@@ -626,20 +626,26 @@ def approve_correction():
 @app.route("/api/admin/pms-template", methods=["POST"])
 @token_required
 def save_pms_template():
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    # ALLOW MANAGERS OR ADMINS TO CREATE TEMPLATES
+    if request.user.get("role") not in ["admin", "manager"]: return jsonify({"message": "Unauthorized"}), 403
     data = request.json 
     # Data Format expected:
     # { "department": "All", "sessions": [ { "name": "Work Productivity", "questions": [ {"text": "What were achievements?", "type": "descriptive", "requires_remarks": True} ] } ] }
     
+    dept_to_update = data.get("department", "All")
+    # If it's a manager, force them to only update their own department's template
+    if request.user.get("role") == "manager":
+        dept_to_update = request.user.get("department")
+
     pms_templates_col.update_one(
-        {"department": data.get("department", "All")},
+        {"department": dept_to_update},
         {"$set": {
             "sessions": data.get("sessions", []), 
             "updated_at": datetime.now(timezone.utc)
         }},
         upsert=True
     )
-    return jsonify({"message": "PMS Evaluation Form Template Saved!"}), 200
+    return jsonify({"message": f"PMS Evaluation Form Template Saved for {dept_to_update}!"}), 200
 
 # Fetch Template for Employees to fill out
 @app.route("/api/pms-template", methods=["GET"])
@@ -736,25 +742,31 @@ def my_pms():
     return jsonify(rows)
 
 
-# Req 2.8: Department Wise Performance Dashboard (Admin)
+# Req 2.8: Department Wise Performance Dashboard (Admin & Manager)
 @app.route("/api/admin/pms-dashboard", methods=["GET"])
 @token_required
 def pms_dashboard():
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    # ALLOW MANAGERS AND ADMINS
+    if request.user.get("role") not in ["admin", "manager"]: return jsonify({"message": "Unauthorized"}), 403
     
     month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
-    
     dashboard_data = {}
     
-    # Initialize depts
-    departments = users_col.distinct("department")
+    # If manager, they only see their department. If admin, they see all.
+    if request.user.get("role") == "manager":
+        departments = [request.user.get("department")]
+    else:
+        departments = users_col.distinct("department")
+        
     for d in departments:
         if d: # exclude empty
             total_emps = users_col.count_documents({"department": d, "role": "employee"})
             dashboard_data[d] = {"total_employees": total_emps, "completed_pms": 0, "total_score": 0, "avg_score": 0}
             
     # Calculate Completion and Averages
-    reviews = pms_reviews_col.find({"month": month, "status": "Manager Review Completed"})
+    # Filter reviews strictly for the allowed departments
+    reviews = pms_reviews_col.find({"month": month, "status": "Manager Review Completed", "department": {"$in": departments}})
+    
     for r in reviews:
         dept = r.get("department")
         if dept and dept in dashboard_data:
@@ -786,16 +798,22 @@ def pms_dashboard():
 @app.route("/api/admin/export-pms", methods=["GET"])
 @token_required
 def export_pms():
-    if request.user.get("role") != "admin": return jsonify({"message": "Unauthorized"}), 403
+    # ALLOW MANAGERS AND ADMINS
+    if request.user.get("role") not in ["admin", "manager"]: return jsonify({"message": "Unauthorized"}), 403
     
     month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
+    
+    # Query logic depending on role
+    query = {"month": month}
+    if request.user.get("role") == "manager":
+        query["department"] = request.user.get("department")
     
     si = io.StringIO()
     cw = csv.writer(si)
     # Header
     cw.writerow(["Employee Name", "Department", "Month", "Status", "Self Score Total", "Manager Score Total", "Manager Feedback"])
     
-    for r in pms_reviews_col.find({"month": month}).sort("department", 1):
+    for r in pms_reviews_col.find(query).sort("department", 1):
         emp = users_col.find_one({"_id": ObjectId(r["user_id"])})
         emp_name = emp["name"] if emp else "Unknown"
         
