@@ -71,11 +71,17 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # --- HELPERS ---
 def utc_to_ist(utc_datetime):
+    """
+    Converts a UTC datetime object to Indian Standard Time (IST).
+    """
     if utc_datetime.tzinfo is None:
         utc_datetime = pytz.utc.localize(utc_datetime)
     return utc_datetime.astimezone(IST)
 
 def format_datetime_ist(dt):
+    """
+    Formats a datetime object or ISO string into an IST ISO string.
+    """
     if isinstance(dt, str):
         try:
             dt = datetime.fromisoformat(dt.replace('Z', '+00:00'))
@@ -86,7 +92,9 @@ def format_datetime_ist(dt):
     return dt.astimezone(IST).isoformat()
 
 def is_strong_password(password):
-    """Requires 8+ chars, 1 uppercase, 1 lowercase, 1 number, 1 special char"""
+    """
+    Requires 8+ chars, 1 uppercase, 1 lowercase, 1 number, 1 special char
+    """
     if len(password) < 8: return False
     if not re.search(r"[a-z]", password): return False
     if not re.search(r"[A-Z]", password): return False
@@ -96,11 +104,17 @@ def is_strong_password(password):
 
 @app.route("/")
 def home():
+    """
+    Health check route to ensure the backend is running.
+    """
     return "Backend running ✅", 200
 
 # Keep this for backward compatibility if old files still exist locally
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
+    """
+    Serves files from the local uploads directory.
+    """
     uploads_dir = os.path.join(os.getcwd(), "uploads")
     return send_from_directory(uploads_dir, filename)
 
@@ -108,6 +122,10 @@ def serve_upload(filename):
 # AUTH MIDDLEWARE
 # -------------------------------------------------------------
 def token_required(f):
+    """
+    Decorator to protect routes using JWT authentication.
+    Extracts token from Authorization header and sets request.user.
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
         token = None
@@ -131,17 +149,32 @@ def token_required(f):
 
 
 # -------------------------------------------------------------
-# SET OWN STRONG PASSWORD (NEW)
+# SET OWN STRONG PASSWORD (NEW - FIXED SECURITY BUG)
 # -------------------------------------------------------------
 @app.route("/api/my/set-password", methods=["POST"])
 @token_required
 def set_own_password():
+    """
+    Allows a user to securely change their password.
+    Validates the current password before applying the new strong password.
+    """
     data = request.json
+    old_password = data.get("oldPassword")
     new_password = data.get("password")
     
+    # 1. Validate that the old password is provided
+    if not old_password:
+        return jsonify({"message": "Current password is required."}), 400
+        
+    # 2. Verify the old password against the stored database hash
+    if not bcrypt.check_password_hash(request.user["password"], old_password):
+        return jsonify({"message": "Incorrect current password. Please try again."}), 400
+    
+    # 3. Validate that the new password meets strong password criteria
     if not new_password or not is_strong_password(new_password):
         return jsonify({"message": "Password must be at least 8 characters and contain 1 uppercase, 1 lowercase, 1 number, and 1 special character."}), 400
         
+    # 4. Hash the new password and update the database
     hashed = bcrypt.generate_password_hash(new_password).decode("utf-8")
     users_col.update_one(
         {"_id": request.user["_id"]}, 
@@ -156,6 +189,10 @@ def set_own_password():
 # -------------------------------------------------------------
 @app.route("/api/forgot-password", methods=["POST"])
 def forgot_password():
+    """
+    Handles forgotten password requests by generating a temporary password,
+    updating the user document, and emailing the temporary credentials.
+    """
     data = request.json
     email = data.get("email")
 
@@ -186,6 +223,9 @@ def forgot_password():
 # -------------------------------------------------------------
 @app.route("/api/register-admin", methods=["POST"])
 def register_admin():
+    """
+    Registers a new master admin account.
+    """
     data = request.json
     email = data.get("email")
     name = data.get("name", "Admin")
@@ -216,6 +256,10 @@ def register_admin():
 @app.route("/api/register-manager", methods=["POST"])
 @token_required
 def register_manager():
+    """
+    Allows an admin to register a new manager account.
+    Requires Name, Email, Password, and Department.
+    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -255,6 +299,9 @@ def register_manager():
 # -------------------------------------------------------------
 @app.route("/api/login", methods=["POST"])
 def login():
+    """
+    Authenticates a user and issues a JWT token valid for 4 hours.
+    """
     data = request.json
     email = data.get("email")
     password = data.get("password")
@@ -286,6 +333,10 @@ def login():
 @app.route("/api/admin/employees", methods=["POST"])
 @token_required
 def add_employee():
+    """
+    Allows admins to create new employee profiles, assigns a random temporary 
+    password, and emails the credentials to the user.
+    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -341,6 +392,10 @@ def add_employee():
 @app.route("/api/admin/employees", methods=["GET"])
 @token_required
 def list_employees():
+    """
+    Returns a list of all employees and managers for admin view.
+    Strips sensitive password data before returning.
+    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -366,6 +421,9 @@ def list_employees():
 @app.route("/api/admin/managers", methods=["GET"])
 @token_required
 def list_managers():
+    """
+    Returns a list of only managers for admin view.
+    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -385,6 +443,9 @@ def list_managers():
 @app.route("/api/admin/employees/<emp_id>", methods=["PUT"])
 @token_required
 def edit_employee(emp_id):
+    """
+    Updates an employee's profile data (name, dept, position, manager).
+    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -411,6 +472,9 @@ def edit_employee(emp_id):
 @app.route("/api/admin/managers/<man_id>", methods=["PUT"])
 @token_required
 def edit_manager(man_id):
+    """
+    Updates a manager's profile data.
+    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -432,6 +496,9 @@ def edit_manager(man_id):
 @app.route("/api/admin/employees/<emp_id>", methods=["DELETE"])
 @token_required
 def delete_employee(emp_id):
+    """
+    Deletes an employee and removes their associated attendance and leaves.
+    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -448,6 +515,9 @@ def delete_employee(emp_id):
 @app.route("/api/admin/managers/<man_id>", methods=["DELETE"])
 @token_required
 def delete_manager(man_id):
+    """
+    Deletes a manager and unassigns them from all their assigned employees.
+    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
