@@ -1532,6 +1532,56 @@ def send_pms_reminders():
                 )
                 threading.Thread(target=send_email, args=(manager["email"], subject, body), daemon=True).start()
 
+# -------------------------------------------------------------
+# CHECK MY DELEGATED ACCESS (NEW)
+# -------------------------------------------------------------
+@app.route("/api/my/delegated-access", methods=["GET"])
+@token_required
+def my_delegated_access():
+    """
+    Checks if the currently logged-in user has any active delegated admin grants.
+    This is what tells the frontend to show the 'Special Access' button.
+    """
+    uid = str(request.user["_id"])
+    now = datetime.now(IST)
+
+    active_grants = []
+    
+    # Find grants assigned to this specific user that are marked active
+    grants = access_grants_col.find({
+        "employee_id": uid, 
+        "is_active": True
+    })
+
+    for g in grants:
+        # Perform a quick real-time expiration check just in case the background job hasn't run yet
+        expired = False
+        
+        if g.get("expiry") == "end_of_day":
+            granted_at_ist = utc_to_ist(g["granted_at"])
+            if now.date() > granted_at_ist.date():
+                expired = True
+                
+        elif g.get("expiry") == "custom_time":
+            custom_time_str = g.get("custom_expiry_time")
+            if custom_time_str:
+                try:
+                    expiry_dt = datetime.strptime(custom_time_str, "%Y-%m-%dT%H:%M")
+                    expiry_dt = IST.localize(expiry_dt)
+                    if now >= expiry_dt:
+                        expired = True
+                except Exception as e:
+                    print(f"Error parsing custom time: {e}")
+        
+        if expired:
+            # If we catch it expiring right now, update the DB and don't send it to frontend
+            access_grants_col.update_one({"_id": g["_id"]}, {"$set": {"is_active": False}})
+        else:
+            g["_id"] = str(g["_id"])
+            active_grants.append(g)
+
+    return jsonify(active_grants), 200
+
 def auto_expire_grants():
     """
     Automated Background Job: Checks active temporary access grants and disables them
