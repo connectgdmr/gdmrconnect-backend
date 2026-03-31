@@ -60,6 +60,9 @@ corrections_col = db["attendance_corrections"]
 pip_records_col = db["pip_records"]
 announcements_col = db["announcements"]
 
+# --- DELEGATED ACCESS COLLECTION (NEW) ---
+access_grants_col = db["access_grants"] # Stores temporary admin access for employees
+
 # --- NEW PMS COLLECTIONS ---
 pms_templates_col = db["pms_templates"] # Stores Admin Sessions & Questions
 pms_reviews_col = db["pms_reviews"] # Stores actual employee and manager evaluations
@@ -185,7 +188,7 @@ def set_own_password():
 
 
 # -------------------------------------------------------------
-# FORGOT PASSWORD (FIXED THREADING ISSUE)
+# FORGOT PASSWORD
 # -------------------------------------------------------------
 @app.route("/api/forgot-password", methods=["POST"])
 def forgot_password():
@@ -215,13 +218,10 @@ def forgot_password():
         "Please login and change your password immediately."
     )
 
-    # FIXED: Send the email in a background thread to prevent blocking the Flask response
     try:
         threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
     except Exception as e:
         print(f"Failed to start email thread: {e}")
-        # We still return 200 because the password was successfully reset in the DB, 
-        # even if the email system is currently misconfigured.
 
     return jsonify({"message": "Password reset email sent."}), 200
 
@@ -533,6 +533,85 @@ def delete_manager(man_id):
     users_col.update_many({"manager_id": man_id}, {"$set": {"manager_id": None}})
     
     return jsonify({"message": "Deleted"})
+
+
+# ==============================================================================
+#  DELEGATED ADMIN ACCESS (GRANT ACCESS) - NEW FEATURE
+# ==============================================================================
+@app.route("/api/admin/grant-access", methods=["POST"])
+@token_required
+def grant_access():
+    """
+    Allows the main admin to grant temporary view or edit access to an employee.
+    """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    
+    data = request.json
+    emp_id = data.get("employeeId")
+    access_level = data.get("accessLevel", "view_only")
+    scope = data.get("scope", "today")
+    custom_date = data.get("customDate", "")
+    expiry = data.get("expiry", "end_of_day")
+    custom_expiry_time = data.get("customExpiryTime", "")
+
+    if not emp_id:
+        return jsonify({"message": "Employee ID is required"}), 400
+
+    # Prevent assigning access to someone who is already an admin
+    emp = users_col.find_one({"_id": ObjectId(emp_id)})
+    if not emp or emp.get("role") == "admin":
+        return jsonify({"message": "Invalid employee or employee is already an admin."}), 400
+
+    grant_record = {
+        "employee_id": emp_id,
+        "access_level": access_level,
+        "scope": scope,
+        "custom_date": custom_date,
+        "expiry": expiry,
+        "custom_expiry_time": custom_expiry_time,
+        "granted_by": str(request.user["_id"]),
+        "granted_at": datetime.now(timezone.utc),
+        "is_active": True
+    }
+
+    res = access_grants_col.insert_one(grant_record)
+    return jsonify({"message": "Temporary access granted successfully", "id": str(res.inserted_id)}), 201
+
+@app.route("/api/admin/active-grants", methods=["GET"])
+@token_required
+def get_active_grants():
+    """
+    Fetches a list of all currently active temporary admin permissions.
+    """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    
+    grants = []
+    # Only return grants that are currently marked as active
+    for g in access_grants_col.find({"is_active": True}).sort("granted_at", -1):
+        g["_id"] = str(g["_id"])
+        emp = users_col.find_one({"_id": ObjectId(g["employee_id"])})
+        g["employee_name"] = emp["name"] if emp else "Unknown Employee"
+        grants.append(g)
+        
+    return jsonify(grants), 200
+
+@app.route("/api/admin/revoke-access/<grant_id>", methods=["DELETE"])
+@token_required
+def revoke_access(grant_id):
+    """
+    Allows the admin to manually revoke a granted permission before its expiration.
+    """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    
+    # We use a soft delete (is_active = False) so the history is preserved
+    result = access_grants_col.update_one({"_id": ObjectId(grant_id)}, {"$set": {"is_active": False}})
+    if result.modified_count > 0:
+        return jsonify({"message": "Access revoked successfully"}), 200
+    else:
+        return jsonify({"message": "Access grant not found or already inactive."}), 404
 
 
 # -------------------------------------------------------------
@@ -1426,9 +1505,12 @@ def today_stats():
 
 
 # ==============================================================================
-# Req 2.5: AUTOMATED PMS REMINDER SCHEDULER (BACKGROUND JOB)
+# Req 2.5: AUTOMATED PMS REMINDER SCHEDULER & GRANT EXPIRATIONS
 # ==============================================================================
 def send_pms_reminders():
+    """
+    Automated Background Job: Sends emails to managers to remind them of pending PMS reviews.
+    """
     print("Running Automated PMS Reminder Job...")
     now = datetime.now(IST)
     
@@ -1450,10 +1532,56 @@ def send_pms_reminders():
                 )
                 threading.Thread(target=send_email, args=(manager["email"], subject, body), daemon=True).start()
 
+def auto_expire_grants():
+    """
+    Automated Background Job: Checks active temporary access grants and disables them
+    if they have passed their designated expiration timeframe.
+    """
+    print("Running Auto-Expire Access Grants Job...")
+    now = datetime.now(IST)
+    
+    # Query all active grants
+    active_grants = access_grants_col.find({"is_active": True})
+    
+    for g in active_grants:
+        expired = False
+        
+        # Scenario 1: Expires at the "end of the day" it was granted
+        if g.get("expiry") == "end_of_day":
+            granted_at_ist = utc_to_ist(g["granted_at"])
+            # If the current date is strictly greater than the date it was granted, it has expired.
+            if now.date() > granted_at_ist.date():
+                expired = True
+                
+        # Scenario 2: Expires at a specific custom date and time
+        elif g.get("expiry") == "custom_time":
+            custom_time_str = g.get("custom_expiry_time")
+            if custom_time_str:
+                try:
+                    # Frontend datetime-local usually produces "YYYY-MM-DDTHH:MM"
+                    expiry_dt = datetime.strptime(custom_time_str, "%Y-%m-%dT%H:%M")
+                    # Localize to IST
+                    expiry_dt = IST.localize(expiry_dt)
+                    if now >= expiry_dt:
+                        expired = True
+                except Exception as e:
+                    print(f"Error parsing custom time for grant {g['_id']}: {e}")
+        
+        # If expired, mark as inactive in the database
+        if expired:
+            access_grants_col.update_one({"_id": g["_id"]}, {"$set": {"is_active": False}})
+            print(f"Automatically expired access grant for employee {g['employee_id']}.")
+
 # Initialize Background Scheduler
 scheduler = BackgroundScheduler(timezone=IST)
-# Runs every day at 10:00 AM IST
+
+# Runs every day at 10:00 AM IST to send the PMS reminders
 scheduler.add_job(func=send_pms_reminders, trigger="cron", hour=10, minute=0)
+
+# Runs every 30 minutes to aggressively check and strip expired Access Grants
+scheduler.add_job(func=auto_expire_grants, trigger="interval", minutes=30)
+
+# Start the automated system
 scheduler.start()
 
 
