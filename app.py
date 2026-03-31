@@ -60,7 +60,7 @@ corrections_col = db["attendance_corrections"]
 pip_records_col = db["pip_records"]
 announcements_col = db["announcements"]
 
-# --- DELEGATED ACCESS COLLECTION (NEW) ---
+# --- DELEGATED ACCESS COLLECTION ---
 access_grants_col = db["access_grants"] # Stores temporary admin access for employees
 
 # --- NEW PMS COLLECTIONS ---
@@ -157,27 +157,19 @@ def token_required(f):
 @app.route("/api/my/set-password", methods=["POST"])
 @token_required
 def set_own_password():
-    """
-    Allows a user to securely change their password.
-    Validates the current password before applying the new strong password.
-    """
     data = request.json
     old_password = data.get("oldPassword")
     new_password = data.get("password")
     
-    # 1. Validate that the old password is provided
     if not old_password:
         return jsonify({"message": "Current password is required."}), 400
         
-    # 2. Verify the old password against the stored database hash
     if not bcrypt.check_password_hash(request.user["password"], old_password):
         return jsonify({"message": "Incorrect current password. Please try again."}), 400
     
-    # 3. Validate that the new password meets strong password criteria
     if not new_password or not is_strong_password(new_password):
         return jsonify({"message": "Password must be at least 8 characters and contain 1 uppercase, 1 lowercase, 1 number, and 1 special character."}), 400
         
-    # 4. Hash the new password and update the database
     hashed = bcrypt.generate_password_hash(new_password).decode("utf-8")
     users_col.update_one(
         {"_id": request.user["_id"]}, 
@@ -192,22 +184,16 @@ def set_own_password():
 # -------------------------------------------------------------
 @app.route("/api/forgot-password", methods=["POST"])
 def forgot_password():
-    """
-    Handles forgotten password requests by generating a temporary password,
-    updating the user document, and emailing the temporary credentials asynchronously.
-    """
     data = request.json
     email = data.get("email")
 
     user = users_col.find_one({"email": email})
     if not user:
-        # Generic response to prevent email enumeration attacks
         return jsonify({"message": "If this email exists, a password reset has been sent."}), 200
 
     temp_password = generate_random_password()
     hashed = bcrypt.generate_password_hash(temp_password).decode("utf-8")
     
-    # Reset password_changed flag so they are forced to set a strong one again
     users_col.update_one({"_id": user["_id"]}, {"$set": {"password": hashed, "password_changed": False}})
 
     subject = "Password Reset Request"
@@ -231,9 +217,6 @@ def forgot_password():
 # -------------------------------------------------------------
 @app.route("/api/register-admin", methods=["POST"])
 def register_admin():
-    """
-    Registers a new master admin account.
-    """
     data = request.json
     email = data.get("email")
     name = data.get("name", "Admin")
@@ -247,7 +230,7 @@ def register_admin():
         "name": name,
         "email": email,
         "password": hashed,
-        "password_changed": True, # Admins exempt from force change on register
+        "password_changed": True, 
         "role": "admin",
         "department": "",
         "position": "",
@@ -264,10 +247,6 @@ def register_admin():
 @app.route("/api/register-manager", methods=["POST"])
 @token_required
 def register_manager():
-    """
-    Allows an admin to register a new manager account.
-    Requires Name, Email, Password, and Department.
-    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -289,7 +268,7 @@ def register_manager():
         "name": name,
         "email": email,
         "password": hashed_pw,
-        "password_changed": False, # Force strong password on first login
+        "password_changed": False, 
         "role": "manager",
         "department": department,
         "position": "Manager",
@@ -307,9 +286,6 @@ def register_manager():
 # -------------------------------------------------------------
 @app.route("/api/login", methods=["POST"])
 def login():
-    """
-    Authenticates a user and issues a JWT token valid for 4 hours.
-    """
     data = request.json
     email = data.get("email")
     password = data.get("password")
@@ -326,7 +302,7 @@ def login():
     return jsonify({
         "token": token,
         "role": user.get("role", "employee"),
-        "password_changed": user.get("password_changed", False), # Front-end checks this to show Set Password Modal
+        "password_changed": user.get("password_changed", False), 
         "user": {
             "name": user.get("name"),
             "email": user.get("email"),
@@ -341,10 +317,6 @@ def login():
 @app.route("/api/admin/employees", methods=["POST"])
 @token_required
 def add_employee():
-    """
-    Allows admins to create new employee profiles, assigns a random temporary 
-    password, and emails the credentials to the user.
-    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -365,7 +337,7 @@ def add_employee():
         "name": name,
         "email": email,
         "password": hashed,
-        "password_changed": False, # Will trigger strong password modal
+        "password_changed": False, 
         "role": "employee",
         "department": department,
         "position": position,
@@ -395,16 +367,19 @@ def add_employee():
 
 
 # -------------------------------------------------------------
-# ADMIN: LIST EMPLOYEES
+# ADMIN: LIST EMPLOYEES (FIXED FOR DELEGATED ACCESS)
 # -------------------------------------------------------------
 @app.route("/api/admin/employees", methods=["GET"])
 @token_required
 def list_employees():
     """
     Returns a list of all employees and managers for admin view.
-    Strips sensitive password data before returning.
+    UPDATED: Now allows users with active delegated grants to view this list.
     """
-    if request.user.get("role") != "admin":
+    role = request.user.get("role")
+    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    
+    if role != "admin" and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     managers = {str(m["_id"]): m["name"] for m in users_col.find({"role": "manager"})}
@@ -429,9 +404,6 @@ def list_employees():
 @app.route("/api/admin/managers", methods=["GET"])
 @token_required
 def list_managers():
-    """
-    Returns a list of only managers for admin view.
-    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -451,9 +423,6 @@ def list_managers():
 @app.route("/api/admin/employees/<emp_id>", methods=["PUT"])
 @token_required
 def edit_employee(emp_id):
-    """
-    Updates an employee's profile data (name, dept, position, manager).
-    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -464,7 +433,6 @@ def edit_employee(emp_id):
         if k in data:
             update[k] = data[k]
     
-    # Allow clearing manager
     if "manager_id" in data and not data["manager_id"]:
          update["manager_id"] = None
          
@@ -480,9 +448,6 @@ def edit_employee(emp_id):
 @app.route("/api/admin/managers/<man_id>", methods=["PUT"])
 @token_required
 def edit_manager(man_id):
-    """
-    Updates a manager's profile data.
-    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -504,9 +469,6 @@ def edit_manager(man_id):
 @app.route("/api/admin/employees/<emp_id>", methods=["DELETE"])
 @token_required
 def delete_employee(emp_id):
-    """
-    Deletes an employee and removes their associated attendance and leaves.
-    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -523,9 +485,6 @@ def delete_employee(emp_id):
 @app.route("/api/admin/managers/<man_id>", methods=["DELETE"])
 @token_required
 def delete_manager(man_id):
-    """
-    Deletes a manager and unassigns them from all their assigned employees.
-    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -536,14 +495,11 @@ def delete_manager(man_id):
 
 
 # ==============================================================================
-#  DELEGATED ADMIN ACCESS (GRANT ACCESS) - NEW FEATURE
+#  DELEGATED ADMIN ACCESS (GRANT ACCESS)
 # ==============================================================================
 @app.route("/api/admin/grant-access", methods=["POST"])
 @token_required
 def grant_access():
-    """
-    Allows the main admin to grant temporary view or edit access to an employee.
-    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
     
@@ -558,7 +514,6 @@ def grant_access():
     if not emp_id:
         return jsonify({"message": "Employee ID is required"}), 400
 
-    # Prevent assigning access to someone who is already an admin
     emp = users_col.find_one({"_id": ObjectId(emp_id)})
     if not emp or emp.get("role") == "admin":
         return jsonify({"message": "Invalid employee or employee is already an admin."}), 400
@@ -581,14 +536,10 @@ def grant_access():
 @app.route("/api/admin/active-grants", methods=["GET"])
 @token_required
 def get_active_grants():
-    """
-    Fetches a list of all currently active temporary admin permissions.
-    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
     
     grants = []
-    # Only return grants that are currently marked as active
     for g in access_grants_col.find({"is_active": True}).sort("granted_at", -1):
         g["_id"] = str(g["_id"])
         emp = users_col.find_one({"_id": ObjectId(g["employee_id"])})
@@ -600,18 +551,52 @@ def get_active_grants():
 @app.route("/api/admin/revoke-access/<grant_id>", methods=["DELETE"])
 @token_required
 def revoke_access(grant_id):
-    """
-    Allows the admin to manually revoke a granted permission before its expiration.
-    """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
     
-    # We use a soft delete (is_active = False) so the history is preserved
     result = access_grants_col.update_one({"_id": ObjectId(grant_id)}, {"$set": {"is_active": False}})
     if result.modified_count > 0:
         return jsonify({"message": "Access revoked successfully"}), 200
     else:
         return jsonify({"message": "Access grant not found or already inactive."}), 404
+
+# -------------------------------------------------------------
+# CHECK MY DELEGATED ACCESS (FRONTEND UTILITY)
+# -------------------------------------------------------------
+@app.route("/api/my/delegated-access", methods=["GET"])
+@token_required
+def my_delegated_access():
+    uid = str(request.user["_id"])
+    now = datetime.now(IST)
+    active_grants = []
+    
+    grants = access_grants_col.find({"employee_id": uid, "is_active": True})
+
+    for g in grants:
+        expired = False
+        if g.get("expiry") == "end_of_day":
+            granted_at_ist = utc_to_ist(g["granted_at"])
+            if now.date() > granted_at_ist.date():
+                expired = True
+                
+        elif g.get("expiry") == "custom_time":
+            custom_time_str = g.get("custom_expiry_time")
+            if custom_time_str:
+                try:
+                    expiry_dt = datetime.strptime(custom_time_str, "%Y-%m-%dT%H:%M")
+                    expiry_dt = IST.localize(expiry_dt)
+                    if now >= expiry_dt:
+                        expired = True
+                except Exception as e:
+                    print(f"Error parsing custom time: {e}")
+        
+        if expired:
+            access_grants_col.update_one({"_id": g["_id"]}, {"$set": {"is_active": False}})
+        else:
+            g["_id"] = str(g["_id"])
+            active_grants.append(g)
+
+    return jsonify(active_grants), 200
 
 
 # -------------------------------------------------------------
@@ -783,14 +768,10 @@ def approve_correction():
 @app.route("/api/admin/pms-template", methods=["POST"])
 @token_required
 def save_pms_template():
-    # ALLOW MANAGERS OR ADMINS TO CREATE TEMPLATES
     if request.user.get("role") not in ["admin", "manager"]: return jsonify({"message": "Unauthorized"}), 403
     data = request.json 
-    # Data Format expected:
-    # { "department": "All", "sessions": [ { "name": "Work Productivity", "questions": [ {"text": "What were achievements?", "type": "descriptive", "requires_remarks": True} ] } ] }
     
     dept_to_update = data.get("department", "All")
-    # If it's a manager, force them to only update their own department's template
     if request.user.get("role") == "manager":
         dept_to_update = request.user.get("department")
 
@@ -809,7 +790,6 @@ def save_pms_template():
 @token_required
 def get_pms_template():
     dept = request.user.get("department", "All")
-    # First try fetching a department-specific template, fallback to "All"
     template = pms_templates_col.find_one({"department": dept}, {"_id": 0})
     if not template:
         template = pms_templates_col.find_one({"department": "All"}, {"_id": 0})
@@ -827,7 +807,6 @@ def submit_pms_review():
     data = request.json
     month = datetime.now(IST).strftime("%Y-%m")
 
-    # Employees can only submit once per month
     if pms_reviews_col.find_one({"user_id": uid, "month": month}):
         return jsonify({"message": "You have already submitted your Self Assessment for this month."}), 400
 
@@ -836,7 +815,7 @@ def submit_pms_review():
         "department": request.user.get("department"),
         "manager_id": request.user.get("manager_id"),
         "month": month,
-        "responses": data.get("responses", []), # List containing self_score (1-10), descriptive answers, and remarks
+        "responses": data.get("responses", []), 
         "status": "Pending Review", 
         "self_assessment_date": datetime.now(timezone.utc),
         "manager_review_date": None,
@@ -878,7 +857,7 @@ def finalize_pms_review():
     pms_reviews_col.update_one(
         {"_id": ObjectId(review_id)},
         {"$set": {
-            "manager_scores": data.get("manager_scores", []), # List mapping to questions
+            "manager_scores": data.get("manager_scores", []), 
             "manager_feedback": data.get("manager_feedback", ""),
             "status": "Manager Review Completed",
             "manager_review_date": datetime.now(timezone.utc)
@@ -903,37 +882,30 @@ def my_pms():
 @app.route("/api/admin/pms-dashboard", methods=["GET"])
 @token_required
 def pms_dashboard():
-    # ALLOW MANAGERS AND ADMINS
     if request.user.get("role") not in ["admin", "manager"]: return jsonify({"message": "Unauthorized"}), 403
     
     month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
     dashboard_data = {}
     
-    # If manager, they only see their department. If admin, they see all.
     if request.user.get("role") == "manager":
         departments = [request.user.get("department")]
     else:
         departments = users_col.distinct("department")
         
     for d in departments:
-        if d: # exclude empty
+        if d:
             total_emps = users_col.count_documents({"department": d, "role": "employee"})
             dashboard_data[d] = {"total_employees": total_emps, "completed_pms": 0, "total_score": 0, "avg_score": 0}
             
-    # Calculate Completion and Averages
-    # Filter reviews strictly for the allowed departments
     reviews = pms_reviews_col.find({"month": month, "status": "Manager Review Completed", "department": {"$in": departments}})
     
     for r in reviews:
         dept = r.get("department")
         if dept and dept in dashboard_data:
             dashboard_data[dept]["completed_pms"] += 1
-            
-            # Sum up manager scores for linear scale questions
             mgr_total = sum([int(ms.get('score', 0)) for ms in r.get('manager_scores', []) if str(ms.get('score')).isdigit()])
             dashboard_data[dept]["total_score"] += mgr_total
 
-    # Format final output
     final_output = []
     for dept, data in dashboard_data.items():
         if data["completed_pms"] > 0:
@@ -955,26 +927,22 @@ def pms_dashboard():
 @app.route("/api/admin/export-pms", methods=["GET"])
 @token_required
 def export_pms():
-    # ALLOW MANAGERS AND ADMINS
     if request.user.get("role") not in ["admin", "manager"]: return jsonify({"message": "Unauthorized"}), 403
     
     month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
     
-    # Query logic depending on role
     query = {"month": month}
     if request.user.get("role") == "manager":
         query["department"] = request.user.get("department")
     
     si = io.StringIO()
     cw = csv.writer(si)
-    # Header
     cw.writerow(["Employee Name", "Department", "Month", "Status", "Self Score Total", "Manager Score Total", "Manager Feedback"])
     
     for r in pms_reviews_col.find(query).sort("department", 1):
         emp = users_col.find_one({"_id": ObjectId(r["user_id"])})
         emp_name = emp["name"] if emp else "Unknown"
         
-        # Calculate totals
         self_total = sum([int(res.get('self_score', 0)) for res in r.get('responses', []) if str(res.get('self_score')).isdigit()])
         mgr_total = sum([int(ms.get('score', 0)) for ms in r.get('manager_scores', []) if str(ms.get('score')).isdigit()])
         
@@ -1239,20 +1207,29 @@ def apply_leave():
 
 
 # -------------------------------------------------------------
-# ADMIN VIEW LEAVES
+# ADMIN VIEW LEAVES (FIXED FOR DELEGATED ACCESS)
 # -------------------------------------------------------------
 @app.route("/api/admin/leaves", methods=["GET"])
 @token_required
 def admin_view_leaves():
-    if request.user.get("role") not in ["admin", "manager"]:
+    """
+    Allows Admin to view all leaves, Managers to view their department,
+    and Employees/Managers with an active 'access_grant' to view all leaves.
+    """
+    role = request.user.get("role")
+    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    
+    if role not in ["admin", "manager"] and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     query = {}
     
-    if request.user.get("role") == "manager":
+    # If the user is merely a manager (and has NOT been delegated global admin access)
+    if role == "manager" and not has_delegated:
         my_dept = request.user.get("department")
         dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept})]
         query = {"user_id": {"$in": dept_users}}
+    # If role is admin, or they have delegated admin access, query remains {} (all leaves)
 
     rows = []
     employees = {str(e["_id"]): e for e in users_col.find()}
@@ -1276,13 +1253,19 @@ def admin_view_leaves():
 
 
 # -------------------------------------------------------------
-# UPDATE LEAVE STATUS
+# UPDATE LEAVE STATUS (FIXED FOR DELEGATED ACCESS)
 # -------------------------------------------------------------
 @app.route("/api/admin/leaves/<leave_id>", methods=["PUT"])
 @token_required
 def update_leave(leave_id):
+    """
+    Allows Managers and Admins to approve/reject leaves. 
+    Users with Delegated Access can only edit if their access_level is 'view_edit'.
+    """
     role = request.user.get("role")
-    if role not in ["admin", "manager"]:
+    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    
+    if role not in ["admin", "manager"] and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     data = request.json
@@ -1293,10 +1276,15 @@ def update_leave(leave_id):
 
     update_fields = {}
 
-    if role == "manager":
-        update_fields["manager_status"] = action
-    elif role == "admin":
+    if role == "admin":
         update_fields["admin_status"] = action
+    elif has_delegated:
+        if has_delegated.get("access_level") == "view_only":
+            return jsonify({"message": "Unauthorized: Your delegated access is View Only."}), 403
+        # Delegated users act as an Admin
+        update_fields["admin_status"] = action
+    elif role == "manager":
+        update_fields["manager_status"] = action
 
     leaves_col.update_one({"_id": ObjectId(leave_id)}, {"$set": update_fields})
 
@@ -1378,12 +1366,19 @@ def my_leaves():
 
 
 # -------------------------------------------------------------
-# ADMIN: EMPLOYEE ATTENDANCE
+# ADMIN: EMPLOYEE ATTENDANCE (FIXED FOR DELEGATED ACCESS)
 # -------------------------------------------------------------
 @app.route("/api/admin/attendance/<emp_id>", methods=["GET"])
 @token_required
 def admin_employee_attendance(emp_id):
-    if request.user.get("role") != "admin":
+    """
+    Fetches attendance for a specific employee. 
+    Accessible by Admin, or users with delegated access.
+    """
+    role = request.user.get("role")
+    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    
+    if role != "admin" and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     emp = users_col.find_one({"_id": ObjectId(emp_id)})
@@ -1435,12 +1430,19 @@ def auto_mark_absent():
 
 
 # -------------------------------------------------------------
-# ADMIN MONTHLY SUMMARY
+# ADMIN MONTHLY SUMMARY (FIXED FOR DELEGATED ACCESS)
 # -------------------------------------------------------------
 @app.route("/api/admin/attendance-summary", methods=["GET"])
 @token_required
 def attendance_summary():
-    if request.user.get("role") != "admin":
+    """
+    Returns the monthly summary for all employees.
+    Accessible by Admin or users with delegated access.
+    """
+    role = request.user.get("role")
+    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    
+    if role != "admin" and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     month_param = request.args.get("month")
@@ -1485,12 +1487,15 @@ def attendance_summary():
 
 
 # -------------------------------------------------------------
-# TODAY STATS
+# TODAY STATS (FIXED FOR DELEGATED ACCESS)
 # -------------------------------------------------------------
 @app.route("/api/admin/today-stats", methods=["GET"])
 @token_required
 def today_stats():
-    if request.user.get("role") != "admin":
+    role = request.user.get("role")
+    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    
+    if role != "admin" and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     today = str(datetime.now(IST).date())
@@ -1508,13 +1513,9 @@ def today_stats():
 # Req 2.5: AUTOMATED PMS REMINDER SCHEDULER & GRANT EXPIRATIONS
 # ==============================================================================
 def send_pms_reminders():
-    """
-    Automated Background Job: Sends emails to managers to remind them of pending PMS reviews.
-    """
     print("Running Automated PMS Reminder Job...")
     now = datetime.now(IST)
     
-    # Send reminders only from the 28th to the end of the month
     if now.day >= 28:
         pending_reviews = pms_reviews_col.find({"status": "Pending Review"})
         for rev in pending_reviews:
@@ -1532,106 +1533,36 @@ def send_pms_reminders():
                 )
                 threading.Thread(target=send_email, args=(manager["email"], subject, body), daemon=True).start()
 
-# -------------------------------------------------------------
-# CHECK MY DELEGATED ACCESS (NEW)
-# -------------------------------------------------------------
-@app.route("/api/my/delegated-access", methods=["GET"])
-@token_required
-def my_delegated_access():
-    """
-    Checks if the currently logged-in user has any active delegated admin grants.
-    This is what tells the frontend to show the 'Special Access' button.
-    """
-    uid = str(request.user["_id"])
-    now = datetime.now(IST)
-
-    active_grants = []
-    
-    # Find grants assigned to this specific user that are marked active
-    grants = access_grants_col.find({
-        "employee_id": uid, 
-        "is_active": True
-    })
-
-    for g in grants:
-        # Perform a quick real-time expiration check just in case the background job hasn't run yet
-        expired = False
-        
-        if g.get("expiry") == "end_of_day":
-            granted_at_ist = utc_to_ist(g["granted_at"])
-            if now.date() > granted_at_ist.date():
-                expired = True
-                
-        elif g.get("expiry") == "custom_time":
-            custom_time_str = g.get("custom_expiry_time")
-            if custom_time_str:
-                try:
-                    expiry_dt = datetime.strptime(custom_time_str, "%Y-%m-%dT%H:%M")
-                    expiry_dt = IST.localize(expiry_dt)
-                    if now >= expiry_dt:
-                        expired = True
-                except Exception as e:
-                    print(f"Error parsing custom time: {e}")
-        
-        if expired:
-            # If we catch it expiring right now, update the DB and don't send it to frontend
-            access_grants_col.update_one({"_id": g["_id"]}, {"$set": {"is_active": False}})
-        else:
-            g["_id"] = str(g["_id"])
-            active_grants.append(g)
-
-    return jsonify(active_grants), 200
-
 def auto_expire_grants():
-    """
-    Automated Background Job: Checks active temporary access grants and disables them
-    if they have passed their designated expiration timeframe.
-    """
     print("Running Auto-Expire Access Grants Job...")
     now = datetime.now(IST)
-    
-    # Query all active grants
     active_grants = access_grants_col.find({"is_active": True})
     
     for g in active_grants:
         expired = False
-        
-        # Scenario 1: Expires at the "end of the day" it was granted
         if g.get("expiry") == "end_of_day":
             granted_at_ist = utc_to_ist(g["granted_at"])
-            # If the current date is strictly greater than the date it was granted, it has expired.
             if now.date() > granted_at_ist.date():
                 expired = True
                 
-        # Scenario 2: Expires at a specific custom date and time
         elif g.get("expiry") == "custom_time":
             custom_time_str = g.get("custom_expiry_time")
             if custom_time_str:
                 try:
-                    # Frontend datetime-local usually produces "YYYY-MM-DDTHH:MM"
                     expiry_dt = datetime.strptime(custom_time_str, "%Y-%m-%dT%H:%M")
-                    # Localize to IST
                     expiry_dt = IST.localize(expiry_dt)
                     if now >= expiry_dt:
                         expired = True
                 except Exception as e:
                     print(f"Error parsing custom time for grant {g['_id']}: {e}")
         
-        # If expired, mark as inactive in the database
         if expired:
             access_grants_col.update_one({"_id": g["_id"]}, {"$set": {"is_active": False}})
             print(f"Automatically expired access grant for employee {g['employee_id']}.")
 
-# Initialize Background Scheduler
 scheduler = BackgroundScheduler(timezone=IST)
-
-# Runs every day at 10:00 AM IST to send the PMS reminders
 scheduler.add_job(func=send_pms_reminders, trigger="cron", hour=10, minute=0)
-
-# Runs every 30 minutes to aggressively check and strip expired Access Grants
 scheduler.add_job(func=auto_expire_grants, trigger="interval", minutes=30)
-
-# Start the automated system
 scheduler.start()
 
 
