@@ -149,7 +149,7 @@ def token_required(f):
 
 
 # -------------------------------------------------------------
-# SET OWN STRONG PASSWORD (NEW - FIXED SECURITY BUG)
+# SET OWN STRONG PASSWORD
 # -------------------------------------------------------------
 @app.route("/api/my/set-password", methods=["POST"])
 @token_required
@@ -185,19 +185,20 @@ def set_own_password():
 
 
 # -------------------------------------------------------------
-# FORGOT PASSWORD
+# FORGOT PASSWORD (FIXED THREADING ISSUE)
 # -------------------------------------------------------------
 @app.route("/api/forgot-password", methods=["POST"])
 def forgot_password():
     """
     Handles forgotten password requests by generating a temporary password,
-    updating the user document, and emailing the temporary credentials.
+    updating the user document, and emailing the temporary credentials asynchronously.
     """
     data = request.json
     email = data.get("email")
 
     user = users_col.find_one({"email": email})
     if not user:
+        # Generic response to prevent email enumeration attacks
         return jsonify({"message": "If this email exists, a password reset has been sent."}), 200
 
     temp_password = generate_random_password()
@@ -214,7 +215,14 @@ def forgot_password():
         "Please login and change your password immediately."
     )
 
-    send_email(email, subject, body)
+    # FIXED: Send the email in a background thread to prevent blocking the Flask response
+    try:
+        threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
+    except Exception as e:
+        print(f"Failed to start email thread: {e}")
+        # We still return 200 because the password was successfully reset in the DB, 
+        # even if the email system is currently misconfigured.
+
     return jsonify({"message": "Password reset email sent."}), 200
 
 
