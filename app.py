@@ -16,10 +16,6 @@ import threading
 import cloudinary
 import cloudinary.uploader
 from apscheduler.schedulers.background import BackgroundScheduler
-import logging
-
-# Configure logging to see errors in your terminal
-logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
 
@@ -188,60 +184,32 @@ def set_own_password():
 # -------------------------------------------------------------
 @app.route("/api/forgot-password", methods=["POST"])
 def forgot_password():
+    data = request.json
+    email = data.get("email")
+
+    user = users_col.find_one({"email": email})
+    if not user:
+        return jsonify({"message": "If this email exists, a password reset has been sent."}), 200
+
+    temp_password = generate_random_password()
+    hashed = bcrypt.generate_password_hash(temp_password).decode("utf-8")
+    
+    users_col.update_one({"_id": user["_id"]}, {"$set": {"password": hashed, "password_changed": False}})
+
+    subject = "Password Reset Request"
+    body = (
+        f"Hello {user['name']},\n\n"
+        "We received a request to reset your password.\n"
+        f"Your new temporary password is: {temp_password}\n\n"
+        "Please login and change your password immediately."
+    )
+
     try:
-        data = request.json
-        email = data.get("email")
-
-        if not email:
-            return jsonify({"message": "Email is required"}), 400
-
-        user = users_col.find_one({"email": email})
-        
-        # Security: Always return 200 even if user doesn't exist 
-        # to prevent email harvesting.
-        if not user:
-            logging.info(f"Password reset attempted for non-existent email: {email}")
-            return jsonify({"message": "If this email exists, a password reset has been sent."}), 200
-
-        temp_password = generate_random_password()
-        hashed = bcrypt.generate_password_hash(temp_password).decode("utf-8")
-        
-        # Update the database
-        users_col.update_one(
-            {"_id": user["_id"]}, 
-            {"$set": {"password": hashed, "password_changed": False}}
-        )
-
-        subject = "Password Reset Request"
-        body = (
-            f"Hello {user.get('name', 'User')},\n\n"
-            "We received a request to reset your password.\n"
-            f"Your new temporary password is: {temp_password}\n\n"
-            "Please login and change your password immediately."
-        )
-
-        # Updated Threading: We wrap the target in a helper to catch errors
-        def send_email_with_logging(dest_email, subj, msg_body):
-            try:
-                # This calls your existing send_email function
-                send_email(dest_email, subj, msg_body)
-                logging.info(f"Email successfully sent to {dest_email}")
-            except Exception as e:
-                logging.error(f"CRITICAL: Failed to send email to {dest_email}. Error: {e}")
-
-        # Start the background thread
-        thread = threading.Thread(
-            target=send_email_with_logging, 
-            args=(email, subject, body), 
-            daemon=True
-        )
-        thread.start()
-
-        return jsonify({"message": "Password reset email sent."}), 200
-
+        threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
     except Exception as e:
-        logging.error(f"Unexpected error in forgot_password route: {e}")
-        return jsonify({"message": "Internal server error"}), 500
+        print(f"Failed to start email thread: {e}")
+
+    return jsonify({"message": "Password reset email sent."}), 200
 
 
 # -------------------------------------------------------------
