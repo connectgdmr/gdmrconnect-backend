@@ -1620,40 +1620,7 @@ except Exception as e:
 
 
 
-@app.route("/api/admin/force-reset-password", methods=["POST"])
-def force_reset_admin_password():
-    """
-    TEMPORARY RECOVERY ROUTE: Force reset admin password without the old password.
-    WARNING: Remove this block of code after you successfully regain access!
-    """
-    data = request.json
-    email = data.get("email")
-    new_password = data.get("new_password")
-    admin_secret = data.get("admin_secret") 
-
-    # Security check to prevent unauthorized access
-    if admin_secret != "super-secret-recovery-key":
-        return jsonify({"message": "Unauthorized"}), 403
-
-    if not email or not new_password:
-        return jsonify({"message": "Email and new_password are required."}), 400
-
-    if not is_strong_password(new_password):
-        return jsonify({"message": "Password must be at least 8 characters, contain 1 uppercase, 1 lowercase, 1 number, and 1 special character."}), 400
-
-    user = users_col.find_one({"email": email, "role": "admin"})
-    if not user:
-        return jsonify({"message": "Admin user not found."}), 404
-
-    # Hash the new password and update the database
-    hashed = bcrypt.generate_password_hash(new_password).decode("utf-8")
     
-    users_col.update_one(
-        {"_id": user["_id"]}, 
-        {"$set": {"password": hashed, "password_changed": True}}
-    )
-    
-    return jsonify({"message": "Admin password successfully force-reset!"}), 200
 
 # =============================================================================
 # RUN SERVER
