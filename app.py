@@ -13,6 +13,7 @@ Key Modules:
 - Temporary Delegated Admin Access
 - Performance Management System (PMS 2.0)
 - Automated Background Tasks (APScheduler)
+- Announcements & System Broadcasts (Create, Read, Update, Delete)
 ===============================================================================
 """
 
@@ -51,7 +52,7 @@ try:
         api_key = os.getenv('CLOUDINARY_API_KEY'),
         api_secret = os.getenv('CLOUDINARY_API_SECRET')
     )
-    print("Cloudinary configured successfully.")
+    print("Cloudinary configured successfully for Asset Management.")
 except Exception as e:
     print(f"Warning: Cloudinary configuration failed. Images may not upload. Error: {e}")
 
@@ -82,7 +83,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 try:
     client = MongoClient(MONGO_URI)
     db = client["attendance_db"]
-    print("MongoDB Connected Successfully.")
+    print("MongoDB Connected Successfully to Database: attendance_db.")
 except Exception as e:
     print(f"CRITICAL ERROR: Failed to connect to MongoDB. Error: {e}")
 
@@ -101,11 +102,11 @@ access_grants_col = db["access_grants"] # Stores temporary admin access for empl
 pms_templates_col = db["pms_templates"] # Stores Admin/Manager Sessions & Questions
 pms_reviews_col = db["pms_reviews"] # Stores actual employee responses and manager evaluations
 
-# Local Upload Fallback
+# Local Upload Fallback Directory (Used if Cloudinary is unavailable)
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Application Timezone
+# Application Timezone Context (Strict enforcement to avoid UTC drift)
 IST = pytz.timezone('Asia/Kolkata')
 
 
@@ -125,7 +126,7 @@ def utc_to_ist(utc_datetime):
 def format_datetime_ist(dt):
     """
     Formats a datetime object or ISO string into a standardized IST ISO string.
-    Useful for JSON serialization to the frontend.
+    Useful for JSON serialization to the frontend to ensure correct display times.
     """
     if isinstance(dt, str):
         try:
@@ -139,7 +140,7 @@ def format_datetime_ist(dt):
 def is_strong_password(password):
     """
     Validates password strength to enforce security standards.
-    Requires: 8+ chars, 1 uppercase, 1 lowercase, 1 number, 1 special char.
+    Requires: Minimum 8 characters, 1 uppercase, 1 lowercase, 1 number, 1 special character.
     """
     if len(password) < 8: return False
     if not re.search(r"[a-z]", password): return False
@@ -155,12 +156,12 @@ def is_strong_password(password):
 
 @app.route("/")
 def home():
-    """ Health check route to ensure the backend is active. """
+    """ Health check route to ensure the backend container is active and responding. """
     return "GDMR Connect Backend is running normally ✅", 200
 
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
-    """ Serves files from the local uploads directory if Cloudinary isn't used. """
+    """ Serves files from the local uploads directory if Cloudinary isn't used for storage. """
     uploads_dir = os.path.join(os.getcwd(), "uploads")
     return send_from_directory(uploads_dir, filename)
 
@@ -172,7 +173,7 @@ def serve_upload(filename):
 def token_required(f):
     """
     Decorator to protect routes using JWT authentication.
-    Extracts the token from the Authorization header, decodes it, 
+    Extracts the Bearer token from the Authorization header, decodes it, 
     and sets request.user with the full user document from the database.
     """
     @wraps(f)
@@ -209,7 +210,7 @@ def token_required(f):
 @app.route("/api/login", methods=["POST"])
 def login():
     """
-    Authenticates a user and returns a JWT token along with user details.
+    Authenticates a user against the database and returns a short-lived JWT token.
     """
     data = request.json
     email = data.get("email")
@@ -245,7 +246,8 @@ def login():
 @token_required
 def set_own_password():
     """
-    Allows a user to update their password. Enforces strong password rules.
+    Allows an authenticated user to update their password. 
+    Enforces strong password rules and validates current password.
     """
     data = request.json
     old_password = data.get("oldPassword")
@@ -273,14 +275,15 @@ def set_own_password():
 @app.route("/api/forgot-password", methods=["POST"])
 def forgot_password():
     """
-    Generates a temporary password and emails it to the user.
+    Generates a temporary secure password and emails it to the user.
+    Flags the user account to require a password change on next login.
     """
     data = request.json
     email = data.get("email")
 
     user = users_col.find_one({"email": email})
     if not user:
-        # Standard security practice: Don't reveal if email exists or not
+        # Standard security practice: Don't reveal if email exists or not to prevent user enumeration
         return jsonify({"message": "If this email exists, a password reset has been sent."}), 200
 
     temp_password = generate_random_password()
@@ -311,7 +314,7 @@ def forgot_password():
 
 @app.route("/api/register-admin", methods=["POST"])
 def register_admin():
-    """ Initial setup route to create the master admin. """
+    """ Initial system setup route to create the master administrator. """
     data = request.json
     email = data.get("email")
     name = data.get("name", "Admin")
@@ -339,7 +342,7 @@ def register_admin():
 @app.route("/api/register-manager", methods=["POST"])
 @token_required
 def register_manager():
-    """ Registers a new manager. Requires Admin privileges. """
+    """ Registers a new manager profile. Requires Admin privileges. """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized access."}), 403
 
@@ -377,7 +380,7 @@ def register_manager():
 @app.route("/api/admin/employees", methods=["POST"])
 @token_required
 def add_employee():
-    """ Registers a new employee. Requires Admin privileges. """
+    """ Registers a new employee profile. Requires Admin privileges. """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized access."}), 403
 
@@ -411,7 +414,7 @@ def add_employee():
 
     res = users_col.insert_one(user_doc)
 
-    # Email the credentials to the new employee
+    # Email the credentials to the new employee automatically
     subject = "Welcome to GDMR Connect: Your New Account Credentials"
     body = (
         f"Dear {name},\n\n"
@@ -449,7 +452,7 @@ def list_employees():
     if role != "admin" and not has_delegated:
         return jsonify({"message": "Unauthorized access."}), 403
 
-    # Map manager IDs to their names for easy reference on the frontend
+    # Map manager IDs to their names for easy reference on the frontend list
     managers = {str(m["_id"]): m["name"] for m in users_col.find({"role": "manager"})}
 
     rows = []
@@ -469,6 +472,7 @@ def list_employees():
 @app.route("/api/admin/managers", methods=["GET"])
 @token_required
 def list_managers():
+    """ Fetches a list of all registered managers in the system. """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -485,7 +489,7 @@ def list_managers():
 @app.route("/api/manager/my-employees", methods=["GET"])
 @token_required
 def manager_my_employees():
-    """ Returns a list of employees specific to a Manager's department. """
+    """ Returns a list of employees specific to a Manager's assigned department. """
     if request.user.get("role") != "manager":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -505,6 +509,7 @@ def manager_my_employees():
 @app.route("/api/admin/employees/<emp_id>", methods=["PUT"])
 @token_required
 def edit_employee(emp_id):
+    """ Modifies an existing employee record. """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -527,6 +532,7 @@ def edit_employee(emp_id):
 @app.route("/api/admin/managers/<man_id>", methods=["PUT"])
 @token_required
 def edit_manager(man_id):
+    """ Modifies an existing manager record. """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -545,10 +551,11 @@ def edit_manager(man_id):
 @app.route("/api/admin/employees/<emp_id>", methods=["DELETE"])
 @token_required
 def delete_employee(emp_id):
+    """ Hard deletes an employee and wipes all associated tracking data. """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
-    # Clean up user and all associated records
+    # Clean up user and all associated records to prevent orphaned documents
     users_col.delete_one({"_id": ObjectId(emp_id)})
     attendance_col.delete_many({"user_id": emp_id})
     leaves_col.delete_many({"user_id": emp_id})
@@ -560,6 +567,7 @@ def delete_employee(emp_id):
 @app.route("/api/admin/managers/<man_id>", methods=["DELETE"])
 @token_required
 def delete_manager(man_id):
+    """ Deletes a manager and unassigns them from their subordinates. """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -579,6 +587,7 @@ def delete_manager(man_id):
 def grant_access():
     """ 
     Allows an Admin to grant temporary admin capabilities to a standard employee.
+    Used for vacation coverages or temporary assignments.
     """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
@@ -617,6 +626,7 @@ def grant_access():
 @app.route("/api/admin/active-grants", methods=["GET"])
 @token_required
 def get_active_grants():
+    """ Returns a list of all currently active delegated access grants. """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
     
@@ -633,6 +643,7 @@ def get_active_grants():
 @app.route("/api/admin/revoke-access/<grant_id>", methods=["DELETE"])
 @token_required
 def revoke_access(grant_id):
+    """ Manually revokes an active delegated access grant immediately. """
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
     
@@ -646,7 +657,10 @@ def revoke_access(grant_id):
 @app.route("/api/my/delegated-access", methods=["GET"])
 @token_required
 def my_delegated_access():
-    """ Frontend utility to check if the current user has active special permissions. """
+    """ 
+    Frontend utility to check if the currently logged-in user has active special permissions. 
+    It evaluates the time restrictions live and deactivates them if expired.
+    """
     uid = str(request.user["_id"])
     now = datetime.now(IST)
     active_grants = []
@@ -729,7 +743,7 @@ def save_pms_template():
 def get_pms_template():
     """
     FETCHES THE PMS TEMPLATE FOR THE EMPLOYEE.
-    FIXED: Ensures the form is only sent to the user if their ID is in the 'assigned_to' array.
+    Ensures the form is only sent to the user if their ID is in the 'assigned_to' array.
     """
     uid = str(request.user["_id"])
     
@@ -772,10 +786,6 @@ def submit_pms_review():
     }
     
     pms_reviews_col.insert_one(submission)
-    
-    # OPTIONAL: You could remove the user from the `assigned_to` list here so they 
-    # don't see the form anymore, but relying on the "Already Submitted" block is safer for records.
-    
     return jsonify({"message": "Self Assessment Submitted for Manager Review."}), 201
 
 
@@ -1120,6 +1130,10 @@ def admin_employee_attendance(emp_id):
 @app.route("/api/leaves", methods=["POST"])
 @token_required
 def apply_leave():
+    """
+    Handles employee and manager leave applications. 
+    Parses start/end dates and attempts to upload any attached medical files to Cloudinary.
+    """
     if request.user.get("role") not in ["employee", "manager"]:
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -1184,7 +1198,10 @@ def apply_leave():
 @app.route("/api/admin/leaves", methods=["GET"])
 @token_required
 def admin_view_leaves():
-    """ Returns leaves contextually based on user role and delegated grants. """
+    """ 
+    Returns leaves contextually based on user role and delegated grants. 
+    Managers see their department; Admins/Delegated see everyone.
+    """
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
     
@@ -1224,6 +1241,7 @@ def admin_view_leaves():
 def update_leave(leave_id):
     """
     Approve or reject leaves with role-based logic.
+    A leave is only strictly "Approved" if BOTH manager and admin approve it.
     """
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
@@ -1276,6 +1294,7 @@ def update_leave(leave_id):
 @app.route("/api/my/leaves", methods=["GET"])
 @token_required
 def my_leaves():
+    """ Fetches the authenticated user's leave history. """
     uid = str(request.user["_id"])
     rows = []
     for l in leaves_col.find({"user_id": uid}).sort("applied_at", -1):
@@ -1291,6 +1310,7 @@ def my_leaves():
 @app.route("/api/announcements", methods=["POST"])
 @token_required
 def create_announcement():
+    """ Creates a new system-wide announcement. (Admin Only) """
     if request.user.get("role") != "admin": 
         return jsonify({"message": "Unauthorized"}), 403
     
@@ -1306,6 +1326,7 @@ def create_announcement():
 @app.route("/api/announcements", methods=["GET"])
 @token_required
 def get_announcements():
+    """ Fetches all active announcements. Viewable by everyone. """
     rows = []
     for a in announcements_col.find().sort("created_at", -1):
         a["_id"] = str(a["_id"])
@@ -1313,9 +1334,60 @@ def get_announcements():
     return jsonify(rows), 200
 
 
+@app.route("/api/announcements/<ann_id>", methods=["PUT"])
+@token_required
+def update_announcement(ann_id):
+    """ 
+    Updates an existing announcement's title and message. (Admin Only) 
+    Provides the backend logic for the frontend "Edit" feature.
+    """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized access. Admins only."}), 403
+        
+    data = request.json
+    title = data.get("title")
+    message = data.get("message")
+    
+    if not title or not message:
+        return jsonify({"message": "Title and message are required fields."}), 400
+        
+    result = announcements_col.update_one(
+        {"_id": ObjectId(ann_id)},
+        {"$set": {
+            "title": title,
+            "message": message,
+            "updated_at": datetime.now(timezone.utc)
+        }}
+    )
+    
+    if result.matched_count == 0:
+        return jsonify({"message": "Announcement not found in the database."}), 404
+        
+    return jsonify({"message": "Announcement successfully updated."}), 200
+
+
+@app.route("/api/announcements/<ann_id>", methods=["DELETE"])
+@token_required
+def delete_announcement(ann_id):
+    """ 
+    Deletes (recalls) an announcement from the system. (Admin Only) 
+    Provides the backend logic for the frontend "Recall" feature.
+    """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized access. Admins only."}), 403
+        
+    result = announcements_col.delete_one({"_id": ObjectId(ann_id)})
+    
+    if result.deleted_count == 0:
+        return jsonify({"message": "Announcement not found or already deleted."}), 404
+        
+    return jsonify({"message": "Announcement recalled and deleted successfully."}), 200
+
+
 @app.route("/api/attendance/request-correction", methods=["POST"])
 @token_required
 def request_correction():
+    """ Allows an employee to request a fix for a missed or wrong punch. Limits to 3 per month. """
     uid = str(request.user["_id"])
     now_ist = datetime.now(IST)
     month_str = now_ist.strftime("%Y-%m")
@@ -1343,6 +1415,7 @@ def request_correction():
 @app.route("/api/manager/corrections", methods=["GET"])
 @token_required
 def manager_corrections():
+    """ Fetches pending attendance correction requests for the manager's team. """
     if request.user.get("role") != "manager": return jsonify({"message": "Unauthorized"}), 403
     
     my_dept = request.user.get("department")
@@ -1362,6 +1435,7 @@ def manager_corrections():
 @app.route("/api/my/corrections", methods=["GET"])
 @token_required
 def my_corrections():
+    """ Fetches the employee's own correction history. """
     uid = str(request.user["_id"])
     rows = []
     for c in corrections_col.find({"user_id": uid}).sort("created_at", -1):
@@ -1373,6 +1447,10 @@ def my_corrections():
 @app.route("/api/manager/approve-correction", methods=["POST"])
 @token_required
 def approve_correction():
+    """
+    Manager approves/rejects an attendance fix.
+    If approved, it injects a new synthetic attendance record into the database.
+    """
     if request.user.get("role") != "manager": return jsonify({"message": "Unauthorized"}), 403
     data = request.json
     cid = data.get("id")
@@ -1443,6 +1521,7 @@ def get_notification_counts():
 @app.route("/api/admin/today-stats", methods=["GET"])
 @token_required
 def today_stats():
+    """ Aggregates raw counts for the top dashboard widgets. """
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
     
@@ -1461,6 +1540,7 @@ def today_stats():
 @app.route("/api/admin/attendance-summary", methods=["GET"])
 @token_required
 def attendance_summary():
+    """ Aggregates full monthly attendance records for the reporting tool. """
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
     
@@ -1512,7 +1592,7 @@ def attendance_summary():
 def auto_mark_absent():
     """ 
     Script endpoint to auto-flag users who didn't punch in.
-    Usually called internally via cron or external trigger.
+    Usually called internally via cron or external trigger at night.
     """
     today = datetime.now(IST).date()
     today_str = str(today)
@@ -1619,8 +1699,6 @@ except Exception as e:
     print(f"Warning: Failed to start background scheduler. Error: {e}")
 
 
-
-    
 
 # =============================================================================
 # RUN SERVER
