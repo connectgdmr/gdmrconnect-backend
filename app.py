@@ -503,7 +503,7 @@ def manager_my_employees():
 
 
 # =============================================================================
-# 11. USER UPDATES & DELETIONS
+# 11. USER UPDATES, PROMOTIONS & DELETIONS
 # =============================================================================
 
 @app.route("/api/admin/employees/<emp_id>", methods=["PUT"])
@@ -527,6 +527,41 @@ def edit_employee(emp_id):
         users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": update})
     
     return jsonify({"message": "Employee profile updated successfully."}), 200
+
+
+@app.route("/api/admin/employees/<emp_id>/promote", methods=["PUT"])
+@token_required
+def promote_to_manager(emp_id):
+    """ 
+    Promotes an employee to a manager role and automatically assigns them 
+    as the manager for all other employees in their respective department.
+    """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized. Only admins can promote employees."}), 403
+
+    emp = users_col.find_one({"_id": ObjectId(emp_id)})
+    if not emp:
+        return jsonify({"message": "Employee not found."}), 404
+        
+    if emp.get("role") == "manager":
+        return jsonify({"message": "User is already a manager."}), 400
+
+    dept = emp.get("department")
+    
+    # 1. Upgrade the user's role to 'manager'
+    users_col.update_one(
+        {"_id": ObjectId(emp_id)},
+        {"$set": {"role": "manager", "position": "Manager", "manager_id": None}}
+    )
+    
+    # 2. Re-assign all employees in the same department to this new manager
+    if dept:
+        users_col.update_many(
+            {"department": dept, "role": "employee"},
+            {"$set": {"manager_id": str(emp_id)}}
+        )
+
+    return jsonify({"message": f"Successfully promoted {emp.get('name')} to Manager of the {dept} department."}), 200
 
 
 @app.route("/api/admin/managers/<man_id>", methods=["PUT"])
