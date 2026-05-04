@@ -1,17 +1,18 @@
 """
 ===============================================================================
-GDMR CONNECT - CORE BACKEND APPLICATION API
+GDMR CONNECT - CORE BACKEND APPLICATION API (ENTERPRISE EDITION)
 ===============================================================================
 This file contains all the core backend routes, database connections, and 
-business logic for the GDMR Connect HRMS and Attendance system.
+business logic for the GDMR Connect HRMS and Enterprise Management system.
 
-Key Modules:
-- JWT Authentication & Role-based Access Control
-- Employee & Manager Management
-- Daily Attendance & Camera/Photo Logging
-- Leave Management & Approvals
-- Temporary Delegated Admin Access
-- Performance Management System (PMS 2.0)
+Key Modules Included:
+- JWT Authentication & Strict Role-based Access Control (RBAC)
+- Employee & Manager Directory Management
+- Daily Attendance & Camera/Photo Logging (with Cloudinary)
+- Leave Management & Dual-Tier Approvals
+- Temporary Delegated Admin Access (Auto-Expiring Grants)
+- Performance Management System (PMS 2.0) Form Builder & Grading
+- Asset & Hardware Management (Dual-Approval Workflow)
 - Automated Background Tasks (APScheduler)
 - Announcements & System Broadcasts (Create, Read, Update, Delete)
 ===============================================================================
@@ -44,7 +45,7 @@ app = Flask(__name__)
 bcrypt = Bcrypt(app)
 
 # =============================================================================
-# 2. CLOUDINARY CONFIGURATION (For Image Uploads)
+# 2. CLOUDINARY CONFIGURATION (For Image Uploads & Assets)
 # =============================================================================
 try:
     cloudinary.config(
@@ -57,7 +58,7 @@ except Exception as e:
     print(f"Warning: Cloudinary configuration failed. Images may not upload. Error: {e}")
 
 # =============================================================================
-# 3. CORS CONFIGURATION
+# 3. CORS CONFIGURATION (Cross-Origin Resource Sharing)
 # =============================================================================
 CORS(app, resources={
     r"/*": {
@@ -97,6 +98,7 @@ corrections_col = db["attendance_corrections"]
 pip_records_col = db["pip_records"]
 announcements_col = db["announcements"]
 access_grants_col = db["access_grants"] # Stores temporary admin access for employees
+assets_col = db["assets"] # NEW: Stores hardware/equipment requests and approval statuses
 
 # --- Performance Management System (PMS) Collections ---
 pms_templates_col = db["pms_templates"] # Stores Admin/Manager Sessions & Questions
@@ -139,7 +141,7 @@ def format_datetime_ist(dt):
 
 def is_strong_password(password):
     """
-    Validates password strength to enforce security standards.
+    Validates password strength to enforce enterprise security standards.
     Requires: Minimum 8 characters, 1 uppercase, 1 lowercase, 1 number, 1 special character.
     """
     if len(password) < 8: return False
@@ -211,6 +213,7 @@ def token_required(f):
 def login():
     """
     Authenticates a user against the database and returns a short-lived JWT token.
+    Provides basic user payload so the frontend knows how to route the dashboard.
     """
     data = request.json
     email = data.get("email")
@@ -1339,7 +1342,167 @@ def my_leaves():
 
 
 # =============================================================================
-# 16. ANNOUNCEMENTS, CORRECTIONS & NOTIFICATIONS
+# 16. NEW: ASSET MANAGEMENT (DUAL-APPROVAL WORKFLOW)
+# =============================================================================
+
+@app.route("/api/assets/request", methods=["POST"])
+@token_required
+def request_asset():
+    """
+    EMPLOYEE ROUTE: Submits a request for new hardware, laptops, or equipment.
+    The request is saved in the database with a dual-pending state.
+    """
+    uid = str(request.user["_id"])
+    data = request.json
+    
+    asset_name = data.get("asset_name")
+    reason = data.get("reason")
+    
+    if not asset_name or not reason:
+        return jsonify({"message": "Asset name and reason are strictly required."}), 400
+        
+    asset_request = {
+        "user_id": uid,
+        "employee_name": request.user.get("name"),
+        "department": request.user.get("department"),
+        "asset_name": asset_name,
+        "reason": reason,
+        "manager_status": "Pending",
+        "admin_status": "Pending",
+        "status": "Pending", # Final overarching status combining the two above
+        "created_at": datetime.now(timezone.utc)
+    }
+    
+    res = assets_col.insert_one(asset_request)
+    return jsonify({"message": "Asset requested successfully.", "id": str(res.inserted_id)}), 201
+
+
+@app.route("/api/assets/my-requests", methods=["GET"])
+@token_required
+def get_my_assets():
+    """
+    EMPLOYEE ROUTE: Retrieves the logged-in employee's personal asset request history.
+    Used to display tracking status on the Employee Dashboard.
+    """
+    uid = str(request.user["_id"])
+    rows = []
+    
+    # Sort newest requests first
+    for asset in assets_col.find({"user_id": uid}).sort("created_at", -1):
+        asset["_id"] = str(asset["_id"])
+        rows.append(asset)
+        
+    return jsonify(rows), 200
+
+
+@app.route("/api/manager/assets", methods=["GET"])
+@token_required
+def manager_get_assets():
+    """
+    MANAGER ROUTE: Retrieves all asset requests strictly for employees within their specific department.
+    """
+    if request.user.get("role") not in ["manager", "admin"]:
+        return jsonify({"message": "Unauthorized access to team assets."}), 403
+        
+    my_dept = request.user.get("department")
+    # If the user is an admin acting as a manager, they can see all, otherwise restrict to dept
+    query = {"department": my_dept} if request.user.get("role") == "manager" else {}
+    
+    rows = []
+    for asset in assets_col.find(query).sort("created_at", -1):
+        asset["_id"] = str(asset["_id"])
+        rows.append(asset)
+        
+    return jsonify(rows), 200
+
+
+@app.route("/api/manager/assets/<asset_id>", methods=["PUT"])
+@token_required
+def manager_update_asset(asset_id):
+    """
+    MANAGER ROUTE: Approves or rejects an asset request.
+    This acts as the first gatekeeper. If rejected here, the final status is immediately marked Rejected.
+    """
+    if request.user.get("role") not in ["manager", "admin"]:
+        return jsonify({"message": "Unauthorized action."}), 403
+        
+    data = request.json
+    manager_status = data.get("manager_status")
+    
+    if manager_status not in ["Approved", "Rejected"]:
+        return jsonify({"message": "Invalid manager status provided."}), 400
+        
+    asset = assets_col.find_one({"_id": ObjectId(asset_id)})
+    if not asset:
+        return jsonify({"message": "Asset request not found in database."}), 404
+        
+    update_data = {"manager_status": manager_status}
+    
+    # Immediate kill switch if the manager rejects the request
+    if manager_status == "Rejected":
+        update_data["status"] = "Rejected"
+        
+    assets_col.update_one({"_id": ObjectId(asset_id)}, {"$set": update_data})
+    
+    return jsonify({"message": f"Asset successfully marked as {manager_status} by Manager."}), 200
+
+
+@app.route("/api/admin/assets", methods=["GET"])
+@token_required
+def admin_get_assets():
+    """
+    ADMIN ROUTE: Retrieves all organizational asset requests for final review and provisioning.
+    """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized access. Admins only."}), 403
+        
+    rows = []
+    for asset in assets_col.find().sort("created_at", -1):
+        asset["_id"] = str(asset["_id"])
+        rows.append(asset)
+        
+    return jsonify(rows), 200
+
+
+@app.route("/api/admin/assets/<asset_id>", methods=["PUT"])
+@token_required
+def admin_update_asset(asset_id):
+    """
+    ADMIN ROUTE: Provides final approval or rejection for an asset request.
+    This triggers the final 'status' change in the database.
+    """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized action. Admins only."}), 403
+        
+    data = request.json
+    admin_status = data.get("admin_status")
+    
+    if admin_status not in ["Approved", "Rejected"]:
+        return jsonify({"message": "Invalid admin status provided."}), 400
+        
+    asset = assets_col.find_one({"_id": ObjectId(asset_id)})
+    if not asset:
+        return jsonify({"message": "Asset request not found in database."}), 404
+        
+    update_data = {"admin_status": admin_status}
+    
+    # Calculate the final overarching status combining both tiers
+    mgr_status = asset.get("manager_status", "Pending")
+    
+    if admin_status == "Rejected" or mgr_status == "Rejected":
+        update_data["status"] = "Rejected"
+    elif admin_status == "Approved" and mgr_status == "Approved":
+        update_data["status"] = "Approved"
+    else:
+        update_data["status"] = "Pending"
+        
+    assets_col.update_one({"_id": ObjectId(asset_id)}, {"$set": update_data})
+    
+    return jsonify({"message": f"Asset successfully marked as {admin_status} by Master Admin."}), 200
+
+
+# =============================================================================
+# 17. ANNOUNCEMENTS, CORRECTIONS & NOTIFICATIONS
 # =============================================================================
 
 @app.route("/api/announcements", methods=["POST"])
@@ -1524,7 +1687,13 @@ def approve_correction():
 def get_notification_counts():
     """ Fetch dynamic badge counts for the dashboard sidebar/quick-launch items. """
     role = request.user.get("role")
-    counts = {"leaves": 0, "pms": 0, "corrections": 0, "announcements": announcements_col.count_documents({})}
+    counts = {
+        "leaves": 0, 
+        "pms": 0, 
+        "corrections": 0, 
+        "assets": 0, 
+        "announcements": announcements_col.count_documents({})
+    }
     
     if role == "manager":
         my_dept = request.user.get("department")
@@ -1546,11 +1715,16 @@ def get_notification_counts():
             "status": "Pending"
         })
         
+        counts["assets"] = assets_col.count_documents({
+            "department": my_dept,
+            "manager_status": "Pending"
+        })
+        
     return jsonify(counts), 200
 
 
 # =============================================================================
-# 17. STATS & ANALYTICS DASHBOARDS
+# 18. STATS & ANALYTICS DASHBOARDS
 # =============================================================================
 
 @app.route("/api/admin/today-stats", methods=["GET"])
@@ -1658,7 +1832,7 @@ def auto_mark_absent():
 
 
 # =============================================================================
-# 18. AUTOMATED SCHEDULED JOBS (APScheduler)
+# 19. AUTOMATED SCHEDULED JOBS (APScheduler)
 # =============================================================================
 
 def send_pms_reminders():
