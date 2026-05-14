@@ -1816,6 +1816,53 @@ def my_corrections():
     return jsonify(rows), 200
 
 
+# =============================================================================
+# USER PROFILE (birthday, phone, bio)
+# =============================================================================
+
+@app.route("/api/my/profile", methods=["GET"])
+@token_required
+def get_my_profile():
+    """ Returns the current user's editable profile fields. """
+    user = request.user
+    birthday = user.get("birthday")
+    return jsonify({
+        "birthday": birthday.strftime("%Y-%m-%d") if isinstance(birthday, datetime) else birthday,
+        "phone": user.get("phone"),
+        "bio": user.get("bio")
+    }), 200
+
+
+@app.route("/api/my/profile", methods=["PUT"])
+@token_required
+def update_my_profile():
+    """ Updates birthday, phone, and/or bio on the current user document. """
+    data = request.json or {}
+    update = {}
+
+    if "birthday" in data:
+        raw = data["birthday"]
+        if raw:
+            try:
+                # Store as midnight datetime so MongoDB $month/$dayOfMonth work
+                update["birthday"] = datetime.strptime(str(raw)[:10], "%Y-%m-%d")
+            except ValueError:
+                return jsonify({"message": "Invalid birthday format. Use YYYY-MM-DD."}), 400
+        else:
+            update["birthday"] = None
+
+    if "phone" in data:
+        update["phone"] = str(data["phone"]).strip() if data["phone"] else None
+
+    if "bio" in data:
+        update["bio"] = str(data["bio"]).strip() if data["bio"] else None
+
+    if update:
+        users_col.update_one({"_id": request.user["_id"]}, {"$set": update})
+
+    return jsonify({"success": True}), 200
+
+
 @app.route("/api/manager/approve-correction", methods=["POST"])
 @token_required
 def approve_correction():
@@ -1899,6 +1946,46 @@ def get_notification_counts():
         })
         
     return jsonify(counts), 200
+
+
+@app.route("/api/notifications/birthdays", methods=["GET"])
+@token_required
+def birthday_notifications():
+    """
+    Returns users whose birthday (month + day) matches today.
+    Scoped by role: employees see their department, managers see their
+    department, admins see everyone. Always returns [] on any error.
+    """
+    try:
+        today = datetime.now(IST)
+        uid = str(request.user["_id"])
+        role = request.user.get("role")
+        dept = request.user.get("department")
+
+        # Match BSON Date fields only, then filter by month+day via aggregation
+        base_filter = {
+            "birthday": {"$type": "date"},
+            "$expr": {
+                "$and": [
+                    {"$eq": [{"$month": "$birthday"}, today.month]},
+                    {"$eq": [{"$dayOfMonth": "$birthday"}, today.day]}
+                ]
+            }
+        }
+
+        if role in ("employee", "manager"):
+            base_filter["department"] = dept
+
+        celebrants = list(users_col.find(base_filter, {"name": 1}))
+
+        return jsonify([
+            {"name": u["name"], "is_self": str(u["_id"]) == uid}
+            for u in celebrants
+        ]), 200
+
+    except Exception as e:
+        print(f"Birthday notification error: {e}")
+        return jsonify([]), 200
 
 
 # =============================================================================
