@@ -123,6 +123,28 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # Application Timezone Context (Strict enforcement to avoid UTC drift)
 IST = pytz.timezone('Asia/Kolkata')
 
+# =============================================================================
+# CREATE INDEXES (run once at startup; background=True means no lock)
+# =============================================================================
+try:
+    users_col.create_index("email", background=True)
+    users_col.create_index("role", background=True)
+    users_col.create_index("department", background=True)
+    attendance_col.create_index([("user_id", 1), ("date", 1), ("type", 1)], background=True)
+    attendance_col.create_index([("date", 1), ("type", 1)], background=True)
+    leaves_col.create_index([("user_id", 1), ("status", 1)], background=True)
+    leaves_col.create_index([("from_date", 1), ("to_date", 1), ("status", 1)], background=True)
+    corrections_col.create_index([("user_id", 1), ("month", 1)], background=True)
+    pms_reviews_col.create_index([("user_id", 1), ("month", 1)], background=True)
+    pms_reviews_col.create_index([("department", 1), ("month", 1)], background=True)
+    access_grants_col.create_index([("employee_id", 1), ("is_active", 1)], background=True)
+    assets_col.create_index("user_id", background=True)
+    assets_col.create_index("department", background=True)
+    announcements_col.create_index("created_at", background=True)
+    print("MongoDB indexes ensured.")
+except Exception as _idx_err:
+    print(f"Warning: Could not create indexes: {_idx_err}")
+
 
 # =============================================================================
 # 5. UTILITY & HELPER FUNCTIONS
@@ -488,18 +510,15 @@ def list_employees():
     if role != "admin" and not has_delegated:
         return jsonify({"message": "Unauthorized access."}), 403
 
-    # Map manager IDs to their names for easy reference on the frontend list
-    managers = {str(m["_id"]): m["name"] for m in users_col.find({"role": "manager"})}
+    # Single query — projection drops password on the DB side
+    all_users = list(users_col.find({"role": {"$in": ["employee", "manager"]}}, {"password": 0}))
+    managers = {str(u["_id"]): u["name"] for u in all_users if u.get("role") == "manager"}
 
     rows = []
-    for u in users_col.find({"role": {"$in": ["employee", "manager"]}}):
+    for u in all_users:
         u["_id"] = str(u["_id"])
-        if "password" in u:
-            del u["password"]
-        
         manager_id = u.get("manager_id")
         u["manager_name"] = managers.get(manager_id) if manager_id else None
-
         rows.append(u)
 
     return jsonify(rows), 200
@@ -513,10 +532,8 @@ def list_managers():
         return jsonify({"message": "Unauthorized"}), 403
 
     managers = []
-    for m in users_col.find({"role": "manager"}):
+    for m in users_col.find({"role": "manager"}, {"password": 0}):
         m["_id"] = str(m["_id"])
-        if "password" in m:
-            del m["password"]
         managers.append(m)
 
     return jsonify(managers), 200
@@ -530,9 +547,8 @@ def manager_my_employees():
         return jsonify({"message": "Unauthorized"}), 403
 
     rows = []
-    for u in users_col.find({"department": request.user.get("department"), "role": "employee"}):
+    for u in users_col.find({"department": request.user.get("department"), "role": "employee"}, {"password": 0}):
         u["_id"] = str(u["_id"])
-        if "password" in u: del u["password"]
         rows.append(u)
 
     return jsonify(rows), 200
@@ -703,13 +719,19 @@ def get_active_grants():
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
     
+    raw_grants = list(access_grants_col.find({"is_active": True}).sort("granted_at", -1))
+    emp_ids = []
+    for g in raw_grants:
+        try: emp_ids.append(ObjectId(g["employee_id"]))
+        except Exception: pass
+    emp_map = {str(e["_id"]): e["name"] for e in users_col.find({"_id": {"$in": emp_ids}}, {"name": 1})}
+
     grants = []
-    for g in access_grants_col.find({"is_active": True}).sort("granted_at", -1):
+    for g in raw_grants:
         g["_id"] = str(g["_id"])
-        emp = users_col.find_one({"_id": ObjectId(g["employee_id"])})
-        g["employee_name"] = emp["name"] if emp else "Unknown Employee"
+        g["employee_name"] = emp_map.get(g.get("employee_id"), "Unknown Employee")
         grants.append(g)
-        
+
     return jsonify(grants), 200
 
 
@@ -871,11 +893,17 @@ def get_manager_pms():
     my_dept = request.user.get("department")
     query = {"department": my_dept} if request.user.get("role") == "manager" else {}
     
+    reviews = list(pms_reviews_col.find(query).sort("self_assessment_date", -1))
+    uids = []
+    for r in reviews:
+        try: uids.append(ObjectId(r["user_id"]))
+        except Exception: pass
+    emp_map = {str(e["_id"]): e["name"] for e in users_col.find({"_id": {"$in": uids}}, {"name": 1})}
+
     rows = []
-    for r in pms_reviews_col.find(query).sort("self_assessment_date", -1):
+    for r in reviews:
         r["_id"] = str(r["_id"])
-        emp = users_col.find_one({"_id": ObjectId(r["user_id"])})
-        r["employee_name"] = emp["name"] if emp else "Unknown"
+        r["employee_name"] = emp_map.get(r.get("user_id"), "Unknown")
         rows.append(r)
     return jsonify(rows), 200
 
@@ -986,13 +1014,19 @@ def export_pms():
     cw = csv.writer(si)
     cw.writerow(["Employee Name", "Department", "Month", "Status", "Self Score Total", "Manager Score Total", "Manager Feedback"])
     
-    for r in pms_reviews_col.find(query).sort("department", 1):
-        emp = users_col.find_one({"_id": ObjectId(r["user_id"])})
-        emp_name = emp["name"] if emp else "Unknown"
-        
-        def _to_num(v):
-            try: return float(v)
-            except (TypeError, ValueError): return 0
+    reviews = list(pms_reviews_col.find(query).sort("department", 1))
+    uids = []
+    for r in reviews:
+        try: uids.append(ObjectId(r["user_id"]))
+        except Exception: pass
+    emp_map = {str(e["_id"]): e["name"] for e in users_col.find({"_id": {"$in": uids}}, {"name": 1})}
+
+    def _to_num(v):
+        try: return float(v)
+        except (TypeError, ValueError): return 0
+
+    for r in reviews:
+        emp_name = emp_map.get(r.get("user_id"), "Unknown")
         self_total = sum(_to_num(res.get('self_score', 0)) for res in r.get('responses', []))
         mgr_total = sum(_to_num(ms.get('score', 0)) for ms in r.get('manager_scores', []))
         
@@ -1252,7 +1286,7 @@ def apply_leave():
         try:
             upload_result = cloudinary.uploader.upload(file, folder="leave_attachments")
             attachment_url = upload_result.get("secure_url")
-        except Exception as e:
+        except Exception:
             return jsonify({"message": "File upload failed"}), 500
 
     leave = {
@@ -1658,15 +1692,16 @@ def manager_corrections():
     if request.user.get("role") != "manager": return jsonify({"message": "Unauthorized"}), 403
     
     my_dept = request.user.get("department")
-    dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept})]
-    
+    dept_emp_list = list(users_col.find({"department": my_dept}, {"name": 1}))
+    dept_users = [str(u["_id"]) for u in dept_emp_list]
+    emp_map = {str(u["_id"]): u["name"] for u in dept_emp_list}
+
     query = {"$or": [{"manager_id": str(request.user["_id"])}, {"user_id": {"$in": dept_users}}]}
-    
+
     rows = []
     for c in corrections_col.find(query).sort("created_at", -1):
         c["_id"] = str(c["_id"])
-        u = users_col.find_one({"_id": ObjectId(c["user_id"])})
-        c["employee_name"] = u["name"] if u else "Unknown"
+        c["employee_name"] = emp_map.get(c.get("user_id"), "Unknown")
         rows.append(c)
     return jsonify(rows), 200
 
@@ -1808,33 +1843,50 @@ def attendance_summary():
     start = datetime(year, month, 1, tzinfo=IST)
     end = (start + timedelta(days=32)).replace(day=1)
 
-    employees = list(users_col.find({"role": {"$in": ["employee", "manager"]}}))
+    employees = list(users_col.find({"role": {"$in": ["employee", "manager"]}}, {"name": 1}))
     emp_ids = [str(e["_id"]) for e in employees]
+    emp_names = {str(e["_id"]): e.get("name", "") for e in employees}
+
+    start_str = start.date().isoformat()
+    end_str = (end - timedelta(days=1)).date().isoformat()
+
+    # Batch fetch — 1 query each instead of 2 per day
+    all_recs = list(attendance_col.find({"date": {"$gte": start_str, "$lte": end_str}}))
+    recs_by_date = {}
+    for rec in all_recs:
+        recs_by_date.setdefault(rec["date"], []).append(rec)
+
+    all_leaves = list(leaves_col.find({
+        "from_date": {"$lte": end_str},
+        "to_date": {"$gte": start_str},
+        "status": {"$in": ["Approved", "Absent"]}
+    }))
 
     summary = {"total_employees": len(employees), "days": {}}
 
     curr = start
     while curr < end:
         day_str = curr.date().isoformat()
-        recs = list(attendance_col.find({"date": day_str}))
+        recs = recs_by_date.get(day_str, [])
         present = {r["user_id"] for r in recs if r["type"] == "checkin"}
-        
-        leaves_today_docs = list(leaves_col.find({"from_date": {"$lte": day_str}, "to_date": {"$gte": day_str}, "status": {"$in": ["Approved", "Absent"]}}))
-        
-        leave_names = []
+
         leave_ids = set()
-        for l in leaves_today_docs:
-            leave_ids.add(l["user_id"])
-            u = users_col.find_one({"_id": ObjectId(l["user_id"])})
-            if u: leave_names.append(u["name"])
+        leave_names = []
+        for l in all_leaves:
+            if l.get("from_date", "") <= day_str <= l.get("to_date", ""):
+                uid = l["user_id"]
+                leave_ids.add(uid)
+                name = emp_names.get(uid)
+                if name:
+                    leave_names.append(name)
 
         not_checked_in = set(emp_ids) - present - leave_ids
 
         summary["days"][day_str] = {
-            "present": list(present), 
-            "absent": [], 
-            "leave": list(leave_ids), 
-            "leave_names": leave_names, 
+            "present": list(present),
+            "absent": [],
+            "leave": list(leave_ids),
+            "leave_names": leave_names,
             "not_checked_in": list(not_checked_in),
         }
         curr += timedelta(days=1)
