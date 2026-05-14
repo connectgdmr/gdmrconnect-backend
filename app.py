@@ -813,11 +813,12 @@ def save_pms_template():
     if not assigned_to_list:
         return jsonify({"message": "You must assign the template to at least one employee."}), 400
 
-    # Save the template strictly containing the specific assigned employee IDs
     template_record = {
         "department": dept_to_update,
         "sessions": data.get("sessions", []),
         "assigned_to": assigned_to_list,
+        "cycle_name": data.get("cycle_name", ""),
+        "due_date": data.get("due_date", ""),
         "created_by": str(request.user["_id"]),
         "updated_at": datetime.now(timezone.utc)
     }
@@ -863,23 +864,30 @@ def submit_pms_review():
     data = request.json
     month = datetime.now(IST).strftime("%Y-%m")
 
-    # Prevent double submissions
     if pms_reviews_col.find_one({"user_id": uid, "month": month}):
         return jsonify({"message": "You have already submitted your Self Assessment for this month."}), 400
+
+    template = pms_templates_col.find_one({"assigned_to": uid}, {"cycle_name": 1})
+    cycle_name = template.get("cycle_name", "") if template else ""
 
     submission = {
         "user_id": uid,
         "department": request.user.get("department"),
         "manager_id": request.user.get("manager_id"),
         "month": month,
-        "responses": data.get("responses", []), 
-        "status": "Pending Review", 
+        "cycle_name": cycle_name,
+        "responses": data.get("responses", []),
+        "status": "Pending Review",
         "self_assessment_date": datetime.now(timezone.utc),
         "manager_review_date": None,
         "manager_scores": [],
-        "manager_feedback": ""
+        "manager_feedback": "",
+        "overall_rating": None,
+        "development_plan": "",
+        "manager_comments": [],
+        "acknowledged_by_employee": False
     }
-    
+
     pms_reviews_col.insert_one(submission)
     return jsonify({"message": "Self Assessment Submitted for Manager Review."}), 201
 
@@ -908,6 +916,50 @@ def get_manager_pms():
     return jsonify(rows), 200
 
 
+@app.route("/api/manager/pms-calibration", methods=["GET"])
+@token_required
+def pms_calibration():
+    """
+    Returns a side-by-side self-avg vs manager-avg comparison for every team member
+    for a given month. Used by the Calibration view in the manager dashboard.
+    """
+    if request.user.get("role") not in ["manager", "admin"]:
+        return jsonify({"message": "Unauthorized"}), 403
+
+    month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
+
+    if request.user.get("role") == "manager":
+        query = {"month": month, "department": request.user.get("department")}
+    else:
+        query = {"month": month}
+
+    reviews = list(pms_reviews_col.find(query))
+
+    uids = []
+    for r in reviews:
+        try: uids.append(ObjectId(r["user_id"]))
+        except Exception: pass
+    emp_map = {str(e["_id"]): e["name"] for e in users_col.find({"_id": {"$in": uids}}, {"name": 1})}
+
+    def _to_num(v):
+        try: return float(v)
+        except (TypeError, ValueError): return None
+
+    result = []
+    for r in reviews:
+        self_scores = [_to_num(res.get("self_score")) for res in r.get("responses", []) if _to_num(res.get("self_score")) is not None]
+        mgr_scores  = [_to_num(ms.get("score"))      for ms  in r.get("manager_scores", []) if _to_num(ms.get("score")) is not None]
+
+        result.append({
+            "employee_name": emp_map.get(r.get("user_id"), "Unknown"),
+            "self_avg":    round(sum(self_scores) / len(self_scores), 2) if self_scores else None,
+            "manager_avg": round(sum(mgr_scores)  / len(mgr_scores),  2) if mgr_scores  else None,
+            "overall_rating": r.get("overall_rating")
+        })
+
+    return jsonify(result), 200
+
+
 @app.route("/api/manager/finalize-pms", methods=["POST"])
 @token_required
 def finalize_pms_review():
@@ -917,21 +969,32 @@ def finalize_pms_review():
     """
     if request.user.get("role") not in ["manager", "admin"]: return jsonify({"message": "Unauthorized"}), 403
     data = request.json
-    
+
     review_id = data.get("review_id")
-    
     if not review_id:
         return jsonify({"message": "Review ID missing"}), 400
-        
-    pms_reviews_col.update_one(
-        {"_id": ObjectId(review_id)},
-        {"$set": {
-            "manager_scores": data.get("manager_scores", []), 
-            "manager_feedback": data.get("manager_feedback", ""),
-            "status": "Manager Review Completed",
-            "manager_review_date": datetime.now(timezone.utc)
-        }}
-    )
+
+    overall_rating = data.get("overall_rating")
+    VALID_RATINGS = {"Exceptional", "Exceeds Expectations", "Meets Expectations", "Needs Improvement", "Unsatisfactory"}
+    if overall_rating and overall_rating not in VALID_RATINGS:
+        return jsonify({"message": f"Invalid overall_rating. Allowed: {', '.join(sorted(VALID_RATINGS))}"}), 400
+
+    try:
+        pms_reviews_col.update_one(
+            {"_id": ObjectId(review_id)},
+            {"$set": {
+                "manager_scores": data.get("manager_scores", []),
+                "manager_feedback": data.get("manager_feedback", ""),
+                "overall_rating": overall_rating,
+                "development_plan": data.get("development_plan", ""),
+                "manager_comments": data.get("manager_comments", []),
+                "status": "Manager Review Completed",
+                "manager_review_date": datetime.now(timezone.utc)
+            }}
+        )
+    except Exception:
+        return jsonify({"message": "Invalid review ID"}), 400
+
     return jsonify({"message": "PMS Evaluation Review Completed successfully!"}), 200
 
 
@@ -948,6 +1011,41 @@ def my_pms():
         p["_id"] = str(p["_id"])
         rows.append(p)
     return jsonify(rows), 200
+
+
+@app.route("/api/pms/acknowledge", methods=["POST"])
+@token_required
+def acknowledge_pms_review():
+    """
+    Employee acknowledges their completed PMS review.
+    Only the owner of the review may acknowledge it, and only once the manager has finalised it.
+    """
+    uid = str(request.user["_id"])
+    data = request.json
+    review_id = data.get("review_id")
+
+    if not review_id:
+        return jsonify({"message": "review_id is required"}), 400
+
+    try:
+        review = pms_reviews_col.find_one({"_id": ObjectId(review_id)})
+    except Exception:
+        return jsonify({"message": "Invalid review ID"}), 400
+
+    if not review:
+        return jsonify({"message": "Review not found"}), 404
+
+    if review.get("user_id") != uid:
+        return jsonify({"message": "Unauthorized. You can only acknowledge your own review."}), 403
+
+    if review.get("status") != "Manager Review Completed":
+        return jsonify({"message": "Review has not been finalised by your manager yet."}), 400
+
+    pms_reviews_col.update_one(
+        {"_id": ObjectId(review_id)},
+        {"$set": {"acknowledged_by_employee": True}}
+    )
+    return jsonify({"message": "Review acknowledged"}), 200
 
 
 @app.route("/api/admin/pms-dashboard", methods=["GET"])
