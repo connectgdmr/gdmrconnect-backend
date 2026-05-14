@@ -82,13 +82,25 @@ app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "replace-this-secret-with-a-s
 MONGO_URI = os.getenv("MONGO_URI")
 
 try:
-    client = MongoClient(MONGO_URI)
+    client = MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=5000,   # fail fast instead of hanging 30s
+        connectTimeoutMS=10000,
+        socketTimeoutMS=45000,
+        retryWrites=True,
+        maxPoolSize=50
+    )
+    client.admin.command("ping")         # verify connection is actually alive
     db = client["attendance_db"]
     print("MongoDB Connected Successfully to Database: attendance_db.")
 except Exception as e:
     print(f"CRITICAL ERROR: Failed to connect to MongoDB. Error: {e}")
+    db = None
 
 # --- Core Collections ---
+if db is None:
+    raise RuntimeError("Cannot start: MongoDB connection failed. Check MONGO_URI and Atlas Network Access.")
+
 users_col = db["users"]
 attendance_col = db["attendance"]
 leaves_col = db["leaves"]
@@ -97,12 +109,12 @@ leaves_col = db["leaves"]
 corrections_col = db["attendance_corrections"]
 pip_records_col = db["pip_records"]
 announcements_col = db["announcements"]
-access_grants_col = db["access_grants"] # Stores temporary admin access for employees
-assets_col = db["assets"] # NEW: Stores hardware/equipment requests and approval statuses
+access_grants_col = db["access_grants"]
+assets_col = db["assets"]
 
 # --- Performance Management System (PMS) Collections ---
-pms_templates_col = db["pms_templates"] # Stores Admin/Manager Sessions & Questions
-pms_reviews_col = db["pms_reviews"] # Stores actual employee responses and manager evaluations
+pms_templates_col = db["pms_templates"]
+pms_reviews_col = db["pms_reviews"]
 
 # Local Upload Fallback Directory (Used if Cloudinary is unavailable)
 UPLOAD_FOLDER = "uploads/attendance_photos"
@@ -156,10 +168,22 @@ def is_strong_password(password):
 # 6. ROUTE: HEALTH CHECKS & STATIC FILES
 # =============================================================================
 
+@app.errorhandler(Exception)
+def handle_exception(e):
+    print(f"Unhandled exception: {e}")
+    return jsonify({"message": "A server error occurred. Please try again."}), 500
+
 @app.route("/")
 def home():
-    """ Health check route to ensure the backend container is active and responding. """
     return "GDMR Connect Backend is running normally ✅", 200
+
+@app.route("/api/health", methods=["GET"])
+def health_check():
+    try:
+        client.admin.command("ping")
+        return jsonify({"status": "ok", "db": "connected"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "db": "disconnected", "detail": str(e)}), 503
 
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
