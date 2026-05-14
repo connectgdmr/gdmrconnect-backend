@@ -321,7 +321,13 @@ def register_admin():
     data = request.json
     email = data.get("email")
     name = data.get("name", "Admin")
-    password = data.get("password", "admin123")
+    password = data.get("password")
+
+    if not email or not password:
+        return jsonify({"message": "Email and password are required."}), 400
+
+    if not is_strong_password(password):
+        return jsonify({"message": "Password must be at least 8 characters with uppercase, lowercase, number, and special character."}), 400
 
     if users_col.find_one({"email": email}):
         return jsonify({"message": "Admin with this email already exists"}), 400
@@ -392,7 +398,10 @@ def add_employee():
     email = data.get("email")
     department = data.get("department", "")
     position = data.get("position", "")
-    manager_id = data.get("manager_id") 
+    manager_id = data.get("manager_id")
+
+    if not name or not email:
+        return jsonify({"message": "Name and Email are required."}), 400
 
     if users_col.find_one({"email": email}):
         return jsonify({"message": "User with this email already exists"}), 400
@@ -598,6 +607,8 @@ def delete_employee(emp_id):
     attendance_col.delete_many({"user_id": emp_id})
     leaves_col.delete_many({"user_id": emp_id})
     pms_reviews_col.delete_many({"user_id": emp_id})
+    corrections_col.delete_many({"user_id": emp_id})
+    access_grants_col.delete_many({"employee_id": emp_id})
 
     return jsonify({"message": "Employee completely removed from system."}), 200
 
@@ -912,7 +923,10 @@ def pms_dashboard():
         dept = r.get("department")
         if dept and dept in dashboard_data:
             dashboard_data[dept]["completed_pms"] += 1
-            mgr_total = sum([int(ms.get('score', 0)) for ms in r.get('manager_scores', []) if str(ms.get('score')).isdigit()])
+            def _to_num(v):
+                try: return float(v)
+                except (TypeError, ValueError): return 0
+            mgr_total = sum(_to_num(ms.get('score', 0)) for ms in r.get('manager_scores', []))
             dashboard_data[dept]["total_score"] += mgr_total
 
     final_output = []
@@ -952,8 +966,11 @@ def export_pms():
         emp = users_col.find_one({"_id": ObjectId(r["user_id"])})
         emp_name = emp["name"] if emp else "Unknown"
         
-        self_total = sum([int(res.get('self_score', 0)) for res in r.get('responses', []) if str(res.get('self_score')).isdigit()])
-        mgr_total = sum([int(ms.get('score', 0)) for ms in r.get('manager_scores', []) if str(ms.get('score')).isdigit()])
+        def _to_num(v):
+            try: return float(v)
+            except (TypeError, ValueError): return 0
+        self_total = sum(_to_num(res.get('self_score', 0)) for res in r.get('responses', []))
+        mgr_total = sum(_to_num(ms.get('score', 0)) for ms in r.get('manager_scores', []))
         
         cw.writerow([
             emp_name, 
@@ -989,7 +1006,7 @@ def checkin_photo():
     today = now_ist.date()
     today_str = str(today)
 
-    if leaves_col.find_one({"user_id": uid, "status": "Approved", "date": today_str}):
+    if leaves_col.find_one({"user_id": uid, "status": "Approved", "from_date": {"$lte": today_str}, "to_date": {"$gte": today_str}}):
         return jsonify({"message": "You have an approved leave for today. Attendance not required."}), 200
 
     if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": today_str}):
@@ -1663,16 +1680,20 @@ def approve_correction():
         try:
             new_time_str = correction["new_time"]
             if "T" in new_time_str and not new_time_str.endswith("Z") and "+" not in new_time_str:
-                 new_dt = datetime.fromisoformat(new_time_str)
+                new_dt = datetime.fromisoformat(new_time_str)
             else:
-                 new_dt = datetime.fromisoformat(new_time_str.replace("Z", "+00:00"))
-            
+                new_dt = datetime.fromisoformat(new_time_str.replace("Z", "+00:00"))
+
+            # Determine the original record type (checkin/checkout) from the attendance reference
+            original_record = attendance_col.find_one({"_id": ObjectId(correction["attendance_id"])}) if correction.get("attendance_id") else None
+            record_type = original_record.get("type", "checkin") if original_record else "checkin"
+
             attendance_col.insert_one({
                 "user_id": correction["user_id"],
-                "type": "checkin", 
+                "type": record_type,
                 "date": str(new_dt.date()),
                 "time": new_dt,
-                "photo_url": None, 
+                "photo_url": None,
                 "status_indicator": "Corrected",
                 "correction_ref": cid
             })
@@ -1739,7 +1760,7 @@ def today_stats():
 
     today = str(datetime.now(IST).date())
     present = attendance_col.count_documents({"date": today, "type": "checkin"})
-    leaves = leaves_col.count_documents({"date": today, "status": {"$in": ["Approved", "Absent"]}})
+    leaves = leaves_col.count_documents({"from_date": {"$lte": today}, "to_date": {"$gte": today}, "status": {"$in": ["Approved", "Absent"]}})
     total = users_col.count_documents({"role": {"$in": ["employee", "manager"]}})
     not_in = total - present - leaves
 
@@ -1774,7 +1795,7 @@ def attendance_summary():
         recs = list(attendance_col.find({"date": day_str}))
         present = {r["user_id"] for r in recs if r["type"] == "checkin"}
         
-        leaves_today_docs = list(leaves_col.find({"date": day_str, "status": {"$in": ["Approved", "Absent"]}}))
+        leaves_today_docs = list(leaves_col.find({"from_date": {"$lte": day_str}, "to_date": {"$gte": day_str}, "status": {"$in": ["Approved", "Absent"]}}))
         
         leave_names = []
         leave_ids = set()
@@ -1799,10 +1820,17 @@ def attendance_summary():
 
 @app.route("/api/attendance/auto-absent", methods=["POST"])
 def auto_mark_absent():
-    """ 
-    Script endpoint to auto-flag users who didn't punch in.
-    Usually called internally via cron or external trigger at night.
     """
+    Script endpoint to auto-flag users who didn't punch in.
+    Called internally via cron or external trigger at night.
+    Requires CRON_SECRET header to prevent unauthorized invocation.
+    """
+    cron_secret = os.getenv("CRON_SECRET")
+    if cron_secret:
+        provided = request.headers.get("X-Cron-Secret", "")
+        if provided != cron_secret:
+            return jsonify({"message": "Unauthorized"}), 401
+
     today = datetime.now(IST).date()
     today_str = str(today)
     all_users = users_col.find({"role": {"$in": ["employee", "manager"]}})
@@ -1811,7 +1839,7 @@ def auto_mark_absent():
         uid = str(emp["_id"])
         
         if not attendance_col.find_one({"user_id": uid, "type": "checkin", "date": today_str}):
-            if not leaves_col.find_one({"user_id": uid, "status": "Approved", "date": today_str}):
+            if not leaves_col.find_one({"user_id": uid, "status": "Approved", "from_date": {"$lte": today_str}, "to_date": {"$gte": today_str}}):
                 
                 if not attendance_col.find_one({"user_id": uid, "type": "absent", "date": today_str}):
                     attendance_col.insert_one({
@@ -1847,8 +1875,13 @@ def send_pms_reminders():
     if now.day >= 28:
         pending_reviews = pms_reviews_col.find({"status": "Pending Review"})
         for rev in pending_reviews:
-            manager = users_col.find_one({"_id": ObjectId(rev["manager_id"])})
-            emp = users_col.find_one({"_id": ObjectId(rev["user_id"])})
+            if not rev.get("manager_id"):
+                continue
+            try:
+                manager = users_col.find_one({"_id": ObjectId(rev["manager_id"])})
+                emp = users_col.find_one({"_id": ObjectId(rev["user_id"])})
+            except Exception:
+                continue
             if manager and emp:
                 subject = f"Action Required: Pending PMS Review for {emp['name']}"
                 body = (

@@ -34,7 +34,7 @@ def send_email(to_email: str, subject: str, body: str, from_name="GDMR Attendanc
 
 
 # Password Generator
-import random, string
+import secrets, string
 def generate_random_password(length: int = 10) -> str:
     chars = string.ascii_letters + string.digits + "!@#$%&*"
-    return "".join(random.choice(chars) for _ in range(length))
+    return "".join(secrets.choice(chars) for _ in range(length))
