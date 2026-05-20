@@ -116,6 +116,9 @@ assets_col = db["assets"]
 pms_templates_col = db["pms_templates"]
 pms_reviews_col = db["pms_reviews"]
 
+# --- Department Management ---
+departments_col = db["departments"]
+
 # Local Upload Fallback Directory (Used if Cloudinary is unavailable)
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -141,6 +144,7 @@ try:
     assets_col.create_index("user_id", background=True)
     assets_col.create_index("department", background=True)
     announcements_col.create_index("created_at", background=True)
+    departments_col.create_index("name", unique=True, background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
@@ -537,6 +541,137 @@ def list_managers():
         managers.append(m)
 
     return jsonify(managers), 200
+
+
+# =============================================================================
+# DEPARTMENT MANAGEMENT (CRUD)
+# =============================================================================
+
+@app.route("/api/admin/departments", methods=["GET"])
+@token_required
+def list_departments():
+    """ Returns all departments. """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    depts = []
+    for d in departments_col.find().sort("name", 1):
+        d["_id"] = str(d["_id"])
+        if d.get("head_id"):
+            d["head_id"] = str(d["head_id"])
+        depts.append(d)
+
+    return jsonify(depts), 200
+
+
+@app.route("/api/admin/departments", methods=["POST"])
+@token_required
+def create_department():
+    """ Creates a new department. Name must be non-empty and unique. """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data = request.json or {}
+    name = str(data.get("name", "")).strip()
+
+    if not name:
+        return jsonify({"message": "Department name is required."}), 400
+
+    if departments_col.find_one({"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}):
+        return jsonify({"message": f"Department '{name}' already exists."}), 400
+
+    head_id = data.get("head_id")
+    doc = {
+        "name": name,
+        "description": str(data.get("description", "")).strip(),
+        "head_id": ObjectId(head_id) if head_id else None,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc)
+    }
+
+    res = departments_col.insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    if doc.get("head_id"):
+        doc["head_id"] = str(doc["head_id"])
+
+    return jsonify(doc), 201
+
+
+@app.route("/api/admin/departments/<dept_id>", methods=["PUT"])
+@token_required
+def update_department(dept_id):
+    """ Updates name, description, and/or head_id of a department. """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    try:
+        dept = departments_col.find_one({"_id": ObjectId(dept_id)})
+    except Exception:
+        return jsonify({"message": "Invalid department ID."}), 400
+
+    if not dept:
+        return jsonify({"message": "Department not found."}), 404
+
+    data = request.json or {}
+    update = {"updated_at": datetime.now(timezone.utc)}
+
+    if "name" in data:
+        new_name = str(data["name"]).strip()
+        if not new_name:
+            return jsonify({"message": "Department name cannot be empty."}), 400
+        # Check uniqueness excluding the current document
+        clash = departments_col.find_one({
+            "name": {"$regex": f"^{re.escape(new_name)}$", "$options": "i"},
+            "_id": {"$ne": ObjectId(dept_id)}
+        })
+        if clash:
+            return jsonify({"message": f"Department '{new_name}' already exists."}), 400
+
+        old_name = dept["name"]
+        update["name"] = new_name
+
+        # Keep employee department field in sync when the name changes
+        if old_name != new_name:
+            users_col.update_many({"department": old_name}, {"$set": {"department": new_name}})
+
+    if "description" in data:
+        update["description"] = str(data["description"]).strip()
+
+    if "head_id" in data:
+        raw = data["head_id"]
+        try:
+            update["head_id"] = ObjectId(raw) if raw else None
+        except Exception:
+            return jsonify({"message": "Invalid head_id."}), 400
+
+    departments_col.update_one({"_id": ObjectId(dept_id)}, {"$set": update})
+    updated = departments_col.find_one({"_id": ObjectId(dept_id)})
+    updated["_id"] = str(updated["_id"])
+    if updated.get("head_id"):
+        updated["head_id"] = str(updated["head_id"])
+
+    return jsonify(updated), 200
+
+
+@app.route("/api/admin/departments/<dept_id>", methods=["DELETE"])
+@token_required
+def delete_department(dept_id):
+    """ Deletes a department and clears it from all assigned employees. """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    try:
+        dept = departments_col.find_one({"_id": ObjectId(dept_id)})
+    except Exception:
+        return jsonify({"message": "Invalid department ID."}), 400
+
+    if not dept:
+        return jsonify({"message": "Department not found."}), 404
+
+    departments_col.delete_one({"_id": ObjectId(dept_id)})
+    users_col.update_many({"department": dept["name"]}, {"$set": {"department": "Unassigned"}})
+
+    return jsonify({"message": f"Department '{dept['name']}' deleted. Employees set to Unassigned."}), 200
 
 
 @app.route("/api/manager/my-employees", methods=["GET"])
