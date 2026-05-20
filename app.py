@@ -190,6 +190,33 @@ def is_strong_password(password):
     return True
 
 
+def _serialize_emp_status(user_doc):
+    """
+    Converts extended_leaves and resignation BSON types (ObjectId, datetime)
+    to JSON-safe strings in-place. Also ensures both keys are always present.
+    """
+    leaves = []
+    for entry in user_doc.get("extended_leaves", []):
+        e = dict(entry)
+        if isinstance(e.get("_id"), ObjectId):
+            e["_id"] = str(e["_id"])
+        for f in ("from_date", "to_date", "recorded_at"):
+            if isinstance(e.get(f), datetime):
+                e[f] = e[f].strftime("%Y-%m-%d")
+        leaves.append(e)
+    user_doc["extended_leaves"] = leaves
+
+    res = user_doc.get("resignation")
+    if isinstance(res, dict):
+        res = dict(res)
+        for f in ("notice_date", "last_working_day", "recorded_at"):
+            if isinstance(res.get(f), datetime):
+                res[f] = res[f].strftime("%Y-%m-%d")
+        user_doc["resignation"] = res
+    else:
+        user_doc["resignation"] = None
+
+
 # =============================================================================
 # 6. ROUTE: HEALTH CHECKS & STATIC FILES
 # =============================================================================
@@ -523,6 +550,7 @@ def list_employees():
         u["_id"] = str(u["_id"])
         manager_id = u.get("manager_id")
         u["manager_name"] = managers.get(manager_id) if manager_id else None
+        _serialize_emp_status(u)
         rows.append(u)
 
     return jsonify(rows), 200
@@ -799,6 +827,159 @@ def delete_manager(man_id):
     users_col.update_many({"manager_id": man_id}, {"$set": {"manager_id": None}})
     
     return jsonify({"message": "Manager removed. Subordinates must be reassigned."}), 200
+
+
+# =============================================================================
+# EMPLOYMENT STATUS (extended leaves + resignation)
+# =============================================================================
+
+def _get_emp_or_404(emp_id):
+    """Fetch employee by id string; returns (doc, error_response) tuple."""
+    try:
+        emp = users_col.find_one({"_id": ObjectId(emp_id)}, {"password": 0})
+    except Exception:
+        return None, (jsonify({"message": "Invalid employee ID."}), 400)
+    if not emp:
+        return None, (jsonify({"message": "Employee not found."}), 404)
+    return emp, None
+
+
+def _status_payload(emp_id):
+    """Return the serialised status dict for a given employee ObjectId string."""
+    emp = users_col.find_one({"_id": ObjectId(emp_id)}, {"extended_leaves": 1, "resignation": 1})
+    _serialize_emp_status(emp)
+    return {"extended_leaves": emp["extended_leaves"], "resignation": emp["resignation"]}
+
+
+@app.route("/api/admin/employees/<emp_id>/status", methods=["GET"])
+@token_required
+def get_employee_status(emp_id):
+    """ Returns extended_leaves and resignation for a single employee. """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    emp, err = _get_emp_or_404(emp_id)
+    if err:
+        return err
+
+    _serialize_emp_status(emp)
+    return jsonify({"extended_leaves": emp["extended_leaves"], "resignation": emp["resignation"]}), 200
+
+
+@app.route("/api/admin/employees/<emp_id>/extended-leave", methods=["POST"])
+@token_required
+def add_extended_leave(emp_id):
+    """ Appends an extended-leave entry to the employee's extended_leaves array. """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    emp, err = _get_emp_or_404(emp_id)
+    if err:
+        return err
+
+    data = request.json or {}
+    leave_type = str(data.get("type", "")).strip()
+    from_date_raw = data.get("from_date")
+    to_date_raw = data.get("to_date")
+
+    if not leave_type or not from_date_raw or not to_date_raw:
+        return jsonify({"message": "type, from_date, and to_date are required."}), 400
+
+    try:
+        from_date = datetime.strptime(str(from_date_raw)[:10], "%Y-%m-%d")
+        to_date   = datetime.strptime(str(to_date_raw)[:10],   "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"message": "Invalid date format. Use YYYY-MM-DD."}), 400
+
+    if to_date < from_date:
+        return jsonify({"message": "to_date cannot be before from_date."}), 400
+
+    entry = {
+        "_id":         ObjectId(),
+        "type":        leave_type,
+        "from_date":   from_date,
+        "to_date":     to_date,
+        "notes":       str(data.get("notes", "")).strip(),
+        "recorded_at": datetime.now(timezone.utc)
+    }
+
+    users_col.update_one({"_id": ObjectId(emp_id)}, {"$push": {"extended_leaves": entry}})
+    return jsonify(_status_payload(emp_id)), 201
+
+
+@app.route("/api/admin/employees/<emp_id>/extended-leave/<leave_id>", methods=["DELETE"])
+@token_required
+def delete_extended_leave(emp_id, leave_id):
+    """ Removes a specific extended-leave entry by its _id. """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    emp, err = _get_emp_or_404(emp_id)
+    if err:
+        return err
+
+    try:
+        users_col.update_one(
+            {"_id": ObjectId(emp_id)},
+            {"$pull": {"extended_leaves": {"_id": ObjectId(leave_id)}}}
+        )
+    except Exception:
+        return jsonify({"message": "Invalid leave ID."}), 400
+
+    return jsonify(_status_payload(emp_id)), 200
+
+
+@app.route("/api/admin/employees/<emp_id>/resignation", methods=["PUT"])
+@token_required
+def set_resignation(emp_id):
+    """ Sets or replaces the resignation record on an employee. """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    emp, err = _get_emp_or_404(emp_id)
+    if err:
+        return err
+
+    data = request.json or {}
+
+    def _parse_date(raw):
+        if not raw:
+            return None
+        try:
+            return datetime.strptime(str(raw)[:10], "%Y-%m-%d")
+        except ValueError:
+            raise ValueError(f"Invalid date '{raw}'. Use YYYY-MM-DD.")
+
+    try:
+        notice_date      = _parse_date(data.get("notice_date"))
+        last_working_day = _parse_date(data.get("last_working_day"))
+    except ValueError as e:
+        return jsonify({"message": str(e)}), 400
+
+    resignation = {
+        "notice_date":      notice_date,
+        "last_working_day": last_working_day,
+        "reason":           str(data.get("reason", "")).strip(),
+        "recorded_at":      datetime.now(timezone.utc)
+    }
+
+    users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": {"resignation": resignation}})
+    return jsonify(_status_payload(emp_id)), 200
+
+
+@app.route("/api/admin/employees/<emp_id>/resignation", methods=["DELETE"])
+@token_required
+def clear_resignation(emp_id):
+    """ Clears the resignation record from an employee. """
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    emp, err = _get_emp_or_404(emp_id)
+    if err:
+        return err
+
+    users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": {"resignation": None}})
+    return jsonify(_status_payload(emp_id)), 200
 
 
 # =============================================================================
