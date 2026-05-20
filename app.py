@@ -669,9 +669,8 @@ def delete_department(dept_id):
         return jsonify({"message": "Department not found."}), 404
 
     departments_col.delete_one({"_id": ObjectId(dept_id)})
-    users_col.update_many({"department": dept["name"]}, {"$set": {"department": "Unassigned"}})
 
-    return jsonify({"message": f"Department '{dept['name']}' deleted. Employees set to Unassigned."}), 200
+    return jsonify({"message": f"Department '{dept['name']}' metadata deleted."}), 200
 
 
 @app.route("/api/manager/my-employees", methods=["GET"])
