@@ -2,18 +2,21 @@
 import os
 import requests
 
-BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 BREVO_URL = "https://api.brevo.com/v3/smtp/email"
 
-def send_email(to_email: str, subject: str, body: str, from_name="GDMR Attendance App"):
-    """Send email via Brevo API. Returns True/False."""
-    if not BREVO_API_KEY:
-        print("Brevo API key missing")
+def send_email(to_email: str, subject: str, body: str, from_name="GDMR Connect"):
+    """Send email via Brevo API. Returns True on success, False on failure."""
+
+    # Read fresh every call — avoids the import-time race with load_dotenv()
+    api_key = os.getenv("BREVO_API_KEY")
+
+    if not api_key:
+        print("[Brevo] ERROR: BREVO_API_KEY environment variable is not set.")
         return False
 
     headers = {
         "accept": "application/json",
-        "api-key": BREVO_API_KEY,
+        "api-key": api_key,
         "content-type": "application/json",
     }
 
@@ -26,10 +29,14 @@ def send_email(to_email: str, subject: str, body: str, from_name="GDMR Attendanc
 
     try:
         res = requests.post(BREVO_URL, headers=headers, json=payload, timeout=10)
-        print("Brevo response:", res.status_code, res.text)
-        return res.status_code in (200, 201)
+        print(f"[Brevo] status={res.status_code} to={to_email} response={res.text[:200]}")
+        if res.status_code in (200, 201):
+            return True
+        else:
+            print(f"[Brevo] FAILED — status {res.status_code}: {res.text}")
+            return False
     except Exception as e:
-        print("Brevo email error:", e)
+        print(f"[Brevo] Exception sending to {to_email}: {e}")
         return False
 
 

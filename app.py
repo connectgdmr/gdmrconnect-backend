@@ -380,12 +380,14 @@ def forgot_password():
         "Please login and change your password immediately to secure your account."
     )
 
-    try:
-        threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
-    except Exception as e:
-        print(f"Failed to start email thread: {e}")
+    # Send directly (not in a thread) so we can log the result clearly
+    ok = send_email(email, subject, body)
+    if ok:
+        print(f"[forgot-password] Reset email sent successfully to {email}")
+    else:
+        print(f"[forgot-password] WARNING: Reset email FAILED for {email} — check BREVO_API_KEY in Railway env vars")
 
-    return jsonify({"message": "Password reset email processed."}), 200
+    return jsonify({"message": "If this email exists, a password reset has been sent."}), 200
 
 
 # =============================================================================
