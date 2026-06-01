@@ -2765,13 +2765,44 @@ def candidate_result(candidate_id):
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
     try:
-        c = candidates_col.find_one({"_id": ObjectId(candidate_id)})
+        invite = candidates_col.find_one({"_id": ObjectId(candidate_id)})
     except Exception:
         return jsonify({"message": "Invalid ID"}), 400
-    if not c:
+    if not invite:
         return jsonify({"message": "Candidate not found"}), 404
-    c["_id"] = str(c["_id"])
-    return jsonify(c), 200
+
+    invite["_id"] = str(invite["_id"])
+
+    # Enrich answers with question text and correctness when the assessment exists
+    try:
+        assessment = assessments_col.find_one({"_id": ObjectId(invite.get("assessment_id", ""))})
+    except Exception:
+        assessment = None
+
+    if assessment and invite.get("answers"):
+        questions = assessment.get("questions", [])
+        answers_enriched = []
+        for ans in invite["answers"]:
+            qi          = ans.get("question_index", 0)
+            q           = questions[qi] if qi < len(questions) else {}
+            given       = str(ans.get("answer", ""))
+            correct_idx = str(q.get("correctIndex", ""))
+            is_correct  = (given == correct_idx) if q.get("type") == "mcq" else None
+
+            options = q.get("options", [])
+            given_text   = options[int(given)]   if q.get("type") == "mcq" and given.isdigit()       and int(given)       < len(options) else given
+            correct_text = options[int(correct_idx)] if q.get("type") == "mcq" and correct_idx.isdigit() and int(correct_idx) < len(options) else None
+
+            answers_enriched.append({
+                "question_index": qi,
+                "question":       q.get("text", f"Question {qi + 1}"),
+                "given_answer":   given_text,
+                "correct_answer": correct_text,
+                "correct":        is_correct,
+            })
+        invite["answers"] = answers_enriched
+
+    return jsonify(invite), 200
 
 
 # =============================================================================
