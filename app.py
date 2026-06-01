@@ -2777,6 +2777,116 @@ def candidate_result(candidate_id):
 
 
 # =============================================================================
+# ASSESSMENT — PUBLIC (token-based, no auth header required)
+# =============================================================================
+
+@app.route("/api/assessment/<token>", methods=["GET"])
+def get_assessment_by_token(token):
+    """Candidate fetches their assessment using the unique link token."""
+    candidate = candidates_col.find_one({"token": token})
+    if not candidate or candidate.get("token_used"):
+        return jsonify({"message": "Invalid or expired assessment link."}), 404
+
+    try:
+        assessment = assessments_col.find_one({"_id": ObjectId(candidate["assessment_id"])})
+    except Exception:
+        assessment = None
+    if not assessment:
+        return jsonify({"message": "Assessment not found."}), 404
+
+    # Strip correct_answer so answers aren't leaked to the candidate
+    questions = [
+        {k: v for k, v in q.items() if k != "correct_answer"}
+        for q in assessment.get("questions", [])
+    ]
+
+    return jsonify({
+        "_id":              str(assessment["_id"]),
+        "title":            assessment.get("title"),
+        "description":      assessment.get("description"),
+        "duration_minutes": assessment.get("duration_minutes", 0),
+        "passing_score":    assessment.get("passing_score", 60),
+        "questions":        questions,
+        "candidate_name":   candidate.get("name"),
+    }), 200
+
+
+@app.route("/api/assessment/submit", methods=["POST"])
+def submit_assessment():
+    """Grade answers, return score/passed, and permanently burn the token."""
+    data      = request.json or {}
+    token     = str(data.get("token", "")).strip()
+    answers   = data.get("answers", [])   # [{question_index, answer}]
+    forced    = bool(data.get("forced", False))
+    timed_out = bool(data.get("timed_out", False))
+
+    if not token:
+        return jsonify({"message": "token is required"}), 400
+
+    candidate = candidates_col.find_one({"token": token})
+    if not candidate:
+        return jsonify({"message": "Invalid assessment link."}), 404
+    if candidate.get("token_used"):
+        return jsonify({"message": "This assessment has already been submitted."}), 400
+
+    try:
+        assessment = assessments_col.find_one({"_id": ObjectId(candidate["assessment_id"])})
+    except Exception:
+        assessment = None
+    if not assessment:
+        return jsonify({"message": "Assessment not found."}), 404
+
+    questions     = assessment.get("questions", [])
+    passing_score = int(assessment.get("passing_score", 60))
+
+    # Build a lookup from question_index → submitted answer
+    answers_map = {}
+    for a in answers:
+        try:
+            answers_map[int(a["question_index"])] = a.get("answer", "")
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    # Grade only MCQ questions that have a correct_answer defined
+    total_mcq = 0
+    correct   = 0
+    for idx, q in enumerate(questions):
+        expected = q.get("correct_answer")
+        if expected is None:
+            continue
+        total_mcq += 1
+        submitted = str(answers_map.get(idx, "")).strip().lower()
+        if submitted == str(expected).strip().lower():
+            correct += 1
+
+    score  = round((correct / total_mcq) * 100) if total_mcq > 0 else 0
+    passed = score >= passing_score
+
+    result = {
+        "score":        score,
+        "passed":       passed,
+        "correct":      correct,
+        "total_mcq":    total_mcq,
+        "timed_out":    timed_out,
+        "forced":       forced,
+        "answers":      answers,
+        "submitted_at": datetime.now(timezone.utc),
+    }
+
+    candidates_col.update_one(
+        {"token": token},
+        {"$set": {
+            "token_used":   True,
+            "status":       "Completed",
+            "result":       result,
+            "completed_at": datetime.now(timezone.utc),
+        }}
+    )
+
+    return jsonify({"score": score, "passed": passed, "correct": correct, "total_mcq": total_mcq}), 200
+
+
+# =============================================================================
 # LMS MODULE
 # =============================================================================
 
