@@ -119,6 +119,18 @@ pms_reviews_col = db["pms_reviews"]
 # --- Department Management ---
 departments_col = db["departments"]
 
+# --- Assessment Module ---
+assessments_col   = db["assessments"]
+candidates_col    = db["assessment_candidates"]
+
+# --- LMS Module ---
+lms_courses_col   = db["lms_courses"]
+lms_progress_col  = db["lms_progress"]
+
+# --- Career Module ---
+career_jobs_col   = db["career_jobs"]
+referrals_col     = db["career_referrals"]
+
 # Local Upload Fallback Directory (Used if Cloudinary is unavailable)
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -145,6 +157,11 @@ try:
     assets_col.create_index("department", background=True)
     announcements_col.create_index("created_at", background=True)
     departments_col.create_index("name", unique=True, background=True)
+    candidates_col.create_index("assessment_id", background=True)
+    candidates_col.create_index("email", background=True)
+    lms_progress_col.create_index([("user_id", 1), ("course_id", 1)], unique=True, background=True)
+    referrals_col.create_index([("referred_by", 1), ("job_id", 1)], background=True)
+    referrals_col.create_index("status", background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
@@ -2607,6 +2624,440 @@ def auto_expire_grants():
         if expired:
             access_grants_col.update_one({"_id": g["_id"]}, {"$set": {"is_active": False}})
             print(f"Automatically expired access grant for employee {g['employee_id']}.")
+
+
+# =============================================================================
+# ASSESSMENT MODULE
+# =============================================================================
+
+@app.route("/api/admin/assessments", methods=["GET"])
+@token_required
+def list_assessments():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    rows = []
+    for a in assessments_col.find().sort("created_at", -1):
+        a["_id"] = str(a["_id"])
+        rows.append(a)
+    return jsonify(rows), 200
+
+
+@app.route("/api/admin/assessments", methods=["POST"])
+@token_required
+def create_assessment():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    data = request.json or {}
+    title = str(data.get("title", "")).strip()
+    if not title:
+        return jsonify({"message": "title is required"}), 400
+    doc = {
+        "title":            title,
+        "description":      str(data.get("description", "")).strip(),
+        "questions":        data.get("questions", []),
+        "duration_minutes": int(data.get("duration_minutes", 0)),
+        "created_by":       str(request.user["_id"]),
+        "created_at":       datetime.now(timezone.utc),
+    }
+    res = assessments_col.insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    return jsonify(doc), 201
+
+
+@app.route("/api/admin/assessments/<assessment_id>", methods=["PUT"])
+@token_required
+def update_assessment(assessment_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(assessment_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    data = request.json or {}
+    update = {"updated_at": datetime.now(timezone.utc)}
+    for k in ["title", "description", "questions", "duration_minutes"]:
+        if k in data:
+            update[k] = data[k]
+    result = assessments_col.update_one({"_id": obj}, {"$set": update})
+    if result.matched_count == 0:
+        return jsonify({"message": "Assessment not found"}), 404
+    return jsonify({"message": "Assessment updated"}), 200
+
+
+@app.route("/api/admin/assessments/<assessment_id>", methods=["DELETE"])
+@token_required
+def delete_assessment(assessment_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(assessment_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    result = assessments_col.delete_one({"_id": obj})
+    if result.deleted_count == 0:
+        return jsonify({"message": "Assessment not found"}), 404
+    candidates_col.delete_many({"assessment_id": assessment_id})
+    return jsonify({"message": "Assessment deleted"}), 200
+
+
+@app.route("/api/admin/assessments/invite", methods=["POST"])
+@token_required
+def invite_candidate():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    data = request.json or {}
+    name          = str(data.get("name", "")).strip()
+    email         = str(data.get("email", "")).strip()
+    phone         = str(data.get("phone", "")).strip()
+    assessment_id = str(data.get("assessmentId", "")).strip()
+    if not name or not email or not assessment_id:
+        return jsonify({"message": "name, email, and assessmentId are required"}), 400
+    if not assessments_col.find_one({"_id": ObjectId(assessment_id)}):
+        return jsonify({"message": "Assessment not found"}), 404
+    doc = {
+        "assessment_id": assessment_id,
+        "name":          name,
+        "email":         email,
+        "phone":         phone,
+        "status":        "Invited",
+        "result":        None,
+        "invited_at":    datetime.now(timezone.utc),
+    }
+    res = candidates_col.insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    return jsonify(doc), 201
+
+
+@app.route("/api/admin/assessments/candidates", methods=["GET"])
+@token_required
+def list_candidates():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    assessment_id = request.args.get("assessmentId")
+    query = {"assessment_id": assessment_id} if assessment_id else {}
+    rows = []
+    for c in candidates_col.find(query).sort("invited_at", -1):
+        c["_id"] = str(c["_id"])
+        rows.append(c)
+    return jsonify(rows), 200
+
+
+@app.route("/api/admin/assessments/candidates/<candidate_id>/result", methods=["GET"])
+@token_required
+def candidate_result(candidate_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        c = candidates_col.find_one({"_id": ObjectId(candidate_id)})
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    if not c:
+        return jsonify({"message": "Candidate not found"}), 404
+    c["_id"] = str(c["_id"])
+    return jsonify(c), 200
+
+
+# =============================================================================
+# LMS MODULE
+# =============================================================================
+
+@app.route("/api/admin/lms/courses", methods=["GET"])
+@token_required
+def list_courses():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    rows = []
+    for c in lms_courses_col.find().sort("created_at", -1):
+        c["_id"] = str(c["_id"])
+        rows.append(c)
+    return jsonify(rows), 200
+
+
+@app.route("/api/admin/lms/courses", methods=["POST"])
+@token_required
+def create_course():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    data = request.json or {}
+    title = str(data.get("title", "")).strip()
+    if not title:
+        return jsonify({"message": "title is required"}), 400
+    doc = {
+        "title":       title,
+        "description": str(data.get("description", "")).strip(),
+        "content_url": str(data.get("content_url", "")).strip(),
+        "tags":        data.get("tags", []),
+        "created_by":  str(request.user["_id"]),
+        "created_at":  datetime.now(timezone.utc),
+    }
+    res = lms_courses_col.insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    return jsonify(doc), 201
+
+
+@app.route("/api/admin/lms/courses/<course_id>", methods=["PUT"])
+@token_required
+def update_course(course_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(course_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    data = request.json or {}
+    update = {"updated_at": datetime.now(timezone.utc)}
+    for k in ["title", "description", "content_url", "tags"]:
+        if k in data:
+            update[k] = data[k]
+    result = lms_courses_col.update_one({"_id": obj}, {"$set": update})
+    if result.matched_count == 0:
+        return jsonify({"message": "Course not found"}), 404
+    return jsonify({"message": "Course updated"}), 200
+
+
+@app.route("/api/admin/lms/courses/<course_id>", methods=["DELETE"])
+@token_required
+def delete_course(course_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(course_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    result = lms_courses_col.delete_one({"_id": obj})
+    if result.deleted_count == 0:
+        return jsonify({"message": "Course not found"}), 404
+    lms_progress_col.delete_many({"course_id": course_id})
+    return jsonify({"message": "Course deleted"}), 200
+
+
+@app.route("/api/admin/lms/courses/<course_id>/assign", methods=["POST"])
+@token_required
+def assign_course(course_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        ObjectId(course_id)
+    except Exception:
+        return jsonify({"message": "Invalid course ID"}), 400
+    if not lms_courses_col.find_one({"_id": ObjectId(course_id)}):
+        return jsonify({"message": "Course not found"}), 404
+
+    data = request.json or {}
+    department   = data.get("department")
+    employee_ids = data.get("employee_ids", [])
+
+    if department:
+        emps = users_col.find(
+            {"role": {"$in": ["employee", "manager"]}, "department": department},
+            {"_id": 1}
+        )
+        employee_ids = [str(e["_id"]) for e in emps]
+
+    if not employee_ids:
+        return jsonify({"message": "No employees to assign"}), 400
+
+    now = datetime.now(timezone.utc)
+    assigned = 0
+    for uid in employee_ids:
+        try:
+            lms_progress_col.update_one(
+                {"course_id": course_id, "user_id": uid},
+                {"$setOnInsert": {
+                    "course_id":   course_id,
+                    "user_id":     uid,
+                    "status":      "Assigned",
+                    "progress_pct": 0,
+                    "assigned_at": now,
+                    "completed_at": None,
+                }},
+                upsert=True
+            )
+            assigned += 1
+        except Exception:
+            pass
+
+    return jsonify({"message": f"Course assigned to {assigned} employee(s)"}), 200
+
+
+@app.route("/api/admin/lms/progress", methods=["GET"])
+@token_required
+def lms_progress():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    course_id = request.args.get("course_id")
+    query = {"course_id": course_id} if course_id else {}
+    rows = list(lms_progress_col.find(query))
+
+    uids = []
+    for r in rows:
+        try: uids.append(ObjectId(r["user_id"]))
+        except Exception: pass
+    emp_map = {str(e["_id"]): e["name"] for e in users_col.find({"_id": {"$in": uids}}, {"name": 1})}
+
+    cids = list({r["course_id"] for r in rows})
+    try:
+        course_objs = [ObjectId(c) for c in cids]
+    except Exception:
+        course_objs = []
+    course_map = {str(c["_id"]): c["title"] for c in lms_courses_col.find({"_id": {"$in": course_objs}}, {"title": 1})}
+
+    result = []
+    for r in rows:
+        r["_id"] = str(r["_id"])
+        r["employee_name"] = emp_map.get(r.get("user_id"), "Unknown")
+        r["course_title"]  = course_map.get(r.get("course_id"), "Unknown")
+        result.append(r)
+    return jsonify(result), 200
+
+
+# =============================================================================
+# CAREER MODULE
+# =============================================================================
+
+@app.route("/api/admin/career/jobs", methods=["GET"])
+@token_required
+def list_jobs():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    rows = []
+    for j in career_jobs_col.find().sort("created_at", -1):
+        j["_id"] = str(j["_id"])
+        rows.append(j)
+    return jsonify(rows), 200
+
+
+@app.route("/api/admin/career/jobs", methods=["POST"])
+@token_required
+def create_job():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    data = request.json or {}
+    title = str(data.get("title", "")).strip()
+    if not title:
+        return jsonify({"message": "title is required"}), 400
+    doc = {
+        "title":        title,
+        "department":   str(data.get("department", "")).strip(),
+        "description":  str(data.get("description", "")).strip(),
+        "requirements": str(data.get("requirements", "")).strip(),
+        "type":         data.get("type", "Full-time"),
+        "status":       "Open",
+        "created_by":   str(request.user["_id"]),
+        "created_at":   datetime.now(timezone.utc),
+    }
+    res = career_jobs_col.insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    return jsonify(doc), 201
+
+
+@app.route("/api/admin/career/jobs/<job_id>", methods=["PUT"])
+@token_required
+def update_job(job_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(job_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    data = request.json or {}
+    update = {"updated_at": datetime.now(timezone.utc)}
+    for k in ["title", "department", "description", "requirements", "type", "status"]:
+        if k in data:
+            update[k] = data[k]
+    if "status" in update and update["status"] not in ("Open", "Closed"):
+        return jsonify({"message": "status must be 'Open' or 'Closed'"}), 400
+    result = career_jobs_col.update_one({"_id": obj}, {"$set": update})
+    if result.matched_count == 0:
+        return jsonify({"message": "Job not found"}), 404
+    return jsonify({"message": "Job updated"}), 200
+
+
+@app.route("/api/admin/career/jobs/<job_id>", methods=["DELETE"])
+@token_required
+def delete_job(job_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(job_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    result = career_jobs_col.delete_one({"_id": obj})
+    if result.deleted_count == 0:
+        return jsonify({"message": "Job not found"}), 404
+    return jsonify({"message": "Job deleted"}), 200
+
+
+@app.route("/api/admin/career/referrals", methods=["GET"])
+@token_required
+def admin_list_referrals():
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    job_id = request.args.get("job_id")
+    query = {"job_id": job_id} if job_id else {}
+    rows = []
+    for r in referrals_col.find(query).sort("submitted_at", -1):
+        r["_id"] = str(r["_id"])
+        rows.append(r)
+    return jsonify(rows), 200
+
+
+@app.route("/api/admin/career/referrals/<referral_id>", methods=["PUT"])
+@token_required
+def update_referral(referral_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(referral_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    data = request.json or {}
+    status = data.get("status")
+    valid_statuses = {"Pending", "Reviewed", "Shortlisted", "Rejected", "Hired"}
+    if not status or status not in valid_statuses:
+        return jsonify({"message": f"status must be one of: {', '.join(sorted(valid_statuses))}"}), 400
+    result = referrals_col.update_one({"_id": obj}, {"$set": {"status": status, "updated_at": datetime.now(timezone.utc)}})
+    if result.matched_count == 0:
+        return jsonify({"message": "Referral not found"}), 404
+    return jsonify({"message": "Referral status updated"}), 200
+
+
+@app.route("/api/career/referrals", methods=["POST"])
+@token_required
+def submit_referral():
+    """Employee submits a candidate referral for an open job."""
+    if request.user.get("role") not in ["employee", "manager"]:
+        return jsonify({"message": "Unauthorized"}), 403
+    data = request.json or {}
+    job_id         = str(data.get("job_id", "")).strip()
+    candidate_name  = str(data.get("candidate_name", "")).strip()
+    candidate_email = str(data.get("candidate_email", "")).strip()
+    candidate_phone = str(data.get("candidate_phone", "")).strip()
+
+    if not job_id or not candidate_name or not candidate_email:
+        return jsonify({"message": "job_id, candidate_name, and candidate_email are required"}), 400
+
+    try:
+        job = career_jobs_col.find_one({"_id": ObjectId(job_id), "status": "Open"})
+    except Exception:
+        return jsonify({"message": "Invalid job ID"}), 400
+    if not job:
+        return jsonify({"message": "Job not found or no longer open"}), 404
+
+    doc = {
+        "job_id":          job_id,
+        "job_title":       job.get("title", ""),
+        "referred_by":     str(request.user["_id"]),
+        "referrer_name":   request.user.get("name", ""),
+        "candidate_name":  candidate_name,
+        "candidate_email": candidate_email,
+        "candidate_phone": candidate_phone,
+        "status":          "Pending",
+        "submitted_at":    datetime.now(timezone.utc),
+    }
+    res = referrals_col.insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    return jsonify(doc), 201
 
 
 # Initialize the background scheduler
