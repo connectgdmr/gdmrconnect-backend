@@ -3214,8 +3214,31 @@ def my_referrals():
 @token_required
 def my_lms_courses():
     """Returns courses assigned to the logged-in employee with per-lesson completion state."""
-    uid = str(request.user["_id"])
+    uid  = str(request.user["_id"])
+    dept = request.user.get("department")
+
+    # Collect all progress records for this employee (covers both direct and dept assignments)
     progress_records = list(lms_progress_col.find({"user_id": uid}))
+
+    # Also surface any courses assigned to this employee's department that have no
+    # progress record yet (assigned but never opened)
+    assigned_course_ids = {r["course_id"] for r in progress_records}
+    if dept:
+        dept_courses = lms_courses_col.find({"assigned_departments": dept}, {"_id": 1})
+        for c in dept_courses:
+            cid = str(c["_id"])
+            if cid not in assigned_course_ids:
+                progress_records.append({
+                    "course_id":         cid,
+                    "user_id":           uid,
+                    "status":            "Assigned",
+                    "progress_pct":      0,
+                    "completed_lessons": [],
+                    "assigned_at":       None,
+                    "completed_at":      None,
+                    "last_activity":     None,
+                })
+
     if not progress_records:
         return jsonify([]), 200
 
@@ -3232,25 +3255,48 @@ def my_lms_courses():
         if not course:
             continue
 
-        completed_lessons = set(prog.get("completed_lessons", []))
-        modules = []
+        completed_set = set(prog.get("completed_lessons", []))
+        modules       = []
+        total_lessons = 0
+        completed_count = 0
+
         for mod in course.get("modules", []):
             lessons = []
-            for lesson in mod.get("lessons", []):
-                lessons.append({**lesson, "completed": lesson.get("id", "") in completed_lessons})
-            modules.append({**mod, "lessons": lessons})
+            for ls in mod.get("lessons", []):
+                # Normalise lesson id — may be ObjectId, string "_id", or plain "id"
+                ls_id = str(ls.get("_id", ls.get("id", "")))
+                done  = ls_id in completed_set
+                if done:
+                    completed_count += 1
+                total_lessons += 1
+                lessons.append({
+                    "_id":       ls_id,
+                    "title":     ls.get("title", ""),
+                    "type":      ls.get("type", "Video"),
+                    "url":       ls.get("url", ""),
+                    "content":   ls.get("content", ""),
+                    "completed": done,
+                })
+            modules.append({"title": mod.get("title", ""), "lessons": lessons})
+
+        pct = round(completed_count / total_lessons * 100) if total_lessons > 0 else 0
 
         result.append({
-            "_id":             str(course["_id"]),
-            "title":           course.get("title"),
-            "description":     course.get("description"),
-            "content_url":     course.get("content_url"),
-            "tags":            course.get("tags", []),
-            "modules":         modules,
-            "percent_complete": prog.get("progress_pct", 0),
-            "status":          prog.get("status", "Assigned"),
-            "assigned_at":     prog.get("assigned_at"),
-            "completed_at":    prog.get("completed_at"),
+            "_id":               str(course["_id"]),
+            "title":             course.get("title"),
+            "description":       course.get("description", ""),
+            "category":          course.get("category", ""),
+            "thumbnail_url":     course.get("thumbnail_url", ""),
+            "content_url":       course.get("content_url", ""),
+            "tags":              course.get("tags", []),
+            "modules":           modules,
+            "total_lessons":     total_lessons,
+            "completed_lessons": completed_count,
+            "percent_complete":  pct,
+            "status":            prog.get("status", "Assigned"),
+            "last_activity":     prog.get("last_activity"),
+            "assigned_at":       prog.get("assigned_at"),
+            "completed_at":      prog.get("completed_at"),
         })
 
     return jsonify(result), 200
@@ -3262,42 +3308,64 @@ def complete_lesson(lesson_id):
     """Mark a lesson as done and recalculate percent_complete for the course."""
     uid  = str(request.user["_id"])
     data = request.json or {}
+
+    # Prefer course_id from body; fall back to finding the course by lesson _id
     course_id = str(data.get("course_id", "")).strip()
-    if not course_id:
-        return jsonify({"message": "course_id is required"}), 400
+    course = None
 
-    try:
-        course = lms_courses_col.find_one({"_id": ObjectId(course_id)})
-    except Exception:
-        return jsonify({"message": "Invalid course_id"}), 400
+    if course_id:
+        try:
+            course = lms_courses_col.find_one({"_id": ObjectId(course_id)})
+        except Exception:
+            pass
+
     if not course:
-        return jsonify({"message": "Course not found"}), 404
+        # Try ObjectId lookup first, then string _id / id
+        try:
+            course = lms_courses_col.find_one({"modules.lessons._id": ObjectId(lesson_id)})
+        except Exception:
+            pass
+        if not course:
+            course = lms_courses_col.find_one({"modules.lessons._id": lesson_id})
+        if not course:
+            course = lms_courses_col.find_one({"modules.lessons.id": lesson_id})
 
-    prog = lms_progress_col.find_one({"course_id": course_id, "user_id": uid})
-    if not prog:
-        return jsonify({"message": "Course not assigned to you"}), 403
+    if not course:
+        return jsonify({"message": "Lesson not found"}), 404
 
-    # Add lesson to completed set and flip to In Progress
+    course_id = str(course["_id"])
+    now       = datetime.now(timezone.utc)
+
+    # Upsert: works for both pre-assigned and department-assigned courses
     lms_progress_col.update_one(
         {"course_id": course_id, "user_id": uid},
         {"$addToSet": {"completed_lessons": lesson_id},
-         "$set":      {"status": "In Progress"}}
+         "$set":      {"status": "In Progress", "last_activity": now},
+         "$setOnInsert": {
+             "course_id":   course_id,
+             "user_id":     uid,
+             "assigned_at": now,
+             "completed_at": None,
+             "progress_pct": 0,
+         }},
+        upsert=True
     )
 
-    # Recalculate progress against total lesson count in the course
+    # Recalculate progress
     total = sum(len(mod.get("lessons", [])) for mod in course.get("modules", []))
     prog  = lms_progress_col.find_one({"course_id": course_id, "user_id": uid})
     done  = len(prog.get("completed_lessons", []))
-    pct   = int((done / total) * 100) if total > 0 else 0
+    pct   = round((done / total) * 100) if total > 0 else 0
 
-    is_complete = total > 0 and done >= total
-    final_update = {"progress_pct": pct, "status": "Completed" if is_complete else "In Progress"}
+    is_complete  = total > 0 and done >= total
+    final_status = "Completed" if is_complete else "In Progress"
+    final_update = {"progress_pct": pct, "status": final_status}
     if is_complete:
-        final_update["completed_at"] = datetime.now(timezone.utc)
+        final_update["completed_at"] = now
 
     lms_progress_col.update_one({"course_id": course_id, "user_id": uid}, {"$set": final_update})
 
-    return jsonify({"progress_pct": pct, "status": final_update["status"]}), 200
+    return jsonify({"message": "Lesson marked complete", "progress_pct": pct, "status": final_status}), 200
 
 
 # Initialize the background scheduler
