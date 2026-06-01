@@ -121,7 +121,7 @@ departments_col = db["departments"]
 
 # --- Assessment Module ---
 assessments_col   = db["assessments"]
-candidates_col    = db["assessment_candidates"]
+candidates_col    = db["assessment_invites"]
 
 # --- LMS Module ---
 lms_courses_col   = db["lms_courses"]
@@ -2723,16 +2723,14 @@ def invite_candidate():
         "email":         email,
         "phone":         phone,
         "token":         token,
-        "token_used":    False,
-        "status":        "Invited",
-        "result":        None,
+        "status":        "pending",
         "invited_at":    datetime.now(timezone.utc),
     }
     res = candidates_col.insert_one(doc)
     doc["_id"] = str(res.inserted_id)
 
     assessment_link = f"https://www.gdmrconnect.com/assessment/{token}"
-    duration = assessment.get("duration_minutes", 0)
+    duration = assessment.get("duration", assessment.get("duration_minutes", 30))
     subject = f"You've Been Invited to Take an Assessment — GDMR Connect"
     body = (
         f"Hello {name},\n\n"
@@ -2783,54 +2781,57 @@ def candidate_result(candidate_id):
 @app.route("/api/assessment/<token>", methods=["GET"])
 def get_assessment_by_token(token):
     """Candidate fetches their assessment using the unique link token."""
-    candidate = candidates_col.find_one({"token": token})
-    if not candidate or candidate.get("token_used"):
-        return jsonify({"message": "Invalid or expired assessment link."}), 404
+    invite = candidates_col.find_one({"token": token})
+    if not invite or invite.get("status") == "completed":
+        return jsonify({"message": "Link is invalid or has already been used."}), 404
 
     try:
-        assessment = assessments_col.find_one({"_id": ObjectId(candidate["assessment_id"])})
+        assessment = assessments_col.find_one({"_id": ObjectId(invite["assessment_id"])})
     except Exception:
         assessment = None
     if not assessment:
         return jsonify({"message": "Assessment not found."}), 404
 
-    # Strip correct_answer so answers aren't leaked to the candidate
-    questions = [
-        {k: v for k, v in q.items() if k != "correct_answer"}
-        for q in assessment.get("questions", [])
-    ]
+    # Mark as started so we can track who opened the link
+    candidates_col.update_one({"token": token}, {"$set": {"status": "started"}})
+
+    # Strip answer keys — never send correctIndex or correct_answer to the client
+    questions = []
+    for q in assessment.get("questions", []):
+        q_clean = {"type": q.get("type"), "text": q.get("text")}
+        if q.get("type") == "mcq":
+            q_clean["options"] = q.get("options", [])
+        questions.append(q_clean)
 
     return jsonify({
-        "_id":              str(assessment["_id"]),
-        "title":            assessment.get("title"),
-        "description":      assessment.get("description"),
-        "duration_minutes": assessment.get("duration_minutes", 0),
-        "passing_score":    assessment.get("passing_score", 60),
-        "questions":        questions,
-        "candidate_name":   candidate.get("name"),
+        "title":         assessment.get("title"),
+        "description":   assessment.get("description", ""),
+        "duration":      assessment.get("duration", assessment.get("duration_minutes", 30)),
+        "passing_score": assessment.get("passing_score", 60),
+        "questions":     questions,
     }), 200
 
 
 @app.route("/api/assessment/submit", methods=["POST"])
 def submit_assessment():
-    """Grade answers, return score/passed, and permanently burn the token."""
+    """Grade answers, mark invite completed, return exactly {score, passed}."""
     data      = request.json or {}
-    token     = str(data.get("token", "")).strip()
-    answers   = data.get("answers", [])   # [{question_index, answer}]
+    token     = data.get("token", "")
+    answers   = data.get("answers", [])
     forced    = bool(data.get("forced", False))
     timed_out = bool(data.get("timed_out", False))
 
     if not token:
         return jsonify({"message": "token is required"}), 400
 
-    candidate = candidates_col.find_one({"token": token})
-    if not candidate:
-        return jsonify({"message": "Invalid assessment link."}), 404
-    if candidate.get("token_used"):
+    invite = candidates_col.find_one({"token": token})
+    if not invite:
+        return jsonify({"message": "Invalid submission token."}), 400
+    if invite.get("status") == "completed":
         return jsonify({"message": "This assessment has already been submitted."}), 400
 
     try:
-        assessment = assessments_col.find_one({"_id": ObjectId(candidate["assessment_id"])})
+        assessment = assessments_col.find_one({"_id": ObjectId(invite["assessment_id"])})
     except Exception:
         assessment = None
     if not assessment:
@@ -2839,51 +2840,39 @@ def submit_assessment():
     questions     = assessment.get("questions", [])
     passing_score = int(assessment.get("passing_score", 60))
 
-    # Build a lookup from question_index → submitted answer
-    answers_map = {}
-    for a in answers:
-        try:
-            answers_map[int(a["question_index"])] = a.get("answer", "")
-        except (KeyError, TypeError, ValueError):
-            pass
-
-    # Grade only MCQ questions that have a correct_answer defined
-    total_mcq = 0
+    # Grade MCQ questions using correctIndex (integer index into options[])
+    total_mcq = sum(1 for q in questions if q.get("type") == "mcq")
     correct   = 0
-    for idx, q in enumerate(questions):
-        expected = q.get("correct_answer")
-        if expected is None:
+
+    for ans in answers:
+        qi = ans.get("question_index")
+        if qi is None or qi >= len(questions):
             continue
-        total_mcq += 1
-        submitted = str(answers_map.get(idx, "")).strip().lower()
-        if submitted == str(expected).strip().lower():
-            correct += 1
+        q = questions[qi]
+        if q.get("type") == "mcq":
+            try:
+                if str(ans.get("answer")) == str(q.get("correctIndex")):
+                    correct += 1
+            except Exception:
+                pass
 
     score  = round((correct / total_mcq) * 100) if total_mcq > 0 else 0
     passed = score >= passing_score
 
-    result = {
-        "score":        score,
-        "passed":       passed,
-        "correct":      correct,
-        "total_mcq":    total_mcq,
-        "timed_out":    timed_out,
-        "forced":       forced,
-        "answers":      answers,
-        "submitted_at": datetime.now(timezone.utc),
-    }
-
     candidates_col.update_one(
         {"token": token},
         {"$set": {
-            "token_used":   True,
-            "status":       "Completed",
-            "result":       result,
-            "completed_at": datetime.now(timezone.utc),
+            "status":       "completed",
+            "score":        score,
+            "passed":       passed,
+            "answers":      answers,
+            "submitted_at": datetime.now(timezone.utc),
+            "forced":       forced,
+            "timed_out":    timed_out,
         }}
     )
 
-    return jsonify({"score": score, "passed": passed, "correct": correct, "total_mcq": total_mcq}), 200
+    return jsonify({"score": score, "passed": passed}), 200
 
 
 # =============================================================================
