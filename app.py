@@ -2370,12 +2370,58 @@ def today_stats():
         return jsonify({"message": "Unauthorized"}), 403
 
     today = str(datetime.now(IST).date())
-    present = attendance_col.count_documents({"date": today, "type": "checkin"})
-    leaves = leaves_col.count_documents({"from_date": {"$lte": today}, "to_date": {"$gte": today}, "status": {"$in": ["Approved", "Absent"]}})
-    total = users_col.count_documents({"role": {"$in": ["employee", "manager"]}})
-    not_in = total - present - leaves
+    today_dt = datetime.strptime(today, "%Y-%m-%d")
 
-    return jsonify({"present": present, "leave": leaves, "not_checked_in": not_in}), 200
+    # Active employees — exclude anyone who has tendered resignation
+    # resignation.notice_date: None matches null, missing field, or parent null
+    active_ids = {
+        str(e["_id"]) for e in users_col.find(
+            {"role": {"$in": ["employee", "manager"]}, "resignation.notice_date": None},
+            {"_id": 1}
+        )
+    }
+
+    # Employees who checked in today
+    present_ids = {
+        r["user_id"] for r in attendance_col.find(
+            {"date": today, "type": "checkin"}, {"user_id": 1}
+        )
+    }
+
+    # Standard approved / system-absent leaves
+    std_leave_ids = {
+        l["user_id"] for l in leaves_col.find(
+            {"from_date": {"$lte": today}, "to_date": {"$gte": today},
+             "status": {"$in": ["Approved", "Absent"]}},
+            {"user_id": 1}
+        )
+    }
+
+    # Extended leaves stored on the employee document (dates are datetime objects)
+    ext_leave_ids = {
+        str(e["_id"]) for e in users_col.find(
+            {"role": {"$in": ["employee", "manager"]},
+             "extended_leaves": {"$elemMatch": {
+                 "from_date": {"$lte": today_dt},
+                 "to_date":   {"$gte": today_dt}
+             }}},
+            {"_id": 1}
+        )
+    }
+
+    all_leave_ids = std_leave_ids | ext_leave_ids
+
+    # Scope everything to active employees only
+    present_count   = len(present_ids & active_ids)
+    # Leave: on leave AND active AND did not check in (check-in takes priority)
+    leave_count     = len((all_leave_ids - present_ids) & active_ids)
+    not_in_count    = len(active_ids - present_ids - all_leave_ids)
+
+    return jsonify({
+        "present":       present_count,
+        "leave":         leave_count,
+        "not_checked_in": not_in_count
+    }), 200
 
 
 @app.route("/api/admin/attendance-summary", methods=["GET"])
