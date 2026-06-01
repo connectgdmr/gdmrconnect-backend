@@ -2391,9 +2391,9 @@ def attendance_summary():
     month_param = request.args.get("month")
     if not month_param: return jsonify({"message": "month required"}), 400
 
-    year, month = map(int, month_param.split("-"))
-    start = datetime(year, month, 1, tzinfo=IST)
-    end = (start + timedelta(days=32)).replace(day=1)
+    year, month_num = map(int, month_param.split("-"))
+    start = IST.localize(datetime(year, month_num, 1))
+    end = IST.localize(datetime(year + (month_num // 12), (month_num % 12) + 1, 1))
 
     employees = list(users_col.find({"role": {"$in": ["employee", "manager"]}}, {"name": 1}))
     emp_ids = [str(e["_id"]) for e in employees]
@@ -2402,8 +2402,9 @@ def attendance_summary():
     start_str = start.date().isoformat()
     end_str = (end - timedelta(days=1)).date().isoformat()
 
-    # Batch fetch — 1 query each instead of 2 per day
-    all_recs = list(attendance_col.find({"date": {"$gte": start_str, "$lte": end_str}}))
+    # Regex match on the date string field — avoids BSON type-comparison issues
+    # that cause $gte/$lte to silently return 0 results
+    all_recs = list(attendance_col.find({"date": {"$regex": f"^{month_param}"}}))
     recs_by_date = {}
     for rec in all_recs:
         recs_by_date.setdefault(rec["date"], []).append(rec)
@@ -2436,10 +2437,13 @@ def attendance_summary():
 
         summary["days"][day_str] = {
             "present": list(present),
+            "present_count": len(present),
             "absent": [],
             "leave": list(leave_ids),
+            "leave_count": len(leave_ids),
             "leave_names": leave_names,
             "not_checked_in": list(not_checked_in),
+            "not_checked_in_count": len(not_checked_in),
         }
         curr += timedelta(days=1)
 
