@@ -149,6 +149,17 @@ try:
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
 
+# One-time migration: stamp "morning" on every employee that pre-dates the shift field
+try:
+    _migrated = users_col.update_many(
+        {"shift": {"$exists": False}},
+        {"$set": {"shift": "morning"}}
+    ).modified_count
+    if _migrated:
+        print(f"Startup migration: set shift='morning' on {_migrated} existing employee(s).")
+except Exception as _mig_err:
+    print(f"Warning: shift migration failed: {_mig_err}")
+
 
 # =============================================================================
 # 5. UTILITY & HELPER FUNCTIONS
@@ -489,17 +500,22 @@ def add_employee():
     password = generate_random_password()
     hashed = bcrypt.generate_password_hash(password).decode("utf-8")
 
+    shift = data.get("shift", "morning")
+    if shift not in ("morning", "night"):
+        shift = "morning"
+
     user_doc = {
         "name": name,
         "email": email,
         "password": hashed,
-        "password_changed": False, 
+        "password_changed": False,
         "role": "employee",
         "department": department,
         "position": position,
         "created_at": datetime.now(timezone.utc),
         "manager_id": manager_id,
-        "late_checkin_count_monthly": 0, 
+        "shift": shift,
+        "late_checkin_count_monthly": 0,
         "last_late_checkin_month": None,
     }
 
@@ -552,6 +568,7 @@ def list_employees():
         u["_id"] = str(u["_id"])
         manager_id = u.get("manager_id")
         u["manager_name"] = managers.get(manager_id) if manager_id else None
+        u.setdefault("shift", "morning")  # backfill for employees created before shift field existed
         _serialize_emp_status(u)
         rows.append(u)
 
@@ -732,16 +749,19 @@ def edit_employee(emp_id):
     data = request.json
     update = {}
 
-    for k in ["name", "department", "position", "email", "manager_id"]:
+    for k in ["name", "department", "position", "email", "manager_id", "shift"]:
         if k in data:
             update[k] = data[k]
-    
+
     if "manager_id" in data and not data["manager_id"]:
-         update["manager_id"] = None
-         
+        update["manager_id"] = None
+
+    if "shift" in update and update["shift"] not in ("morning", "night"):
+        return jsonify({"message": "Invalid shift value. Must be 'morning' or 'night'."}), 400
+
     if update:
         users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": update})
-    
+
     return jsonify({"message": "Employee profile updated successfully."}), 200
 
 
@@ -1476,7 +1496,13 @@ def checkin_photo():
     uid = str(request.user["_id"])
     now_ist = datetime.now(IST)
     current_time = now_ist.time()
-    today = now_ist.date()
+    employee_shift = request.user.get("shift", "morning")
+
+    # Night-shift hours 0–3 AM belong to the previous calendar day's shift date
+    if employee_shift == "night" and now_ist.hour < 4:
+        today = (now_ist - timedelta(days=1)).date()
+    else:
+        today = now_ist.date()
     today_str = str(today)
 
     if leaves_col.find_one({"user_id": uid, "status": "Approved", "from_date": {"$lte": today_str}, "to_date": {"$gte": today_str}}):
@@ -1485,32 +1511,41 @@ def checkin_photo():
     if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": today_str}):
         return jsonify({"message": "Already checked in!"}), 400
 
-    TIME_0900 = time(9, 0)
-    TIME_1000 = time(10, 0)
-    TIME_1015 = time(10, 15)
-    TIME_1300 = time(13, 0)
-    TIME_1400 = time(14, 0)
-
     status_indicator = "Unknown"
     day_type = "full"
-    
-    if current_time < TIME_1000:
+
+    if employee_shift == "morning":
+        TIME_1000 = time(10, 0)
+        TIME_1015 = time(10, 15)
+        TIME_1300 = time(13, 0)
+        TIME_1400 = time(14, 0)
+
+        if current_time < TIME_1000:
+            status_indicator = "Present (On-Time)"
+            day_type = "full"
+        elif TIME_1000 <= current_time < TIME_1015:
+            status_indicator = "Present (Late)"
+            day_type = "full"
+        elif TIME_1015 <= current_time < TIME_1300:
+            return jsonify({
+                "message": "Check-in blocked. You missed the morning window (ended 10:15 AM). Please wait until 1:00 PM for Half Day check-in."
+            }), 400
+        elif TIME_1300 <= current_time < TIME_1400:
+            status_indicator = "Half Day"
+            day_type = "half-day"
+        else:
+            return jsonify({
+                "message": "Check-in closed for the day. Marked as Absent (Full Day)."
+            }), 400
+
+    else:  # night shift: 7 PM (19:00) – 4 AM (03:59) next day
+        hour = now_ist.hour
+        if not (hour >= 19 or hour < 4):
+            return jsonify({
+                "message": "Check-in is not allowed outside your shift hours (Night Shift: 7 PM – 4 AM)"
+            }), 400
         status_indicator = "Present (On-Time)"
         day_type = "full"
-    elif TIME_1000 <= current_time < TIME_1015:
-        status_indicator = "Present (Late)"
-        day_type = "full"
-    elif TIME_1015 <= current_time < TIME_1300:
-        return jsonify({
-            "message": "Check-in blocked. You missed the morning window (ended 10:15 AM). Please wait until 1:00 PM for Half Day check-in."
-        }), 400
-    elif TIME_1300 <= current_time < TIME_1400:
-        status_indicator = "Half Day"
-        day_type = "half-day"
-    else: 
-        return jsonify({
-            "message": "Check-in closed for the day. Marked as Absent (Full Day)."
-        }), 400
 
     data = request.get_json()
     img_data = data.get("image")
@@ -1549,7 +1584,13 @@ def checkout_photo():
     uid = str(request.user["_id"])
     now_ist = datetime.now(IST)
     current_time = now_ist.time()
-    today = now_ist.date()
+    employee_shift = request.user.get("shift", "morning")
+
+    # Night-shift hours 0–3 AM belong to the previous calendar day's shift date
+    if employee_shift == "night" and now_ist.hour < 4:
+        today = (now_ist - timedelta(days=1)).date()
+    else:
+        today = now_ist.date()
 
     checkin = attendance_col.find_one({"user_id": uid, "type": "checkin", "date": str(today)})
     if not checkin:
@@ -1558,29 +1599,38 @@ def checkout_photo():
     if attendance_col.find_one({"user_id": uid, "type": "checkout", "date": str(today)}):
         return jsonify({"message": "Already checked out for today!"}), 400
 
-    HALF_DAY_OUT_START = time(13, 0)
-    HALF_DAY_OUT_END = time(14, 0)
-    FULL_DAY_OUT_START = time(18, 0)
-    LATE_CHECKOUT_START = time(19, 30)
-
-    checkin_dt = utc_to_ist(checkin["time"])
-    checkin_time = checkin_dt.time()
-
     final_day_type = checkin.get("day_type", "full")
     status_indicator = "On Time"
 
-    if checkin_time < time(13, 0) and (HALF_DAY_OUT_START <= current_time <= HALF_DAY_OUT_END):
-        final_day_type = "half-day"
-        attendance_col.update_one({"_id": checkin["_id"]}, {"$set": {"day_type": "half-day"}})
-    
-    if current_time > LATE_CHECKOUT_START:
-        status_indicator = "Late Checkout"
-    elif current_time < FULL_DAY_OUT_START:
-        if final_day_type == "half-day" and (HALF_DAY_OUT_START <= current_time <= HALF_DAY_OUT_END):
-             status_indicator = "On Time"
+    if employee_shift == "morning":
+        HALF_DAY_OUT_START = time(13, 0)
+        HALF_DAY_OUT_END = time(14, 0)
+        FULL_DAY_OUT_START = time(18, 0)
+        LATE_CHECKOUT_START = time(19, 30)
+
+        checkin_dt = utc_to_ist(checkin["time"])
+        checkin_time = checkin_dt.time()
+
+        if checkin_time < time(13, 0) and (HALF_DAY_OUT_START <= current_time <= HALF_DAY_OUT_END):
+            final_day_type = "half-day"
+            attendance_col.update_one({"_id": checkin["_id"]}, {"$set": {"day_type": "half-day"}})
+
+        if current_time > LATE_CHECKOUT_START:
+            status_indicator = "Late Checkout"
+        elif current_time < FULL_DAY_OUT_START:
+            if final_day_type == "half-day" and (HALF_DAY_OUT_START <= current_time <= HALF_DAY_OUT_END):
+                status_indicator = "On Time"
+            else:
+                status_indicator = "Early"
         else:
-             status_indicator = "Early"
-    else:
+            status_indicator = "On Time"
+
+    else:  # night shift: 7 PM – 4 AM
+        hour = now_ist.hour
+        if not (hour >= 19 or hour < 4):
+            return jsonify({
+                "message": "Check-out is not allowed outside your shift hours (Night Shift: 7 PM – 4 AM)"
+            }), 400
         status_indicator = "On Time"
 
     data = request.get_json()
