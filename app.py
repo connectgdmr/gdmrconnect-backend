@@ -2054,8 +2054,40 @@ def admin_update_asset(asset_id):
         update_data["status"] = "Pending"
         
     assets_col.update_one({"_id": ObjectId(asset_id)}, {"$set": update_data})
-    
+
     return jsonify({"message": f"Asset successfully marked as {admin_status} by Master Admin."}), 200
+
+
+@app.route("/api/admin/assets/<asset_id>/assign", methods=["POST"])
+@token_required
+def assign_asset_to_office_admin(asset_id):
+    """Send assignment notification emails to one or more office admins."""
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data   = request.json or {}
+    emails = data.get("emails", [])
+    asset  = data.get("asset", {})
+
+    if not emails:
+        return jsonify({"message": "At least one recipient email is required."}), 400
+
+    subject = f"Asset Request Approved — {asset.get('asset_name', 'Asset')}"
+    body = (
+        f"Dear Office Admin,\n\n"
+        f"An asset request has been approved and requires your processing.\n\n"
+        f"Employee  : {asset.get('employee_name', '—')}\n"
+        f"Department: {asset.get('department', '—')}\n"
+        f"Asset     : {asset.get('asset_name', '—')}\n"
+        f"Reason    : {asset.get('reason', '—')}\n\n"
+        f"Please proceed with the procurement or allocation of the above asset.\n\n"
+        f"Regards,\nGDMR Connect HRMS"
+    )
+
+    for email in emails:
+        threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
+
+    return jsonify({"message": "Assignment emails sent successfully."}), 200
 
 
 # =============================================================================
