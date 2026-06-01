@@ -20,7 +20,7 @@ Key Modules Included:
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
-import base64, os, re, csv, io
+import base64, os, re, csv, io, secrets
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -2712,19 +2712,38 @@ def invite_candidate():
     assessment_id = str(data.get("assessmentId", "")).strip()
     if not name or not email or not assessment_id:
         return jsonify({"message": "name, email, and assessmentId are required"}), 400
-    if not assessments_col.find_one({"_id": ObjectId(assessment_id)}):
+    assessment = assessments_col.find_one({"_id": ObjectId(assessment_id)})
+    if not assessment:
         return jsonify({"message": "Assessment not found"}), 404
+
+    token = secrets.token_urlsafe(32)
     doc = {
         "assessment_id": assessment_id,
         "name":          name,
         "email":         email,
         "phone":         phone,
+        "token":         token,
+        "token_used":    False,
         "status":        "Invited",
         "result":        None,
         "invited_at":    datetime.now(timezone.utc),
     }
     res = candidates_col.insert_one(doc)
     doc["_id"] = str(res.inserted_id)
+
+    assessment_link = f"https://www.gdmrconnect.com/assessment/{token}"
+    duration = assessment.get("duration_minutes", 0)
+    subject = f"You've Been Invited to Take an Assessment — GDMR Connect"
+    body = (
+        f"Hello {name},\n\n"
+        f"You have been invited to complete an assessment: \"{assessment.get('title', '')}\".\n\n"
+        f"Click the link below to begin:\n{assessment_link}\n\n"
+        + (f"Duration: {duration} minutes\n\n" if duration else "")
+        + "This link is unique to you — please do not share it.\n\n"
+        "Best regards,\nGDMR Connect Team"
+    )
+    threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
+
     return jsonify(doc), 201
 
 
@@ -3052,12 +3071,134 @@ def submit_referral():
         "candidate_name":  candidate_name,
         "candidate_email": candidate_email,
         "candidate_phone": candidate_phone,
+        "resume_url":      str(data.get("resume_url", "")).strip() or None,
+        "notes":           str(data.get("notes", "")).strip() or None,
         "status":          "Pending",
         "submitted_at":    datetime.now(timezone.utc),
     }
     res = referrals_col.insert_one(doc)
     doc["_id"] = str(res.inserted_id)
     return jsonify(doc), 201
+
+
+# =============================================================================
+# CAREER — PUBLIC & EMPLOYEE ROUTES
+# =============================================================================
+
+@app.route("/api/career/jobs", methods=["GET"])
+def public_career_jobs():
+    """Open job listings — no authentication required."""
+    rows = []
+    for j in career_jobs_col.find({"status": "Open"}).sort("created_at", -1):
+        j["_id"] = str(j["_id"])
+        rows.append(j)
+    return jsonify(rows), 200
+
+
+@app.route("/api/my/referrals", methods=["GET"])
+@token_required
+def my_referrals():
+    """Returns all referrals submitted by the logged-in employee."""
+    uid = str(request.user["_id"])
+    rows = []
+    for r in referrals_col.find({"referred_by": uid}).sort("submitted_at", -1):
+        r["_id"] = str(r["_id"])
+        rows.append(r)
+    return jsonify(rows), 200
+
+
+# =============================================================================
+# LMS — EMPLOYEE ROUTES
+# =============================================================================
+
+@app.route("/api/my/lms/courses", methods=["GET"])
+@token_required
+def my_lms_courses():
+    """Returns courses assigned to the logged-in employee with per-lesson completion state."""
+    uid = str(request.user["_id"])
+    progress_records = list(lms_progress_col.find({"user_id": uid}))
+    if not progress_records:
+        return jsonify([]), 200
+
+    course_ids = []
+    for r in progress_records:
+        try: course_ids.append(ObjectId(r["course_id"]))
+        except Exception: pass
+
+    courses = {str(c["_id"]): c for c in lms_courses_col.find({"_id": {"$in": course_ids}})}
+
+    result = []
+    for prog in progress_records:
+        course = courses.get(prog.get("course_id"))
+        if not course:
+            continue
+
+        completed_lessons = set(prog.get("completed_lessons", []))
+        modules = []
+        for mod in course.get("modules", []):
+            lessons = []
+            for lesson in mod.get("lessons", []):
+                lessons.append({**lesson, "completed": lesson.get("id", "") in completed_lessons})
+            modules.append({**mod, "lessons": lessons})
+
+        result.append({
+            "_id":             str(course["_id"]),
+            "title":           course.get("title"),
+            "description":     course.get("description"),
+            "content_url":     course.get("content_url"),
+            "tags":            course.get("tags", []),
+            "modules":         modules,
+            "percent_complete": prog.get("progress_pct", 0),
+            "status":          prog.get("status", "Assigned"),
+            "assigned_at":     prog.get("assigned_at"),
+            "completed_at":    prog.get("completed_at"),
+        })
+
+    return jsonify(result), 200
+
+
+@app.route("/api/my/lms/lessons/<lesson_id>/complete", methods=["POST"])
+@token_required
+def complete_lesson(lesson_id):
+    """Mark a lesson as done and recalculate percent_complete for the course."""
+    uid  = str(request.user["_id"])
+    data = request.json or {}
+    course_id = str(data.get("course_id", "")).strip()
+    if not course_id:
+        return jsonify({"message": "course_id is required"}), 400
+
+    try:
+        course = lms_courses_col.find_one({"_id": ObjectId(course_id)})
+    except Exception:
+        return jsonify({"message": "Invalid course_id"}), 400
+    if not course:
+        return jsonify({"message": "Course not found"}), 404
+
+    prog = lms_progress_col.find_one({"course_id": course_id, "user_id": uid})
+    if not prog:
+        return jsonify({"message": "Course not assigned to you"}), 403
+
+    # Add lesson to completed set and flip to In Progress
+    lms_progress_col.update_one(
+        {"course_id": course_id, "user_id": uid},
+        {"$addToSet": {"completed_lessons": lesson_id},
+         "$set":      {"status": "In Progress"}}
+    )
+
+    # Recalculate progress against total lesson count in the course
+    total = sum(len(mod.get("lessons", [])) for mod in course.get("modules", []))
+    prog  = lms_progress_col.find_one({"course_id": course_id, "user_id": uid})
+    done  = len(prog.get("completed_lessons", []))
+    pct   = int((done / total) * 100) if total > 0 else 0
+
+    is_complete = total > 0 and done >= total
+    final_update = {"progress_pct": pct, "status": "Completed" if is_complete else "In Progress"}
+    if is_complete:
+        final_update["completed_at"] = datetime.now(timezone.utc)
+
+    lms_progress_col.update_one({"course_id": course_id, "user_id": uid}, {"$set": final_update})
+
+    return jsonify({"progress_pct": pct, "status": final_update["status"]}), 200
 
 
 # Initialize the background scheduler
