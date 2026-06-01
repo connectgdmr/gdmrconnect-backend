@@ -2388,11 +2388,12 @@ def today_stats():
         )
     }
 
-    # Standard approved / system-absent leaves
+    # All leaves covering today that are not rejected (Pending counts — employees
+    # apply and go on leave before approval; Rejected means they didn't take it)
     std_leave_ids = {
         l["user_id"] for l in leaves_col.find(
             {"from_date": {"$lte": today}, "to_date": {"$gte": today},
-             "status": {"$in": ["Approved", "Absent"]}},
+             "status": {"$nin": ["Rejected"]}},
             {"user_id": 1}
         )
     }
