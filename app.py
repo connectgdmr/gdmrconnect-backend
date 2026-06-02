@@ -2534,11 +2534,14 @@ def attendance_summary():
         "status": {"$in": ["Approved", "Absent"]}
     }))
 
+    today_str = str(datetime.now(IST).date())
+
     summary = {"total_employees": len(employees), "days": {}}
 
     curr = start
     while curr < end:
         day_str = curr.date().isoformat()
+        is_weekend = curr.weekday() >= 5   # 5 = Saturday, 6 = Sunday
         recs = recs_by_date.get(day_str, [])
         present = {r["user_id"] for r in recs if r["type"] == "checkin"}
 
@@ -2552,17 +2555,34 @@ def attendance_summary():
                 if name:
                     leave_names.append(name)
 
-        not_checked_in = set(emp_ids) - present - leave_ids
+        # Everyone not present and not on leave for this day
+        remaining = set(emp_ids) - present - leave_ids
+
+        # Classify the leftover bucket by day type:
+        #  - today          → still in progress, so "not checked in"
+        #  - past weekday    → concluded with no check-in/leave → "absent"
+        #  - past weekend    → no expectation to work → neither (NOTE: public
+        #    holidays aren't tracked in the backend yet, so they currently
+        #    count as working days; add a holidays collection to exclude them)
+        #  - future day      → nothing concluded → neither
+        absent = []
+        not_checked_in = []
+        if day_str == today_str:
+            not_checked_in = list(remaining)
+        elif day_str < today_str and not is_weekend:
+            absent = list(remaining)
 
         summary["days"][day_str] = {
             "present": list(present),
             "present_count": len(present),
-            "absent": [],
+            "absent": absent,
+            "absent_count": len(absent),
             "leave": list(leave_ids),
             "leave_count": len(leave_ids),
             "leave_names": leave_names,
-            "not_checked_in": list(not_checked_in),
+            "not_checked_in": not_checked_in,
             "not_checked_in_count": len(not_checked_in),
+            "is_weekend": is_weekend,
         }
         curr += timedelta(days=1)
 
