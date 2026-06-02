@@ -3089,25 +3089,55 @@ def lms_progress():
     query = {"course_id": course_id} if course_id else {}
     rows = list(lms_progress_col.find(query))
 
+    # Employee name + department lookup
     uids = []
     for r in rows:
         try: uids.append(ObjectId(r["user_id"]))
         except Exception: pass
-    emp_map = {str(e["_id"]): e["name"] for e in users_col.find({"_id": {"$in": uids}}, {"name": 1})}
+    emp_map = {str(e["_id"]): e for e in users_col.find({"_id": {"$in": uids}}, {"name": 1, "department": 1})}
 
+    # Full course docs (need modules to count lessons, not just the title)
     cids = list({r["course_id"] for r in rows})
-    try:
-        course_objs = [ObjectId(c) for c in cids]
-    except Exception:
-        course_objs = []
-    course_map = {str(c["_id"]): c["title"] for c in lms_courses_col.find({"_id": {"$in": course_objs}}, {"title": 1})}
+    course_objs = []
+    for c in cids:
+        try: course_objs.append(ObjectId(c))
+        except Exception: pass
+    course_map = {str(c["_id"]): c for c in lms_courses_col.find({"_id": {"$in": course_objs}})}
 
     result = []
     for r in rows:
-        r["_id"] = str(r["_id"])
-        r["employee_name"] = emp_map.get(r.get("user_id"), "Unknown")
-        r["course_title"]  = course_map.get(r.get("course_id"), "Unknown")
-        result.append(r)
+        course = course_map.get(r.get("course_id"))
+        emp    = emp_map.get(r.get("user_id"))
+
+        # Count using the SAME dual-key matching as the employee endpoint so the
+        # admin view and the employee view always report identical progress
+        completed_set = set(r.get("completed_lessons", []))
+        total = 0
+        done  = 0
+        if course:
+            for m_idx, mod in enumerate(course.get("modules", [])):
+                for l_idx, ls in enumerate(mod.get("lessons", [])):
+                    total += 1
+                    ls_id     = str(ls.get("_id", ls.get("id", "")))
+                    key_byidx = f"{m_idx}_{l_idx}"
+                    if (ls_id and ls_id in completed_set) or (key_byidx in completed_set):
+                        done += 1
+        pct = round(done / total * 100) if total else 0
+
+        result.append({
+            "_id":               str(r["_id"]),
+            "employee_name":     emp.get("name") if emp else "Unknown",
+            "department":        emp.get("department") if emp else None,
+            "course_id":         r.get("course_id"),
+            "course_title":      course.get("title") if course else "Unknown",
+            "total_lessons":     total,
+            "completed_lessons": done,
+            "percent_complete":  pct,
+            "status":            r.get("status", "Assigned"),
+            "last_activity":     r.get("last_activity"),
+            "assigned_at":       r.get("assigned_at"),
+            "completed_at":      r.get("completed_at"),
+        })
     return jsonify(result), 200
 
 
