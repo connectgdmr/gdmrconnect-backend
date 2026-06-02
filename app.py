@@ -131,6 +131,10 @@ lms_progress_col  = db["lms_progress"]
 career_jobs_col   = db["career_jobs"]
 referrals_col     = db["career_referrals"]
 
+# --- Payroll Module ---
+salary_structures_col = db["salary_structures"]
+payslips_col          = db["payslips"]
+
 # Local Upload Fallback Directory (Used if Cloudinary is unavailable)
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -162,6 +166,9 @@ try:
     lms_progress_col.create_index([("user_id", 1), ("course_id", 1)], unique=True, background=True)
     referrals_col.create_index([("referred_by", 1), ("job_id", 1)], background=True)
     referrals_col.create_index("status", background=True)
+    salary_structures_col.create_index("employee_id", unique=True, background=True)
+    payslips_col.create_index([("employee_id", 1), ("year", 1), ("month", 1)], unique=True, background=True)
+    payslips_col.create_index([("year", 1), ("month", 1)], background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
@@ -3583,6 +3590,213 @@ def complete_lesson(lesson_id):
     lms_progress_col.update_one({"course_id": course_id, "user_id": uid}, {"$set": final_update})
 
     return jsonify({"message": "Lesson marked complete", "progress_pct": pct, "status": final_status}), 200
+
+
+# =============================================================================
+# PAYROLL MODULE
+# =============================================================================
+
+# Salary component field groups
+SALARY_EARNINGS   = ["basic", "hra", "conveyance", "medical", "special", "other_earnings"]
+SALARY_DEDUCTIONS = ["pf", "professional_tax", "tds", "other_deductions"]
+
+
+def _payroll_allowed(user):
+    """Payroll access: admins, or anyone in the Accounts department."""
+    if user.get("role") == "admin":
+        return True
+    dept = (user.get("department") or "").strip().lower()
+    return dept.startswith("accounts")
+
+
+def _to_money(v):
+    """Coerce any input to a non-negative rounded float; bad input → 0.0."""
+    try:
+        return round(max(0.0, float(v)), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+@app.route("/api/admin/payroll/salaries", methods=["GET"])
+@token_required
+def list_salaries():
+    if not _payroll_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    employees = list(users_col.find({"role": {"$in": ["employee", "manager"]}}, {"name": 1, "department": 1}))
+    struct_map = {s["employee_id"]: s for s in salary_structures_col.find()}
+
+    rows = []
+    for e in employees:
+        eid = str(e["_id"])
+        s = struct_map.get(eid)
+        salary = None
+        if s:
+            salary = {f: s.get(f, 0) for f in SALARY_EARNINGS + SALARY_DEDUCTIONS}
+        rows.append({
+            "employee_id":   eid,
+            "employee_name": e.get("name", ""),
+            "department":    e.get("department", ""),
+            "salary":        salary,
+        })
+    return jsonify(rows), 200
+
+
+@app.route("/api/admin/payroll/salaries/<employee_id>", methods=["PUT"])
+@token_required
+def upsert_salary(employee_id):
+    if not _payroll_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    try:
+        emp = users_col.find_one({"_id": ObjectId(employee_id)})
+    except Exception:
+        return jsonify({"message": "Invalid employee ID"}), 400
+    if not emp:
+        return jsonify({"message": "Employee not found"}), 404
+
+    data = request.json or {}
+    struct = {f: _to_money(data.get(f, 0)) for f in SALARY_EARNINGS + SALARY_DEDUCTIONS}
+    struct["employee_id"] = employee_id
+    struct["updated_at"]  = datetime.now(timezone.utc)
+
+    salary_structures_col.update_one({"employee_id": employee_id}, {"$set": struct}, upsert=True)
+    return jsonify({"message": "Salary structure saved", "salary": {f: struct[f] for f in SALARY_EARNINGS + SALARY_DEDUCTIONS}}), 200
+
+
+@app.route("/api/admin/payroll/run", methods=["POST"])
+@token_required
+def run_payroll():
+    if not _payroll_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data = request.json or {}
+    try:
+        month = int(data.get("month"))
+        year  = int(data.get("year"))
+    except (TypeError, ValueError):
+        return jsonify({"message": "month (1-12) and year are required"}), 400
+    if not (1 <= month <= 12) or year < 2000:
+        return jsonify({"message": "Invalid month or year"}), 400
+
+    period = datetime(year, month, 1).strftime("%B %Y")
+    now = datetime.now(timezone.utc)
+
+    created = 0
+    skipped = 0
+    for s in salary_structures_col.find():
+        eid = s.get("employee_id")
+        if not eid:
+            continue
+
+        # No duplicate payslip for the same employee + period
+        if payslips_col.find_one({"employee_id": eid, "month": month, "year": year}):
+            skipped += 1
+            continue
+
+        try:
+            emp = users_col.find_one({"_id": ObjectId(eid)})
+        except Exception:
+            emp = None
+        if not emp:
+            continue  # salary structure left behind by a deleted employee
+
+        # Snapshot the numbers at generation time — never a live reference
+        earnings   = {f: _to_money(s.get(f, 0)) for f in SALARY_EARNINGS}
+        deductions = {f: _to_money(s.get(f, 0)) for f in SALARY_DEDUCTIONS}
+        gross            = round(sum(earnings.values()), 2)
+        total_deductions = round(sum(deductions.values()), 2)
+        net              = round(gross - total_deductions, 2)
+
+        payslip = {
+            "employee_id":      eid,
+            "employee_name":    emp.get("name", ""),
+            "department":       emp.get("department", ""),
+            "month":            month,
+            "year":             year,
+            "period":           period,
+            **earnings,
+            **deductions,
+            "gross":            gross,
+            "total_deductions": total_deductions,
+            "net":              net,
+            "status":           "Pending",
+            "created_at":       now,
+        }
+        try:
+            payslips_col.insert_one(payslip)
+            created += 1
+        except Exception:
+            # Unique index race — treat as already generated
+            skipped += 1
+
+    return jsonify({
+        "message": f"Payroll run complete for {period}.",
+        "period":  period,
+        "created": created,
+        "skipped": skipped,
+    }), 200
+
+
+@app.route("/api/admin/payroll/payslips", methods=["GET"])
+@token_required
+def list_payslips():
+    if not _payroll_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    query = {}
+    month = request.args.get("month")
+    year  = request.args.get("year")
+    if month:
+        try: query["month"] = int(month)
+        except ValueError: return jsonify({"message": "Invalid month"}), 400
+    if year:
+        try: query["year"] = int(year)
+        except ValueError: return jsonify({"message": "Invalid year"}), 400
+
+    rows = []
+    for p in payslips_col.find(query).sort([("year", -1), ("month", -1), ("employee_name", 1)]):
+        p["_id"] = str(p["_id"])
+        rows.append(p)
+    return jsonify(rows), 200
+
+
+@app.route("/api/admin/payroll/payslips/<payslip_id>/status", methods=["PUT"])
+@token_required
+def update_payslip_status(payslip_id):
+    if not _payroll_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    try:
+        obj = ObjectId(payslip_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    data = request.json or {}
+    status = data.get("status")
+    if status not in ("Pending", "Paid"):
+        return jsonify({"message": "status must be 'Pending' or 'Paid'"}), 400
+
+    update = {"status": status, "updated_at": datetime.now(timezone.utc)}
+    if status == "Paid":
+        update["paid_at"] = datetime.now(timezone.utc)
+
+    result = payslips_col.update_one({"_id": obj}, {"$set": update})
+    if result.matched_count == 0:
+        return jsonify({"message": "Payslip not found"}), 404
+    return jsonify({"message": f"Payslip marked {status}"}), 200
+
+
+@app.route("/api/my/payslips", methods=["GET"])
+@token_required
+def my_payslips():
+    """Payslips for the logged-in employee, newest first."""
+    uid = str(request.user["_id"])
+    rows = []
+    for p in payslips_col.find({"employee_id": uid}).sort([("year", -1), ("month", -1)]):
+        p["_id"] = str(p["_id"])
+        rows.append(p)
+    return jsonify(rows), 200
 
 
 # Initialize the background scheduler
