@@ -3342,12 +3342,14 @@ def my_lms_courses():
         total_lessons = 0
         completed_count = 0
 
-        for mod in course.get("modules", []):
+        for m_idx, mod in enumerate(course.get("modules", [])):
             lessons = []
-            for ls in mod.get("lessons", []):
+            for l_idx, ls in enumerate(mod.get("lessons", [])):
                 # Normalise lesson id — may be ObjectId, string "_id", or plain "id"
-                ls_id = str(ls.get("_id", ls.get("id", "")))
-                done  = ls_id in completed_set
+                ls_id      = str(ls.get("_id", ls.get("id", "")))
+                key_byidx  = f"{m_idx}_{l_idx}"
+                # Match whichever key form was stored (real _id or positional)
+                done = (ls_id and ls_id in completed_set) or (key_byidx in completed_set)
                 if done:
                     completed_count += 1
                 total_lessons += 1
@@ -3418,10 +3420,16 @@ def complete_lesson(lesson_id):
     course_id = str(course["_id"])
     now       = datetime.now(timezone.utc)
 
+    # Build a stable key for this lesson. The frontend sends the real _id when one
+    # exists, otherwise "by-index" plus positional indices — store whichever applies.
+    module_index = data.get("module_index")
+    lesson_index = data.get("lesson_index")
+    lesson_key = lesson_id if lesson_id and lesson_id != "by-index" else f"{module_index}_{lesson_index}"
+
     # Upsert: works for both pre-assigned and department-assigned courses
     lms_progress_col.update_one(
         {"course_id": course_id, "user_id": uid},
-        {"$addToSet": {"completed_lessons": lesson_id},
+        {"$addToSet": {"completed_lessons": lesson_key},
          "$set":      {"status": "In Progress", "last_activity": now},
          "$setOnInsert": {
              "course_id":   course_id,
@@ -3433,11 +3441,20 @@ def complete_lesson(lesson_id):
         upsert=True
     )
 
-    # Recalculate progress
-    total = sum(len(mod.get("lessons", [])) for mod in course.get("modules", []))
-    prog  = lms_progress_col.find_one({"course_id": course_id, "user_id": uid})
-    done  = len(prog.get("completed_lessons", []))
-    pct   = round((done / total) * 100) if total > 0 else 0
+    # Recalculate progress using the same dual-key matching as the read endpoint,
+    # so the count never exceeds the real lesson total or double-counts a lesson.
+    prog          = lms_progress_col.find_one({"course_id": course_id, "user_id": uid})
+    completed_set = set(prog.get("completed_lessons", []))
+    total = 0
+    done  = 0
+    for m_idx, mod in enumerate(course.get("modules", [])):
+        for l_idx, ls in enumerate(mod.get("lessons", [])):
+            total += 1
+            ls_id     = str(ls.get("_id", ls.get("id", "")))
+            key_byidx = f"{m_idx}_{l_idx}"
+            if (ls_id and ls_id in completed_set) or (key_byidx in completed_set):
+                done += 1
+    pct = round((done / total) * 100) if total > 0 else 0
 
     is_complete  = total > 0 and done >= total
     final_status = "Completed" if is_complete else "In Progress"
