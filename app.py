@@ -2954,6 +2954,20 @@ def list_courses():
     return jsonify(rows), 200
 
 
+def _normalize_modules(modules):
+    """Ensure every lesson has a stable string _id so progress tracking works."""
+    if not isinstance(modules, list):
+        return []
+    for m in modules:
+        for l in m.get("lessons", []):
+            # Assign an id only when missing; keep existing ones stable across edits
+            if not l.get("_id") and not l.get("id"):
+                l["_id"] = str(ObjectId())
+            elif l.get("_id"):
+                l["_id"] = str(l["_id"])
+    return modules
+
+
 @app.route("/api/admin/lms/courses", methods=["POST"])
 @token_required
 def create_course():
@@ -2964,12 +2978,15 @@ def create_course():
     if not title:
         return jsonify({"message": "title is required"}), 400
     doc = {
-        "title":       title,
-        "description": str(data.get("description", "")).strip(),
-        "content_url": str(data.get("content_url", "")).strip(),
-        "tags":        data.get("tags", []),
-        "created_by":  str(request.user["_id"]),
-        "created_at":  datetime.now(timezone.utc),
+        "title":         title,
+        "description":   str(data.get("description", "")).strip(),
+        "category":      str(data.get("category", "Technical")).strip(),
+        "thumbnail_url": str(data.get("thumbnail_url", "")).strip(),
+        "content_url":   str(data.get("content_url", "")).strip(),
+        "tags":          data.get("tags", []),
+        "modules":       _normalize_modules(data.get("modules", [])),
+        "created_by":    str(request.user["_id"]),
+        "created_at":    datetime.now(timezone.utc),
     }
     res = lms_courses_col.insert_one(doc)
     doc["_id"] = str(res.inserted_id)
@@ -2987,9 +3004,11 @@ def update_course(course_id):
         return jsonify({"message": "Invalid ID"}), 400
     data = request.json or {}
     update = {"updated_at": datetime.now(timezone.utc)}
-    for k in ["title", "description", "content_url", "tags"]:
+    for k in ["title", "description", "category", "thumbnail_url", "content_url", "tags"]:
         if k in data:
             update[k] = data[k]
+    if "modules" in data:
+        update["modules"] = _normalize_modules(data.get("modules", []))
     result = lms_courses_col.update_one({"_id": obj}, {"$set": update})
     if result.matched_count == 0:
         return jsonify({"message": "Course not found"}), 404
