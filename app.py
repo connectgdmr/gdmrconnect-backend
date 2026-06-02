@@ -3270,14 +3270,22 @@ def update_referral(referral_id):
 @app.route("/api/career/referrals", methods=["POST"])
 @token_required
 def submit_referral():
-    """Employee submits a candidate referral for an open job."""
+    """
+    Employee submits a candidate referral for an open job.
+    Accepts multipart/form-data so an optional resume file can be uploaded.
+    Falls back to JSON body if no form data is present.
+    """
     if request.user.get("role") not in ["employee", "manager"]:
         return jsonify({"message": "Unauthorized"}), 403
-    data = request.json or {}
-    job_id         = str(data.get("job_id", "")).strip()
-    candidate_name  = str(data.get("candidate_name", "")).strip()
-    candidate_email = str(data.get("candidate_email", "")).strip()
-    candidate_phone = str(data.get("candidate_phone", "")).strip()
+
+    # Read from form (multipart) with a JSON fallback for older clients
+    src = request.form if request.form else (request.json or {})
+    job_id          = str(src.get("job_id", "")).strip()
+    candidate_name  = str(src.get("candidate_name", "")).strip()
+    candidate_email = str(src.get("candidate_email", "")).strip()
+    candidate_phone = str(src.get("candidate_phone", "")).strip()
+    resume_link     = str(src.get("resume_url", "")).strip() or None
+    notes           = str(src.get("notes", "")).strip() or None
 
     if not job_id or not candidate_name or not candidate_email:
         return jsonify({"message": "job_id, candidate_name, and candidate_email are required"}), 400
@@ -3289,6 +3297,22 @@ def submit_referral():
     if not job:
         return jsonify({"message": "Job not found or no longer open"}), 404
 
+    # Optional resume file → Cloudinary (raw resource for PDF/DOC)
+    resume_file_url = None
+    upload = request.files.get("resume")
+    if upload and upload.filename:
+        try:
+            res = cloudinary.uploader.upload(
+                upload,
+                resource_type="raw",
+                folder="gdmr/referral_resumes",
+                use_filename=True, unique_filename=True,
+            )
+            resume_file_url = res.get("secure_url")
+        except Exception as e:
+            print("Resume upload error:", e)
+            return jsonify({"message": "Resume upload failed. Please try again."}), 500
+
     doc = {
         "job_id":          job_id,
         "job_title":       job.get("title", ""),
@@ -3297,13 +3321,36 @@ def submit_referral():
         "candidate_name":  candidate_name,
         "candidate_email": candidate_email,
         "candidate_phone": candidate_phone,
-        "resume_url":      str(data.get("resume_url", "")).strip() or None,
-        "notes":           str(data.get("notes", "")).strip() or None,
+        "resume_url":      resume_link,        # LinkedIn / portfolio link
+        "resume_file_url": resume_file_url,    # uploaded Cloudinary file
+        "notes":           notes,
         "status":          "Pending",
         "submitted_at":    datetime.now(timezone.utc),
     }
     res = referrals_col.insert_one(doc)
     doc["_id"] = str(res.inserted_id)
+
+    # Notify the referring employee's manager, if they have one
+    manager_id = request.user.get("manager_id")
+    if manager_id:
+        try:
+            manager = users_col.find_one({"_id": ObjectId(manager_id)})
+        except Exception:
+            manager = None
+        if manager and manager.get("email"):
+            subject = f"New Referral from {doc['referrer_name']}"
+            body = (
+                f"{doc['referrer_name']} has submitted a referral.\n\n"
+                f"Candidate : {candidate_name}\n"
+                f"Email     : {candidate_email}\n"
+                f"Phone     : {candidate_phone or '—'}\n"
+                f"Position  : {doc['job_title']}\n"
+                f"Resume    : {resume_file_url or resume_link or 'Not provided'}\n"
+                f"Notes     : {notes or '—'}\n\n"
+                f"Please review in the GDMR Connect admin panel."
+            )
+            threading.Thread(target=send_email, args=(manager["email"], subject, body), daemon=True).start()
+
     return jsonify(doc), 201
 
 
