@@ -2335,39 +2335,55 @@ def approve_correction():
 def get_notification_counts():
     """ Fetch dynamic badge counts for the dashboard sidebar/quick-launch items. """
     role = request.user.get("role")
+    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
     counts = {
-        "leaves": 0, 
-        "pms": 0, 
-        "corrections": 0, 
-        "assets": 0, 
-        "announcements": announcements_col.count_documents({})
+        "leaves": 0,
+        "pms": 0,
+        "corrections": 0,
+        "assets": 0,
+        "announcements": 0,
     }
-    
+
     if role == "manager":
         my_dept = request.user.get("department")
         dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept})]
-        
+
         counts["leaves"] = leaves_col.count_documents({
             "user_id": {"$in": dept_users},
             "status": "Pending",
-            "manager_status": "Pending" 
+            "manager_status": "Pending"
         })
-        
+
         counts["pms"] = pms_reviews_col.count_documents({
             "user_id": {"$in": dept_users},
             "status": "Pending Review"
         })
-        
+
         counts["corrections"] = corrections_col.count_documents({
             "user_id": {"$in": dept_users},
             "status": "Pending"
         })
-        
+
         counts["assets"] = assets_col.count_documents({
             "department": my_dept,
             "manager_status": "Pending"
         })
-        
+
+    elif role == "admin" or has_delegated:
+        # Leaves still awaiting the admin's approval (not yet finalised/rejected)
+        counts["leaves"] = leaves_col.count_documents({
+            "status": "Pending",
+            "admin_status": "Pending"
+        })
+
+        # Asset requests awaiting final admin approval
+        counts["assets"] = assets_col.count_documents({
+            "status": "Pending",
+            "admin_status": "Pending"
+        })
+        # announcements stays 0 — no unseen-announcement tracking yet, so the
+        # badge hides rather than showing the static total.
+
     return jsonify(counts), 200
 
 
