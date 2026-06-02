@@ -3145,6 +3145,18 @@ def lms_progress():
 # CAREER MODULE
 # =============================================================================
 
+def _normalize_requirements(raw):
+    """Always return a list of trimmed, non-empty requirement strings.
+    Accepts a list, or a comma/newline-separated string (legacy), or None."""
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, str):
+        items = re.split(r"[,\n]", raw)
+    else:
+        items = []
+    return [str(item).strip() for item in items if str(item).strip()]
+
+
 @app.route("/api/admin/career/jobs", methods=["GET"])
 @token_required
 def list_jobs():
@@ -3153,6 +3165,7 @@ def list_jobs():
     rows = []
     for j in career_jobs_col.find().sort("created_at", -1):
         j["_id"] = str(j["_id"])
+        j["requirements"] = _normalize_requirements(j.get("requirements"))
         rows.append(j)
     return jsonify(rows), 200
 
@@ -3170,7 +3183,7 @@ def create_job():
         "title":        title,
         "department":   str(data.get("department", "")).strip(),
         "description":  str(data.get("description", "")).strip(),
-        "requirements": str(data.get("requirements", "")).strip(),
+        "requirements": _normalize_requirements(data.get("requirements")),
         "type":         data.get("type", "Full-time"),
         "status":       "Open",
         "created_by":   str(request.user["_id"]),
@@ -3192,9 +3205,11 @@ def update_job(job_id):
         return jsonify({"message": "Invalid ID"}), 400
     data = request.json or {}
     update = {"updated_at": datetime.now(timezone.utc)}
-    for k in ["title", "department", "description", "requirements", "type", "status"]:
+    for k in ["title", "department", "description", "type", "status"]:
         if k in data:
             update[k] = data[k]
+    if "requirements" in data:
+        update["requirements"] = _normalize_requirements(data.get("requirements"))
     if "status" in update and update["status"] not in ("Open", "Closed"):
         return jsonify({"message": "status must be 'Open' or 'Closed'"}), 400
     result = career_jobs_col.update_one({"_id": obj}, {"$set": update})
@@ -3302,6 +3317,7 @@ def public_career_jobs():
     rows = []
     for j in career_jobs_col.find({"status": "Open"}).sort("created_at", -1):
         j["_id"] = str(j["_id"])
+        j["requirements"] = _normalize_requirements(j.get("requirements"))
         rows.append(j)
     return jsonify(rows), 200
 
