@@ -3297,15 +3297,40 @@ def submit_referral():
     if not job:
         return jsonify({"message": "Job not found or no longer open"}), 404
 
-    # Optional resume file → Cloudinary (raw resource for PDF/DOC)
+    # Optional resume file → Cloudinary, with strict server-side validation.
+    # Frontend checks are UX only; re-validate everything here since a client
+    # can POST anything directly to the API.
     resume_file_url = None
-    upload = request.files.get("resume")
-    if upload and upload.filename:
+    f = request.files.get("resume")
+    if f and f.filename:
+        # 1. Extension check
+        if not f.filename.lower().endswith(".pdf"):
+            return jsonify({"message": "Only PDF files are allowed."}), 400
+
+        # 2. MIME check
+        if f.mimetype != "application/pdf":
+            return jsonify({"message": "Invalid file type."}), 400
+
+        # 3. Magic-byte check — first 5 bytes must be %PDF-
+        head = f.stream.read(5)
+        f.stream.seek(0)                       # rewind so the upload reads the full file
+        if head != b"%PDF-":
+            return jsonify({"message": "File is not a valid PDF."}), 400
+
+        # 4. Size cap (5 MB)
+        f.stream.seek(0, 2)
+        size = f.stream.tell()
+        f.stream.seek(0)
+        if size > 5 * 1024 * 1024:
+            return jsonify({"message": "File too large (max 5 MB)."}), 400
+
+        # 5. Upload as raw, force .pdf so the delivered file is always a real PDF
         try:
             res = cloudinary.uploader.upload(
-                upload,
+                f,
                 resource_type="raw",
                 folder="gdmr/referral_resumes",
+                format="pdf",
                 use_filename=True, unique_filename=True,
             )
             resume_file_url = res.get("secure_url")
