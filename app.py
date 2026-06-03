@@ -20,7 +20,7 @@ Key Modules Included:
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
-import base64, os, re, csv, io, secrets
+import base64, os, re, csv, io, secrets, gzip
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -169,6 +169,11 @@ try:
     salary_structures_col.create_index("employee_id", unique=True, background=True)
     payslips_col.create_index([("employee_id", 1), ("year", 1), ("month", 1)], unique=True, background=True)
     payslips_col.create_index([("year", 1), ("month", 1)], background=True)
+    # Indexes backing common sorts on growing collections
+    leaves_col.create_index([("applied_at", -1)], background=True)
+    assets_col.create_index([("created_at", -1)], background=True)
+    attendance_col.create_index([("user_id", 1), ("time", -1)], background=True)
+    pms_reviews_col.create_index([("self_assessment_date", -1)], background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
@@ -260,6 +265,46 @@ def _serialize_emp_status(user_doc):
 def handle_exception(e):
     print(f"Unhandled exception: {e}")
     return jsonify({"message": "A server error occurred. Please try again."}), 500
+
+
+@app.after_request
+def _gzip_response(response):
+    """
+    Transparently gzip JSON/text responses when the client supports it.
+    Cuts transfer size ~80-90% on large list payloads (employees, leaves,
+    attendance summaries) with no API contract change. Conservative guards
+    skip streamed files, small bodies, errors, and already-encoded responses.
+    """
+    try:
+        if "gzip" not in request.headers.get("Accept-Encoding", "").lower():
+            return response
+        if response.direct_passthrough or response.status_code != 200:
+            return response
+        if response.headers.get("Content-Encoding"):
+            return response
+        ctype = response.content_type or ""
+        if not (ctype.startswith("application/json") or ctype.startswith("text/")):
+            return response
+
+        data = response.get_data()
+        if len(data) < 1024:          # not worth compressing tiny payloads
+            return response
+
+        compressed = gzip.compress(data, compresslevel=6)
+        response.set_data(compressed)
+        response.headers["Content-Encoding"] = "gzip"
+        response.headers["Content-Length"] = str(len(compressed))
+
+        # Preserve any existing Vary (e.g. Origin from CORS) and add Accept-Encoding
+        vary = response.headers.get("Vary")
+        if vary:
+            if "accept-encoding" not in vary.lower():
+                response.headers["Vary"] = f"{vary}, Accept-Encoding"
+        else:
+            response.headers["Vary"] = "Accept-Encoding"
+    except Exception as _gz_err:
+        print(f"gzip skip: {_gz_err}")
+    return response
 
 @app.route("/")
 def home():
@@ -1814,11 +1859,12 @@ def admin_view_leaves():
     
     if role == "manager" and not has_delegated:
         my_dept = request.user.get("department")
-        dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept})]
+        dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept}, {"_id": 1})]
         query = {"user_id": {"$in": dept_users}}
 
     rows = []
-    employees = {str(e["_id"]): e for e in users_col.find()}
+    # Only name + department are needed for enrichment — avoid pulling full docs
+    employees = {str(e["_id"]): e for e in users_col.find({}, {"name": 1, "department": 1})}
     
     for l in leaves_col.find(query).sort("applied_at", -1):
         l["_id"] = str(l["_id"])
@@ -2346,7 +2392,7 @@ def get_notification_counts():
 
     if role == "manager":
         my_dept = request.user.get("department")
-        dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept})]
+        dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept}, {"_id": 1})]
 
         counts["leaves"] = leaves_col.count_documents({
             "user_id": {"$in": dept_users},
