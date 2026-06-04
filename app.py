@@ -1607,13 +1607,23 @@ def checkin_photo():
                 "message": "Check-in closed for the day. Marked as Absent (Full Day)."
             }), 400
 
-    else:  # night shift: 7 PM (19:00) – 4 AM (03:59) next day
-        hour = now_ist.hour
-        if not (hour >= 19 or hour < 4):
+    else:  # night shift check-in: 5:30 PM – 7:15 PM (late from 7:00 PM)
+        TIME_1730 = time(17, 30)
+        TIME_1900 = time(19, 0)
+        TIME_1915 = time(19, 15)
+
+        if current_time < TIME_1730:
             return jsonify({
-                "message": "Check-in is not allowed outside your shift hours (Night Shift: 7 PM – 4 AM)"
+                "message": "Check-in opens at 5:30 PM for Night Shift."
             }), 400
-        status_indicator = "Present (On-Time)"
+        elif current_time < TIME_1900:
+            status_indicator = "Present (On-Time)"
+        elif current_time <= TIME_1915:
+            status_indicator = "Present (Late)"
+        else:
+            return jsonify({
+                "message": "Check-in closed for Night Shift (window ended 7:15 PM)."
+            }), 400
         day_type = "full"
 
     data = request.get_json()
