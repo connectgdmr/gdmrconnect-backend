@@ -1665,9 +1665,9 @@ def checkout_photo():
     current_time = now_ist.time()
     employee_shift = request.user.get("shift", "morning")
 
-    # Night-shift hours up to 5 AM belong to the previous calendar day's shift date,
+    # Night-shift hours up to 7 AM belong to the previous calendar day's shift date,
     # so a post-midnight checkout pairs with that night's check-in
-    if employee_shift == "night" and now_ist.hour < 5:
+    if employee_shift == "night" and now_ist.hour < 7:
         today = (now_ist - timedelta(days=1)).date()
     else:
         today = now_ist.date()
@@ -1705,11 +1705,11 @@ def checkout_photo():
         else:
             status_indicator = "On Time"
 
-    else:  # night shift checkout: 7 PM – 5 AM
+    else:  # night shift checkout: 7 PM – 7 AM
         hour = now_ist.hour
-        if not (hour >= 19 or hour < 5):
+        if not (hour >= 19 or hour < 7):
             return jsonify({
-                "message": "Check-out is not allowed outside your shift hours (Night Shift: 7 PM – 5 AM)"
+                "message": "Check-out is not allowed outside your shift hours (Night Shift: 7 PM – 7 AM)"
             }), 400
         status_indicator = "On Time"
 
