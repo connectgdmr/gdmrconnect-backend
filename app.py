@@ -576,7 +576,7 @@ def add_employee():
     hashed = bcrypt.generate_password_hash(password).decode("utf-8")
 
     shift = data.get("shift", "morning")
-    if shift not in ("morning", "night"):
+    if shift not in ("morning", "night", "general"):
         shift = "morning"
 
     user_doc = {
@@ -831,8 +831,8 @@ def edit_employee(emp_id):
     if "manager_id" in data and not data["manager_id"]:
         update["manager_id"] = None
 
-    if "shift" in update and update["shift"] not in ("morning", "night"):
-        return jsonify({"message": "Invalid shift value. Must be 'morning' or 'night'."}), 400
+    if "shift" in update and update["shift"] not in ("morning", "night", "general"):
+        return jsonify({"message": "Invalid shift value. Must be 'morning', 'night', or 'general'."}), 400
 
     if update:
         users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": update})
@@ -1613,6 +1613,16 @@ def checkin_photo():
                 "message": "Check-in closed for the day. Marked as Absent (Full Day)."
             }), 400
 
+    elif employee_shift == "general":  # general shift check-in: 8:00 AM – 10:00 AM
+        TIME_0800 = time(8, 0)
+        TIME_1000 = time(10, 0)
+        if not (TIME_0800 <= current_time < TIME_1000):
+            return jsonify({
+                "message": "Check-in is allowed 8:00 AM – 10:00 AM for General Shift."
+            }), 400
+        status_indicator = "Present (On-Time)"
+        day_type = "full"
+
     else:  # night shift check-in: 5:30 PM – 7:15 PM (late from 7:00 PM)
         TIME_1730 = time(17, 30)
         TIME_1900 = time(19, 0)
@@ -1710,6 +1720,13 @@ def checkout_photo():
                 status_indicator = "Early"
         else:
             status_indicator = "On Time"
+
+    elif employee_shift == "general":  # general shift checkout: 5:00 PM – 7:00 PM
+        if not (time(17, 0) <= current_time < time(19, 0)):
+            return jsonify({
+                "message": "Check-out is allowed 5:00 PM – 7:00 PM for General Shift."
+            }), 400
+        status_indicator = "On Time"
 
     else:  # night shift checkout: 7 PM – 7 AM
         hour = now_ist.hour
