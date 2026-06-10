@@ -135,6 +135,9 @@ referrals_col     = db["career_referrals"]
 salary_structures_col = db["salary_structures"]
 payslips_col          = db["payslips"]
 
+# --- Work Plans Module ---
+work_plans_col        = db["work_plans"]
+
 # Local Upload Fallback Directory (Used if Cloudinary is unavailable)
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -174,6 +177,9 @@ try:
     assets_col.create_index([("created_at", -1)], background=True)
     attendance_col.create_index([("user_id", 1), ("time", -1)], background=True)
     pms_reviews_col.create_index([("self_assessment_date", -1)], background=True)
+    work_plans_col.create_index([("employee_id", 1), ("date", 1)], unique=True, background=True)
+    work_plans_col.create_index([("date", 1), ("status", 1)], background=True)
+    work_plans_col.create_index([("department", 1), ("date", 1)], background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
@@ -3892,11 +3898,404 @@ def my_payslips():
     return jsonify(rows), 200
 
 
+# =============================================================================
+# WORK PLANS MODULE (daily task plans + analytics + scheduled summaries)
+# =============================================================================
+
+def _today_ist():
+    return datetime.now(IST).date()
+
+
+def _is_task_done(t):
+    return str(t.get("status", "")).strip().lower() in ("completed", "done")
+
+
+def _checkin_time_for(uid, date_str):
+    rec = attendance_col.find_one(
+        {"user_id": uid, "type": "checkin", "date": date_str}, {"time": 1}
+    )
+    if rec and rec.get("time"):
+        return format_datetime_ist(rec["time"])
+    return None
+
+
+def _checkin_map(uids, date_str):
+    recs = attendance_col.find(
+        {"user_id": {"$in": uids}, "type": "checkin", "date": date_str},
+        {"user_id": 1, "time": 1}
+    )
+    return {r["user_id"]: format_datetime_ist(r["time"]) for r in recs if r.get("time")}
+
+
+def _serialize_plan(doc, checkin=None):
+    doc["_id"] = str(doc["_id"])
+    doc.setdefault("tasks", [])
+    doc.setdefault("manager_comment", None)
+    doc["check_in_time"] = checkin if checkin is not None else _checkin_time_for(doc.get("employee_id", ""), doc.get("date", ""))
+    return doc
+
+
+def _range_start(range_key, today_date):
+    if range_key == "today":
+        return today_date
+    if range_key == "month":
+        return today_date - timedelta(days=29)
+    return today_date - timedelta(days=6)   # "week" / default
+
+
+def _build_analytics(plans, start_date, today_date):
+    """Aggregate a list of submitted-eligible work plans into trend/analytics."""
+    tasks_submitted = 0
+    tasks_completed = 0
+    active_days = set()
+    projects = {}
+    per_day = {}     # "YYYY-MM-DD" -> task count
+
+    for p in plans:
+        if p.get("status") != "submitted":
+            continue
+        d = p.get("date", "")
+        active_days.add(d)
+        tlist = p.get("tasks", [])
+        tasks_submitted += len(tlist)
+        per_day[d] = per_day.get(d, 0) + len(tlist)
+        for t in tlist:
+            if _is_task_done(t):
+                tasks_completed += 1
+            proj = (t.get("project") or "Unassigned").strip() or "Unassigned"
+            projects[proj] = projects.get(proj, 0) + 1
+
+    # Daily trend across the requested window
+    daily_trend = []
+    cur = start_date
+    while cur <= today_date:
+        ds = cur.isoformat()
+        daily_trend.append({"label": cur.strftime("%a %d"), "value": per_day.get(ds, 0)})
+        cur += timedelta(days=1)
+
+    # Weekly trend — group the same window by ISO week
+    weekly = {}
+    for ds, cnt in per_day.items():
+        try:
+            dt = datetime.strptime(ds, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        iso = dt.isocalendar()
+        key = (iso[0], iso[1])
+        weekly[key] = weekly.get(key, 0) + cnt
+    weekly_trend = [
+        {"label": f"W{wk}", "value": val}
+        for (yr, wk), val in sorted(weekly.items())
+    ]
+
+    projects_list = sorted(
+        [{"name": n, "count": c} for n, c in projects.items()],
+        key=lambda x: x["count"], reverse=True
+    )
+
+    return {
+        "tasks_submitted": tasks_submitted,
+        "tasks_completed": tasks_completed,
+        "active_days":     len(active_days),
+        "daily_trend":     daily_trend,
+        "weekly_trend":    weekly_trend,
+        "projects":        projects_list,
+    }
+
+
+# ── Employee routes ──────────────────────────────────────────────────────────
+
+@app.route("/api/my/work-plan", methods=["GET"])
+@token_required
+def get_my_work_plan():
+    uid = str(request.user["_id"])
+    date_str = request.args.get("date") or _today_ist().isoformat()
+    plan = work_plans_col.find_one({"employee_id": uid, "date": date_str})
+    if not plan:
+        return jsonify(None), 200
+    return jsonify(_serialize_plan(plan)), 200
+
+
+@app.route("/api/my/work-plan", methods=["POST"])
+@token_required
+def upsert_my_work_plan():
+    uid = str(request.user["_id"])
+    data = request.json or {}
+    date_str = str(data.get("date") or _today_ist().isoformat())[:10]
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"message": "Invalid date. Use YYYY-MM-DD."}), 400
+
+    status = data.get("status", "draft")
+    if status not in ("draft", "submitted"):
+        return jsonify({"message": "status must be 'draft' or 'submitted'"}), 400
+
+    tasks = data.get("tasks", [])
+    if not isinstance(tasks, list):
+        return jsonify({"message": "tasks must be a list"}), 400
+
+    now = datetime.now(timezone.utc)
+    set_fields = {
+        "employee_id":   uid,
+        "employee_name": request.user.get("name", ""),
+        "department":    request.user.get("department", ""),
+        "date":          date_str,
+        "tasks":         tasks,
+        "status":        status,
+        "updated_at":    now,
+    }
+    if status == "submitted":
+        set_fields["submitted_at"] = now
+
+    work_plans_col.update_one(
+        {"employee_id": uid, "date": date_str},
+        {"$set": set_fields, "$setOnInsert": {"created_at": now, "manager_comment": None}},
+        upsert=True
+    )
+
+    # On submit the plan becomes eligible for the manager's 11 AM consolidated
+    # email — the scheduled job picks up all submitted plans for the day.
+    plan = work_plans_col.find_one({"employee_id": uid, "date": date_str})
+    return jsonify(_serialize_plan(plan)), 200
+
+
+@app.route("/api/my/work-plan/<plan_id>/task/<task_id>", methods=["PUT"])
+@token_required
+def update_my_task(plan_id, task_id):
+    uid = str(request.user["_id"])
+    try:
+        obj = ObjectId(plan_id)
+    except Exception:
+        return jsonify({"message": "Invalid plan ID"}), 400
+
+    status = (request.json or {}).get("status")
+    if not status:
+        return jsonify({"message": "status is required"}), 400
+
+    result = work_plans_col.update_one(
+        {"_id": obj, "employee_id": uid},
+        {"$set": {"tasks.$[t].status": status, "updated_at": datetime.now(timezone.utc)}},
+        array_filters=[{"t.id": task_id}]
+    )
+    if result.matched_count == 0:
+        return jsonify({"message": "Plan not found or not yours"}), 404
+    plan = work_plans_col.find_one({"_id": obj})
+    return jsonify(_serialize_plan(plan)), 200
+
+
+@app.route("/api/my/work-analytics", methods=["GET"])
+@token_required
+def my_work_analytics():
+    uid = str(request.user["_id"])
+    range_key = request.args.get("range", "week")
+    today_date = _today_ist()
+    start_date = _range_start(range_key, today_date)
+
+    plans = list(work_plans_col.find({
+        "employee_id": uid,
+        "date": {"$gte": start_date.isoformat(), "$lte": today_date.isoformat()}
+    }))
+    return jsonify(_build_analytics(plans, start_date, today_date)), 200
+
+
+# ── Admin / Manager routes ───────────────────────────────────────────────────
+
+@app.route("/api/admin/work-plans", methods=["GET"])
+@token_required
+def admin_work_plans():
+    role = request.user.get("role")
+    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    if role not in ("admin", "manager") and not has_delegated:
+        return jsonify({"message": "Unauthorized"}), 403
+
+    date_str = request.args.get("date") or _today_ist().isoformat()
+    query = {"date": date_str}
+    # Managers (without delegated admin) see only their department
+    if role == "manager" and not has_delegated:
+        query["department"] = request.user.get("department")
+
+    plans = list(work_plans_col.find(query).sort("employee_name", 1))
+    checkins = _checkin_map([p["employee_id"] for p in plans], date_str)
+    rows = [_serialize_plan(p, checkin=checkins.get(p["employee_id"])) for p in plans]
+    return jsonify(rows), 200
+
+
+@app.route("/api/admin/work-analytics", methods=["GET"])
+@token_required
+def admin_work_analytics():
+    role = request.user.get("role")
+    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    if role not in ("admin", "manager") and not has_delegated:
+        return jsonify({"message": "Unauthorized"}), 403
+
+    range_key = request.args.get("range", "week")
+    today_date = _today_ist()
+    start_date = _range_start(range_key, today_date)
+
+    query = {"date": {"$gte": start_date.isoformat(), "$lte": today_date.isoformat()}}
+    if role == "manager" and not has_delegated:
+        query["department"] = request.user.get("department")
+
+    plans = list(work_plans_col.find(query))
+    return jsonify(_build_analytics(plans, start_date, today_date)), 200
+
+
+@app.route("/api/admin/work-plans/<plan_id>/comment", methods=["POST"])
+@token_required
+def comment_work_plan(plan_id):
+    role = request.user.get("role")
+    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    if role not in ("admin", "manager") and not has_delegated:
+        return jsonify({"message": "Unauthorized"}), 403
+
+    try:
+        obj = ObjectId(plan_id)
+    except Exception:
+        return jsonify({"message": "Invalid plan ID"}), 400
+
+    plan = work_plans_col.find_one({"_id": obj})
+    if not plan:
+        return jsonify({"message": "Plan not found"}), 404
+    # Managers may only comment on their own department's plans
+    if role == "manager" and not has_delegated and plan.get("department") != request.user.get("department"):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    comment = str((request.json or {}).get("comment", "")).strip()
+    work_plans_col.update_one({"_id": obj}, {"$set": {"manager_comment": comment, "updated_at": datetime.now(timezone.utc)}})
+    return jsonify({"message": "Comment saved"}), 200
+
+
+# ── Scheduled email automation ───────────────────────────────────────────────
+
+def send_daily_work_summaries():
+    """11 AM IST — email each manager their team's submitted work plans for today."""
+    print("Running Daily Work-Plan Summary Job...")
+    today_str = _today_ist().isoformat()
+
+    for m in users_col.find({"role": "manager"}, {"name": 1, "email": 1, "department": 1}):
+        dept = m.get("department")
+        if not dept or not m.get("email"):
+            continue
+
+        plans = list(work_plans_col.find({"date": today_str, "status": "submitted", "department": dept}).sort("employee_name", 1))
+        if not plans:
+            continue
+
+        checkins = _checkin_map([p["employee_id"] for p in plans], today_str)
+        lines = [
+            f"Daily Work Plan Summary — {today_str}",
+            f"Department: {dept}",
+            f"Submitted plans: {len(plans)}",
+            "",
+        ]
+        for p in plans:
+            ci = checkins.get(p["employee_id"]) or "—"
+            lines.append(f"• {p.get('employee_name', '')}  (check-in: {ci})")
+            for t in p.get("tasks", []):
+                done = "✓" if _is_task_done(t) else " "
+                lines.append(
+                    f"    [{done}] {t.get('title', '')}"
+                    f"  | priority: {t.get('priority', '-')}"
+                    f"  | est: {t.get('est_time', '-')}"
+                    f"  | project: {t.get('project', '-')}"
+                )
+            if p.get("manager_comment"):
+                lines.append(f"    ↳ comment: {p['manager_comment']}")
+            lines.append("")
+
+        body = "\n".join(lines)
+        try:
+            threading.Thread(target=send_email, args=(m["email"], f"Team Work Plans — {today_str}", body), daemon=True).start()
+        except Exception as e:
+            print(f"Daily summary email failed for {m.get('email')}: {e}")
+
+
+def send_weekly_work_reports():
+    """Monday 9 AM IST — weekly productivity report (per-dept to managers, org-wide to admins)."""
+    print("Running Weekly Work-Plan Report Job...")
+    today_date = _today_ist()
+    start_date = today_date - timedelta(days=6)
+    start_str, today_str = start_date.isoformat(), today_date.isoformat()
+
+    all_plans = list(work_plans_col.find({
+        "status": "submitted",
+        "date": {"$gte": start_str, "$lte": today_str}
+    }))
+
+    def _report_body(plans, scope_label):
+        submitted = sum(len(p.get("tasks", [])) for p in plans)
+        completed = sum(1 for p in plans for t in p.get("tasks", []) if _is_task_done(t))
+
+        by_dept, by_emp, by_proj, by_day = {}, {}, {}, {}
+        for p in plans:
+            d = p.get("department", "—")
+            by_dept[d] = by_dept.get(d, 0) + len(p.get("tasks", []))
+            name = p.get("employee_name", "—")
+            by_emp[name] = by_emp.get(name, 0) + len(p.get("tasks", []))
+            by_day[p.get("date", "")] = by_day.get(p.get("date", ""), 0) + len(p.get("tasks", []))
+            for t in p.get("tasks", []):
+                proj = (t.get("project") or "Unassigned").strip() or "Unassigned"
+                by_proj[proj] = by_proj.get(proj, 0) + 1
+
+        rate = round(completed / submitted * 100) if submitted else 0
+        top_emps = sorted(by_emp.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        lines = [
+            f"Weekly Work Report ({scope_label}) — {start_str} to {today_str}",
+            "",
+            f"Tasks submitted: {submitted}",
+            f"Tasks completed: {completed}  ({rate}%)",
+            "",
+            "Department activity:",
+        ]
+        for d, c in sorted(by_dept.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"   {d}: {c} tasks")
+        lines += ["", "Most active employees:"]
+        for name, c in top_emps:
+            lines.append(f"   {name}: {c} tasks")
+        lines += ["", "Project allocation:"]
+        for proj, c in sorted(by_proj.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"   {proj}: {c} tasks")
+        lines += ["", "Daily trend:"]
+        cur = start_date
+        while cur <= today_date:
+            lines.append(f"   {cur.strftime('%a %d')}: {by_day.get(cur.isoformat(), 0)}")
+            cur += timedelta(days=1)
+        return "\n".join(lines)
+
+    # Org-wide to every admin
+    if all_plans:
+        org_body = _report_body(all_plans, "Organisation")
+        for a in users_col.find({"role": "admin"}, {"email": 1}):
+            if a.get("email"):
+                try:
+                    threading.Thread(target=send_email, args=(a["email"], f"Weekly Work Report — {today_str}", org_body), daemon=True).start()
+                except Exception as e:
+                    print(f"Weekly admin report failed: {e}")
+
+    # Per-department to each manager
+    for m in users_col.find({"role": "manager"}, {"email": 1, "department": 1}):
+        dept = m.get("department")
+        if not dept or not m.get("email"):
+            continue
+        dept_plans = [p for p in all_plans if p.get("department") == dept]
+        if not dept_plans:
+            continue
+        body = _report_body(dept_plans, dept)
+        try:
+            threading.Thread(target=send_email, args=(m["email"], f"Weekly Work Report — {dept} — {today_str}", body), daemon=True).start()
+        except Exception as e:
+            print(f"Weekly manager report failed for {m.get('email')}: {e}")
+
+
 # Initialize the background scheduler
 try:
     scheduler = BackgroundScheduler(timezone=IST)
     scheduler.add_job(func=send_pms_reminders, trigger="cron", hour=10, minute=0)
     scheduler.add_job(func=auto_expire_grants, trigger="interval", minutes=30)
+    scheduler.add_job(func=send_daily_work_summaries, trigger="cron", hour=11, minute=0)
+    scheduler.add_job(func=send_weekly_work_reports, trigger="cron", day_of_week="mon", hour=9, minute=0)
     scheduler.start()
     print("Background Job Scheduler initialized successfully.")
 except Exception as e:
