@@ -3197,47 +3197,82 @@ def assign_course(course_id):
     if request.user.get("role") != "admin":
         return jsonify({"message": "Unauthorized"}), 403
     try:
-        ObjectId(course_id)
+        course_obj = ObjectId(course_id)
     except Exception:
         return jsonify({"message": "Invalid course ID"}), 400
-    if not lms_courses_col.find_one({"_id": ObjectId(course_id)}):
+    if not lms_courses_col.find_one({"_id": course_obj}):
         return jsonify({"message": "Course not found"}), 404
 
-    data = request.json or {}
-    department   = data.get("department")
-    employee_ids = data.get("employee_ids", [])
+    data         = request.json or {}
+    employee_ids = list(data.get("employee_ids") or [])
+    scheduled_at_raw = data.get("scheduled_at")  # ISO string or None
 
-    if department:
+    # Normalise scheduled_at → UTC datetime (store None if missing/invalid)
+    scheduled_at = None
+    if scheduled_at_raw:
+        try:
+            scheduled_at = IST.localize(
+                datetime.strptime(scheduled_at_raw[:16], "%Y-%m-%dT%H:%M")
+            ).astimezone(timezone.utc)
+        except Exception:
+            pass
+
+    # ── Department mode ───────────────────────────────────────────────────
+    # Accept both "departments" (array) and "department" (single string)
+    departments = list(data.get("departments") or [])
+    single_dept = data.get("department")
+    if single_dept and single_dept not in departments:
+        departments.append(single_dept)
+
+    if departments:
         emps = users_col.find(
-            {"role": {"$in": ["employee", "manager"]}, "department": department},
+            {"role": {"$in": ["employee", "manager"]}, "department": {"$in": departments}},
             {"_id": 1}
         )
-        employee_ids = [str(e["_id"]) for e in emps]
+        dept_emp_ids = [str(e["_id"]) for e in emps]
+        # Merge with any explicitly supplied employee_ids
+        employee_ids = list({*employee_ids, *dept_emp_ids})
+
+        # Record which departments this course is assigned to so that
+        # GET /my/lms/courses can surface it without a progress record.
+        # Also store scheduled_at at course level so ghost records (employees
+        # who join after the assignment) can inherit the schedule.
+        dept_update: dict = {"$addToSet": {"assigned_departments": {"$each": departments}}}
+        if scheduled_at:
+            dept_update["$set"] = {"dept_scheduled_at": scheduled_at}
+        lms_courses_col.update_one({"_id": course_obj}, dept_update)
 
     if not employee_ids:
         return jsonify({"message": "No employees to assign"}), 400
 
     now = datetime.now(timezone.utc)
-    assigned = 0
+    assigned = skipped = 0
     for uid in employee_ids:
         try:
-            lms_progress_col.update_one(
+            result = lms_progress_col.update_one(
                 {"course_id": course_id, "user_id": uid},
                 {"$setOnInsert": {
-                    "course_id":   course_id,
-                    "user_id":     uid,
-                    "status":      "Assigned",
+                    "course_id":    course_id,
+                    "user_id":      uid,
+                    "status":       "Assigned",
                     "progress_pct": 0,
-                    "assigned_at": now,
+                    "assigned_at":  now,
+                    "scheduled_at": scheduled_at,
                     "completed_at": None,
                 }},
                 upsert=True
             )
-            assigned += 1
+            if result.upserted_id:
+                assigned += 1
+            else:
+                skipped += 1   # already assigned — don't overwrite progress
         except Exception:
             pass
 
-    return jsonify({"message": f"Course assigned to {assigned} employee(s)"}), 200
+    msg = f"Course assigned to {assigned} employee(s)"
+    if skipped:
+        msg += f" ({skipped} already assigned, skipped)"
+    return jsonify({"message": msg, "assigned": assigned, "skipped": skipped}), 200
 
 
 @app.route("/api/admin/lms/progress", methods=["GET"])
@@ -3573,31 +3608,54 @@ def my_referrals():
 @app.route("/api/my/lms/courses", methods=["GET"])
 @token_required
 def my_lms_courses():
-    """Returns courses assigned to the logged-in employee with per-lesson completion state."""
+    """Returns courses assigned to the logged-in employee with per-lesson completion state.
+    Courses with a future scheduled_at are hidden until that time arrives."""
     uid  = str(request.user["_id"])
     dept = request.user.get("department")
+    now_utc = datetime.now(timezone.utc)
 
     # Collect all progress records for this employee (covers both direct and dept assignments)
     progress_records = list(lms_progress_col.find({"user_id": uid}))
 
+    def _is_available(sched):
+        """Return True if the schedule time has passed (or there is no schedule)."""
+        if not sched:
+            return True
+        # MongoDB returns naive UTC datetimes; make them aware before comparing
+        if sched.tzinfo is None:
+            sched = sched.replace(tzinfo=timezone.utc)
+        return sched <= now_utc
+
+    # Filter out records that are scheduled for the future
+    progress_records = [r for r in progress_records if _is_available(r.get("scheduled_at"))]
+
     # Also surface any courses assigned to this employee's department that have no
-    # progress record yet (assigned but never opened)
+    # progress record yet (assigned but never opened). Check dept_scheduled_at on
+    # the course doc to honour schedules for ghost records.
     assigned_course_ids = {r["course_id"] for r in progress_records}
     if dept:
-        dept_courses = lms_courses_col.find({"assigned_departments": dept}, {"_id": 1})
+        dept_courses = lms_courses_col.find(
+            {"assigned_departments": dept},
+            {"_id": 1, "dept_scheduled_at": 1}
+        )
         for c in dept_courses:
             cid = str(c["_id"])
-            if cid not in assigned_course_ids:
-                progress_records.append({
-                    "course_id":         cid,
-                    "user_id":           uid,
-                    "status":            "Assigned",
-                    "progress_pct":      0,
-                    "completed_lessons": [],
-                    "assigned_at":       None,
-                    "completed_at":      None,
-                    "last_activity":     None,
-                })
+            if cid in assigned_course_ids:
+                continue
+            dept_sched = c.get("dept_scheduled_at")
+            if not _is_available(dept_sched):
+                continue  # not yet time to show this course
+            progress_records.append({
+                "course_id":         cid,
+                "user_id":           uid,
+                "status":            "Assigned",
+                "progress_pct":      0,
+                "completed_lessons": [],
+                "assigned_at":       None,
+                "scheduled_at":      dept_sched,
+                "completed_at":      None,
+                "last_activity":     None,
+            })
 
     if not progress_records:
         return jsonify([]), 200
@@ -3658,6 +3716,7 @@ def my_lms_courses():
             "status":            prog.get("status", "Assigned"),
             "last_activity":     prog.get("last_activity"),
             "assigned_at":       prog.get("assigned_at"),
+            "scheduled_at":      prog.get("scheduled_at"),
             "completed_at":      prog.get("completed_at"),
         })
 
