@@ -4,8 +4,9 @@ import requests
 
 BREVO_URL = "https://api.brevo.com/v3/smtp/email"
 
-def send_email(to_email: str, subject: str, body: str, from_name="GDMR Connect"):
-    """Send email via Brevo API. Returns True on success, False on failure."""
+def send_email(to_email: str, subject: str, body: str, from_name="GDMR Connect", html_body: str = None):
+    """Send email via Brevo API. Returns True on success, False on failure.
+    Pass html_body to send an HTML email; body is used as the plain-text fallback."""
 
     # Read fresh every call — avoids the import-time race with load_dotenv()
     api_key = os.getenv("BREVO_API_KEY")
@@ -24,8 +25,12 @@ def send_email(to_email: str, subject: str, body: str, from_name="GDMR Connect")
         "sender": {"name": from_name, "email": "connect.gdmr@gmail.com"},
         "to": [{"email": to_email}],
         "subject": subject,
-        "textContent": body
     }
+    if html_body:
+        payload["htmlContent"] = html_body
+        payload["textContent"] = body   # plain-text fallback for email clients that don't render HTML
+    else:
+        payload["textContent"] = body
 
     try:
         res = requests.post(BREVO_URL, headers=headers, json=payload, timeout=10)

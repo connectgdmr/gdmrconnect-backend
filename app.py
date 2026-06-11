@@ -145,6 +145,9 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # Application Timezone Context (Strict enforcement to avoid UTC drift)
 IST = pytz.timezone('Asia/Kolkata')
 
+# Company owners — always receive org-wide work plan summaries
+OWNER_EMAILS = ["gina.gdmr@gmail.com", "githi@gdmrfoundation.com"]
+
 # =============================================================================
 # CREATE INDEXES (run once at startup; background=True means no lock)
 # =============================================================================
@@ -2580,91 +2583,125 @@ def today_stats():
 @app.route("/api/admin/attendance-summary", methods=["GET"])
 @token_required
 def attendance_summary():
-    """ Aggregates full monthly attendance records for the reporting tool. """
+    """Monthly attendance breakdown — every employee classified into exactly one
+    bucket per day: present | leave | not_checked_in (today only) | absent."""
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
-    
     if role != "admin" and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     month_param = request.args.get("month")
-    if not month_param: return jsonify({"message": "month required"}), 400
+    if not month_param:
+        return jsonify({"message": "month required"}), 400
 
     year, month_num = map(int, month_param.split("-"))
     start = IST.localize(datetime(year, month_num, 1))
-    end = IST.localize(datetime(year + (month_num // 12), (month_num % 12) + 1, 1))
-
-    employees = list(users_col.find({"role": {"$in": ["employee", "manager"]}}, {"name": 1}))
-    emp_ids = [str(e["_id"]) for e in employees]
-    emp_names = {str(e["_id"]): e.get("name", "") for e in employees}
-
+    end   = IST.localize(datetime(year + (month_num // 12), (month_num % 12) + 1, 1))
     start_str = start.date().isoformat()
-    end_str = (end - timedelta(days=1)).date().isoformat()
-
-    # Regex match on the date string field — avoids BSON type-comparison issues
-    # that cause $gte/$lte to silently return 0 results
-    all_recs = list(attendance_col.find({"date": {"$regex": f"^{month_param}"}}))
-    recs_by_date = {}
-    for rec in all_recs:
-        recs_by_date.setdefault(rec["date"], []).append(rec)
-
-    all_leaves = list(leaves_col.find({
-        "from_date": {"$lte": end_str},
-        "to_date": {"$gte": start_str},
-        "status": {"$in": ["Approved", "Absent"]}
-    }))
-
+    end_str   = (end - timedelta(days=1)).date().isoformat()
     today_str = str(datetime.now(IST).date())
 
-    summary = {"total_employees": len(employees), "days": {}}
+    # ── 1. Employee roster (fetch only fields we need) ────────────────────
+    employees = list(users_col.find(
+        {"role": {"$in": ["employee", "manager"]}},
+        {"name": 1, "joined_at": 1, "resignation": 1, "extended_leaves": 1}
+    ))
+    emp_names = {str(e["_id"]): e.get("name", "") for e in employees}
+
+    def _date_str(val):
+        """Coerce datetime / date / ISO-string to YYYY-MM-DD string, or None."""
+        if val is None:
+            return None
+        if hasattr(val, "date"):        # datetime object
+            return val.date().isoformat()
+        return str(val)[:10]
+
+    # ── 2. Pre-index check-ins by date → set of user_ids ─────────────────
+    all_recs = attendance_col.find({"date": {"$regex": f"^{month_param}"}, "type": "checkin"})
+    checkins_by_date: dict[str, set] = {}
+    for rec in all_recs:
+        checkins_by_date.setdefault(rec["date"], set()).add(rec["user_id"])
+
+    # ── 3. Pre-index standard leaves by user_id ───────────────────────────
+    all_leaves = list(leaves_col.find({
+        "from_date": {"$lte": end_str},
+        "to_date":   {"$gte": start_str},
+        "status":    {"$nin": ["Rejected"]},
+    }))
+    leaves_by_uid: dict[str, list] = {}
+    for lv in all_leaves:
+        leaves_by_uid.setdefault(lv["user_id"], []).append(lv)
+
+    # ── 4. Day loop ───────────────────────────────────────────────────────
+    summary: dict = {"total_employees": len(employees), "days": {}}
 
     curr = start
     while curr < end:
-        day_str = curr.date().isoformat()
-        is_weekend = curr.weekday() >= 5   # 5 = Saturday, 6 = Sunday
-        recs = recs_by_date.get(day_str, [])
-        present = {r["user_id"] for r in recs if r["type"] == "checkin"}
+        day_str    = curr.date().isoformat()
+        curr      += timedelta(days=1)          # advance early so we can `continue` safely
 
-        leave_ids = set()
-        leave_names = []
-        for l in all_leaves:
-            if l.get("from_date", "") <= day_str <= l.get("to_date", ""):
-                uid = l["user_id"]
-                leave_ids.add(uid)
-                name = emp_names.get(uid)
-                if name:
-                    leave_names.append(name)
+        if day_str > today_str:                 # skip future dates entirely
+            continue
 
-        # Everyone not present and not on leave for this day
-        remaining = set(emp_ids) - present - leave_ids
+        is_weekend = datetime.strptime(day_str, "%Y-%m-%d").weekday() >= 5
+        is_today   = day_str == today_str
+        day_checkins = checkins_by_date.get(day_str, set())
 
-        # Classify the leftover bucket by day type:
-        #  - today          → still in progress, so "not checked in"
-        #  - past weekday    → concluded with no check-in/leave → "absent"
-        #  - past weekend    → no expectation to work → neither (NOTE: public
-        #    holidays aren't tracked in the backend yet, so they currently
-        #    count as working days; add a holidays collection to exclude them)
-        #  - future day      → nothing concluded → neither
-        absent = []
-        not_checked_in = []
-        if day_str == today_str:
-            not_checked_in = list(remaining)
-        elif day_str < today_str and not is_weekend:
-            absent = list(remaining)
+        present_ids, leave_ids, absent_ids, nci_ids = [], [], [], []
+
+        for emp in employees:
+            uid = str(emp["_id"])
+
+            # Gate — employee hadn't joined yet on this day
+            joined = _date_str(emp.get("joined_at"))
+            if joined and day_str < joined:
+                continue
+
+            # Gate — employee already off-boarded before this day
+            resignation = emp.get("resignation") or {}
+            lwd = _date_str(resignation.get("last_working_day"))
+            if lwd and day_str > lwd:
+                continue
+
+            # ── Bucket classification (strict priority order) ────────────
+            # 1) Present — checked in
+            if uid in day_checkins:
+                present_ids.append(uid)
+                continue
+
+            # 2) Leave — approved standard leave OR active extended leave
+            on_leave = any(
+                lv.get("from_date", "") <= day_str <= lv.get("to_date", "")
+                for lv in leaves_by_uid.get(uid, [])
+            )
+            if not on_leave:
+                for el in (emp.get("extended_leaves") or []):
+                    el_from = _date_str(el.get("from_date"))
+                    el_to   = _date_str(el.get("to_date"))
+                    if el_from and el_to and el_from <= day_str <= el_to:
+                        on_leave = True
+                        break
+            if on_leave:
+                leave_ids.append(uid)
+                continue
+
+            # 3) Not-checked-in (today still in progress) or Absent (past weekday)
+            if is_today:
+                nci_ids.append(uid)
+            elif not is_weekend:
+                absent_ids.append(uid)
+            # weekend with no check-in and no leave → no bucket (not expected to work)
+
+        def _names(ids):
+            return [emp_names[uid] for uid in ids if emp_names.get(uid)]
 
         summary["days"][day_str] = {
-            "present": list(present),
-            "present_count": len(present),
-            "absent": absent,
-            "absent_count": len(absent),
-            "leave": list(leave_ids),
-            "leave_count": len(leave_ids),
-            "leave_names": leave_names,
-            "not_checked_in": not_checked_in,
-            "not_checked_in_count": len(not_checked_in),
-            "is_weekend": is_weekend,
+            "present":            present_ids,   "present_count":        len(present_ids),  "present_names":        _names(present_ids),
+            "leave":              leave_ids,     "leave_count":          len(leave_ids),    "leave_names":          _names(leave_ids),
+            "absent":             absent_ids,    "absent_count":         len(absent_ids),   "absent_names":         _names(absent_ids),
+            "not_checked_in":     nci_ids,       "not_checked_in_count": len(nci_ids),      "not_checked_in_names": _names(nci_ids),
+            "is_weekend":         is_weekend,
         }
-        curr += timedelta(days=1)
 
     return jsonify(summary), 200
 
@@ -4190,12 +4227,14 @@ def send_daily_work_summaries():
     print("Running Daily Work-Plan Summary Job...")
     today_str = _today_ist().isoformat()
 
+    all_today_plans = list(work_plans_col.find({"date": today_str, "status": "submitted"}).sort([("department", 1), ("employee_name", 1)]))
+
     for m in users_col.find({"role": "manager"}, {"name": 1, "email": 1, "department": 1}):
         dept = m.get("department")
         if not dept or not m.get("email"):
             continue
 
-        plans = list(work_plans_col.find({"date": today_str, "status": "submitted", "department": dept}).sort("employee_name", 1))
+        plans = [p for p in all_today_plans if p.get("department") == dept]
         if not plans:
             continue
 
@@ -4226,6 +4265,126 @@ def send_daily_work_summaries():
             threading.Thread(target=send_email, args=(m["email"], f"Team Work Plans — {today_str}", body), daemon=True).start()
         except Exception as e:
             print(f"Daily summary email failed for {m.get('email')}: {e}")
+
+
+def send_owner_daily_digest():
+    """11:30 AM IST — HTML digest to company owners: every submitted plan grouped by department."""
+    print("Running Owner Daily Digest Job...")
+    today_str = _today_ist().isoformat()
+
+    plans = list(work_plans_col.find(
+        {"date": today_str, "status": "submitted"}
+    ).sort([("department", 1), ("employee_name", 1)]))
+
+    if not plans:
+        print("Owner digest: no submitted plans today, skipping.")
+        return
+
+    # Build role map so we can show Employee / Manager next to each name
+    all_uids = [p["employee_id"] for p in plans]
+    role_map = {
+        str(u["_id"]): u.get("role", "employee").capitalize()
+        for u in users_col.find({"_id": {"$in": [ObjectId(uid) for uid in all_uids if uid]}}, {"role": 1})
+    }
+    checkins = _checkin_map(all_uids, today_str)
+
+    # Group plans by department
+    by_dept: dict = {}
+    for p in plans:
+        dept = (p.get("department") or "—").strip()
+        by_dept.setdefault(dept, []).append(p)
+
+    # ── Build plain-text fallback ──────────────────────────────────────────
+    txt_lines = [f"Daily Work Updates — {today_str}", f"Total plans: {len(plans)}", ""]
+    for dept, dept_plans in by_dept.items():
+        txt_lines.append(f"=== {dept.upper()} ===")
+        for p in dept_plans:
+            uid = p["employee_id"]
+            role = role_map.get(uid, "Employee")
+            ci = checkins.get(uid) or "not checked in"
+            txt_lines.append(f"  {p.get('employee_name', '')} ({role}) · check-in: {ci}")
+            for t in p.get("tasks", []):
+                done = "✓" if _is_task_done(t) else "○"
+                pri = t.get("priority", "")
+                txt_lines.append(f"    {done} {t.get('title', '')}{'  [' + pri + ']' if pri else ''}")
+            if p.get("manager_comment"):
+                txt_lines.append(f"    ↳ {p['manager_comment']}")
+            txt_lines.append("")
+        txt_lines.append("")
+    plain_body = "\n".join(txt_lines)
+
+    # ── Build HTML body ────────────────────────────────────────────────────
+    PRIORITY_COLOR = {"High": "#e53e3e", "Medium": "#d97706", "Low": "#16a34a"}
+
+    dept_html_parts = []
+    for dept, dept_plans in by_dept.items():
+        rows = []
+        for p in dept_plans:
+            uid = p["employee_id"]
+            role = role_map.get(uid, "Employee")
+            ci = checkins.get(uid) or "not checked in"
+            task_items = []
+            for t in p.get("tasks", []):
+                done = _is_task_done(t)
+                pri = (t.get("priority") or "").strip()
+                color = PRIORITY_COLOR.get(pri, "#6b7280")
+                badge = f'<span style="background:{color};color:#fff;font-size:10px;padding:1px 6px;border-radius:10px;margin-left:6px;">{pri}</span>' if pri else ""
+                check = "✓" if done else "○"
+                style = "color:#16a34a;font-weight:600;" if done else "color:#374151;"
+                est = f'<span style="color:#9ca3af;font-size:11px;"> · {t["est_time"]}</span>' if t.get("est_time") else ""
+                proj = f'<span style="color:#9ca3af;font-size:11px;"> · {t["project"]}</span>' if t.get("project") else ""
+                task_items.append(
+                    f'<li style="margin:3px 0;{style}">{check} {t.get("title","")}{badge}{est}{proj}</li>'
+                )
+            tasks_html = f'<ul style="margin:6px 0 6px 16px;padding:0;list-style:none;">{"".join(task_items)}</ul>' if task_items else ""
+            comment_html = (
+                f'<div style="margin:4px 0 0 16px;color:#6b7280;font-size:12px;font-style:italic;">↳ {p["manager_comment"]}</div>'
+                if p.get("manager_comment") else ""
+            )
+            rows.append(f"""
+            <div style="border:1px solid #e5e7eb;border-radius:8px;padding:12px 16px;margin-bottom:10px;background:#fff;">
+              <div style="font-weight:600;color:#111827;">{p.get("employee_name","")}</div>
+              <div style="font-size:12px;color:#6b7280;margin-bottom:6px;">{role} · checked in: {ci}</div>
+              {tasks_html}{comment_html}
+            </div>""")
+
+        dept_html_parts.append(f"""
+        <div style="margin-bottom:28px;">
+          <h3 style="margin:0 0 10px;font-size:13px;font-weight:700;letter-spacing:.08em;
+                     color:#fff;background:#1f2937;padding:6px 14px;border-radius:6px;
+                     text-transform:uppercase;">{dept}</h3>
+          {"".join(rows)}
+        </div>""")
+
+    html_body = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+             background:#f3f4f6;margin:0;padding:20px;">
+  <div style="max-width:640px;margin:0 auto;">
+    <div style="background:#1f2937;color:#fff;padding:20px 24px;border-radius:10px 10px 0 0;">
+      <div style="font-size:11px;text-transform:uppercase;letter-spacing:.1em;opacity:.7;">GDMR Foundation</div>
+      <h1 style="margin:4px 0 0;font-size:20px;">Daily Work Updates</h1>
+      <div style="font-size:13px;opacity:.8;margin-top:4px;">{today_str} &nbsp;·&nbsp; {len(plans)} plans submitted</div>
+    </div>
+    <div style="background:#f9fafb;padding:20px 24px;border-radius:0 0 10px 10px;border:1px solid #e5e7eb;border-top:none;">
+      {"".join(dept_html_parts)}
+    </div>
+    <div style="text-align:center;font-size:11px;color:#9ca3af;margin-top:12px;">
+      GDMR Connect HRMS &nbsp;·&nbsp; Automated daily digest
+    </div>
+  </div>
+</body></html>"""
+
+    for email in OWNER_EMAILS:
+        try:
+            threading.Thread(
+                target=send_email,
+                args=(email, f"Daily Work Updates — {today_str}", plain_body),
+                kwargs={"html_body": html_body},
+                daemon=True
+            ).start()
+        except Exception as e:
+            print(f"Owner daily digest failed for {email}: {e}")
 
 
 def send_weekly_work_reports():
@@ -4281,15 +4440,19 @@ def send_weekly_work_reports():
             cur += timedelta(days=1)
         return "\n".join(lines)
 
-    # Org-wide to every admin
+    # Org-wide to every admin and to company owners
     if all_plans:
         org_body = _report_body(all_plans, "Organisation")
-        for a in users_col.find({"role": "admin"}, {"email": 1}):
-            if a.get("email"):
-                try:
-                    threading.Thread(target=send_email, args=(a["email"], f"Weekly Work Report — {today_str}", org_body), daemon=True).start()
-                except Exception as e:
-                    print(f"Weekly admin report failed: {e}")
+        recipients = [a["email"] for a in users_col.find({"role": "admin"}, {"email": 1}) if a.get("email")]
+        # Add owners, deduplicating in case an owner is also an admin user
+        for email in OWNER_EMAILS:
+            if email not in recipients:
+                recipients.append(email)
+        for email in recipients:
+            try:
+                threading.Thread(target=send_email, args=(email, f"Weekly Work Report — {today_str}", org_body), daemon=True).start()
+            except Exception as e:
+                print(f"Weekly org report failed for {email}: {e}")
 
     # Per-department to each manager
     for m in users_col.find({"role": "manager"}, {"email": 1, "department": 1}):
@@ -4312,7 +4475,8 @@ try:
     scheduler.add_job(func=send_pms_reminders, trigger="cron", hour=10, minute=0)
     scheduler.add_job(func=auto_expire_grants, trigger="interval", minutes=30)
     scheduler.add_job(func=send_daily_work_summaries, trigger="cron", hour=11, minute=0)
-    scheduler.add_job(func=send_weekly_work_reports, trigger="cron", day_of_week="mon", hour=9, minute=0)
+    scheduler.add_job(func=send_owner_daily_digest,   trigger="cron", hour=11, minute=30)
+    scheduler.add_job(func=send_weekly_work_reports,  trigger="cron", day_of_week="mon", hour=9, minute=0)
     scheduler.start()
     print("Background Job Scheduler initialized successfully.")
 except Exception as e:
