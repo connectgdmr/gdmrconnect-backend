@@ -4173,6 +4173,8 @@ def upsert_my_work_plan():
     return jsonify(_serialize_plan(plan)), 200
 
 
+TASK_STATUSES = ("Pending", "Started", "In Progress", "Completed")
+
 @app.route("/api/my/work-plan/<plan_id>/task/<task_id>", methods=["PUT"])
 @token_required
 def update_my_task(plan_id, task_id):
@@ -4185,16 +4187,70 @@ def update_my_task(plan_id, task_id):
     status = (request.json or {}).get("status")
     if not status:
         return jsonify({"message": "status is required"}), 400
+    if status not in TASK_STATUSES:
+        return jsonify({"message": f"status must be one of: {', '.join(TASK_STATUSES)}"}), 400
 
+    now = datetime.now(timezone.utc)
+    update_doc = {"$set": {"tasks.$[t].status": status, "updated_at": now}}
+
+    # Tasks may store their id as "id" or "_id" — try both
     result = work_plans_col.update_one(
         {"_id": obj, "employee_id": uid},
-        {"$set": {"tasks.$[t].status": status, "updated_at": datetime.now(timezone.utc)}},
+        update_doc,
         array_filters=[{"t.id": task_id}]
     )
     if result.matched_count == 0:
         return jsonify({"message": "Plan not found or not yours"}), 404
+    if result.modified_count == 0:
+        # Plan exists but t.id didn't match — try t._id
+        work_plans_col.update_one(
+            {"_id": obj, "employee_id": uid},
+            update_doc,
+            array_filters=[{"t._id": task_id}]
+        )
+
     plan = work_plans_col.find_one({"_id": obj})
     return jsonify(_serialize_plan(plan)), 200
+
+
+@app.route("/api/my/work-plans", methods=["GET"])
+@token_required
+def my_work_plans_history():
+    """Work history for the logged-in employee. range=week|month|all (default: week)."""
+    uid       = str(request.user["_id"])
+    range_key = request.args.get("range", "week")
+    today     = _today_ist()
+
+    query: dict = {"employee_id": uid}
+    if range_key == "week":
+        query["date"] = {"$gte": (today - timedelta(days=6)).isoformat(), "$lte": today.isoformat()}
+    elif range_key == "month":
+        query["date"] = {"$gte": (today - timedelta(days=29)).isoformat(), "$lte": today.isoformat()}
+    # range_key == "all" → no date filter
+
+    plans = work_plans_col.find(query, {
+        "_id": 1, "date": 1, "status": 1, "tasks": 1
+    }).sort("date", -1)
+
+    result = []
+    for p in plans:
+        result.append({
+            "_id":    str(p["_id"]),
+            "date":   p.get("date"),
+            "status": p.get("status"),
+            "tasks":  [
+                {
+                    "id":       t.get("id") or t.get("_id", ""),
+                    "title":    t.get("title", ""),
+                    "priority": t.get("priority", ""),
+                    "project":  t.get("project", ""),
+                    "est_time": t.get("est_time", ""),
+                    "status":   t.get("status", "Pending"),
+                }
+                for t in (p.get("tasks") or [])
+            ],
+        })
+    return jsonify(result), 200
 
 
 @app.route("/api/my/work-analytics", methods=["GET"])
