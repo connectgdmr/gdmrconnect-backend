@@ -3137,6 +3137,7 @@ def create_course():
     title = str(data.get("title", "")).strip()
     if not title:
         return jsonify({"message": "title is required"}), 400
+    expiry_raw = data.get("expiry_date")
     doc = {
         "title":         title,
         "description":   str(data.get("description", "")).strip(),
@@ -3145,6 +3146,7 @@ def create_course():
         "content_url":   str(data.get("content_url", "")).strip(),
         "tags":          data.get("tags", []),
         "modules":       _normalize_modules(data.get("modules", [])),
+        "expiry_date":   str(expiry_raw)[:10] if expiry_raw else None,
         "created_by":    str(request.user["_id"]),
         "created_at":    datetime.now(timezone.utc),
     }
@@ -3169,6 +3171,9 @@ def update_course(course_id):
             update[k] = data[k]
     if "modules" in data:
         update["modules"] = _normalize_modules(data.get("modules", []))
+    if "expiry_date" in data:
+        expiry_raw = data["expiry_date"]
+        update["expiry_date"] = str(expiry_raw)[:10] if expiry_raw else None
     result = lms_courses_col.update_one({"_id": obj}, {"$set": update})
     if result.matched_count == 0:
         return jsonify({"message": "Course not found"}), 404
@@ -3612,7 +3617,13 @@ def my_lms_courses():
     Courses with a future scheduled_at are hidden until that time arrives."""
     uid  = str(request.user["_id"])
     dept = request.user.get("department")
-    now_utc = datetime.now(timezone.utc)
+    now_utc   = datetime.now(timezone.utc)
+    today_iso = _today_ist().isoformat()
+    not_expired = {"$or": [
+        {"expiry_date": None},
+        {"expiry_date": {"$exists": False}},
+        {"expiry_date": {"$gte": today_iso}},
+    ]}
 
     # Collect all progress records for this employee (covers both direct and dept assignments)
     progress_records = list(lms_progress_col.find({"user_id": uid}))
@@ -3635,7 +3646,7 @@ def my_lms_courses():
     assigned_course_ids = {r["course_id"] for r in progress_records}
     if dept:
         dept_courses = lms_courses_col.find(
-            {"assigned_departments": dept},
+            {"assigned_departments": dept, **not_expired},
             {"_id": 1, "dept_scheduled_at": 1}
         )
         for c in dept_courses:
@@ -3665,7 +3676,10 @@ def my_lms_courses():
         try: course_ids.append(ObjectId(r["course_id"]))
         except Exception: pass
 
-    courses = {str(c["_id"]): c for c in lms_courses_col.find({"_id": {"$in": course_ids}})}
+    courses = {
+        str(c["_id"]): c
+        for c in lms_courses_col.find({"_id": {"$in": course_ids}, **not_expired})
+    }
 
     result = []
     for prog in progress_records:
