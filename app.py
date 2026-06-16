@@ -138,6 +138,9 @@ payslips_col          = db["payslips"]
 # --- Work Plans Module ---
 work_plans_col        = db["work_plans"]
 
+# --- Clients ---
+clients_col           = db["clients"]
+
 # Local Upload Fallback Directory (Used if Cloudinary is unavailable)
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -183,6 +186,7 @@ try:
     work_plans_col.create_index([("employee_id", 1), ("date", 1)], unique=True, background=True)
     work_plans_col.create_index([("date", 1), ("status", 1)], background=True)
     work_plans_col.create_index([("department", 1), ("date", 1)], background=True)
+    clients_col.create_index("name", unique=True, background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
@@ -4257,6 +4261,64 @@ def update_my_task(plan_id, task_id):
     return jsonify(_serialize_plan(plan)), 200
 
 
+# =============================================================================
+# CLIENTS
+# =============================================================================
+
+@app.route("/api/clients", methods=["GET"])
+@token_required
+def list_clients():
+    """All authenticated roles can read the client list."""
+    rows = []
+    for c in clients_col.find().sort("name", 1):
+        task_count = work_plans_col.count_documents({"tasks.client": c.get("name")})
+        rows.append({
+            "_id":         str(c["_id"]),
+            "name":        c.get("name", ""),
+            "description": c.get("description", ""),
+            "task_count":  task_count,
+        })
+    return jsonify(rows), 200
+
+
+@app.route("/api/admin/clients", methods=["POST"])
+@token_required
+def create_client():
+    role = request.user.get("role")
+    if role not in ("admin", "manager"):
+        return jsonify({"message": "Unauthorized"}), 403
+    data = request.json or {}
+    name = str(data.get("name", "")).strip()
+    if not name:
+        return jsonify({"message": "name is required"}), 400
+    try:
+        res = clients_col.insert_one({
+            "name":        name,
+            "description": str(data.get("description", "")).strip(),
+            "created_by":  str(request.user["_id"]),
+            "created_at":  datetime.now(timezone.utc),
+        })
+    except Exception:
+        return jsonify({"message": "A client with that name already exists"}), 409
+    return jsonify({"message": "Client created", "_id": str(res.inserted_id), "name": name}), 201
+
+
+@app.route("/api/admin/clients/<client_id>", methods=["DELETE"])
+@token_required
+def delete_client(client_id):
+    role = request.user.get("role")
+    if role not in ("admin", "manager"):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(client_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    result = clients_col.delete_one({"_id": obj})
+    if result.deleted_count == 0:
+        return jsonify({"message": "Client not found"}), 404
+    return jsonify({"message": "Client deleted"}), 200
+
+
 @app.route("/api/my/work-plans", methods=["GET"])
 @token_required
 def my_work_plans_history():
@@ -4288,6 +4350,7 @@ def my_work_plans_history():
                     "title":    t.get("title", ""),
                     "priority": t.get("priority", ""),
                     "project":  t.get("project", ""),
+                    "client":   t.get("client", ""),
                     "est_time": t.get("est_time", ""),
                     "status":   t.get("status", "Pending"),
                 }
