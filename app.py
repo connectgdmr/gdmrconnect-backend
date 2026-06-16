@@ -1111,8 +1111,13 @@ def grant_access():
     if not emp or emp.get("role") == "admin":
         return jsonify({"message": "Invalid employee or employee is already an admin."}), 400
 
+    module = data.get("module", "attendance")
+    if module not in ("attendance", "lms"):
+        module = "attendance"
+
     grant_record = {
         "employee_id": emp_id,
+        "module": module,
         "access_level": access_level,
         "scope": scope,
         "custom_date": custom_date,
@@ -3102,11 +3107,36 @@ def submit_assessment():
 # LMS MODULE
 # =============================================================================
 
+def _get_lms_grant(user):
+    """Return active LMS grant for this user, or None."""
+    return access_grants_col.find_one({
+        "employee_id": str(user["_id"]),
+        "is_active": True,
+        "module": "lms",
+    })
+
+
+def _require_lms(user, write=False):
+    """
+    Check LMS access for non-admin users.
+    Returns (grant, error_response) — error_response is None if access is allowed.
+    write=True requires access_level="view_edit"; write=False allows view_only too.
+    """
+    if user.get("role") == "admin":
+        return None, None
+    grant = _get_lms_grant(user)
+    if not grant:
+        return None, (jsonify({"message": "Unauthorized"}), 403)
+    if write and grant.get("access_level") != "view_edit":
+        return None, (jsonify({"message": "Read-only LMS access — cannot modify"}), 403)
+    return grant, None
+
+
 @app.route("/api/admin/lms/courses", methods=["GET"])
 @token_required
 def list_courses():
-    if request.user.get("role") != "admin":
-        return jsonify({"message": "Unauthorized"}), 403
+    _, err = _require_lms(request.user)
+    if err: return err
     rows = []
     for c in lms_courses_col.find().sort("created_at", -1):
         c["_id"] = str(c["_id"])
@@ -3131,8 +3161,8 @@ def _normalize_modules(modules):
 @app.route("/api/admin/lms/courses", methods=["POST"])
 @token_required
 def create_course():
-    if request.user.get("role") != "admin":
-        return jsonify({"message": "Unauthorized"}), 403
+    _, err = _require_lms(request.user, write=True)
+    if err: return err
     data = request.json or {}
     title = str(data.get("title", "")).strip()
     if not title:
@@ -3158,8 +3188,8 @@ def create_course():
 @app.route("/api/admin/lms/courses/<course_id>", methods=["PUT"])
 @token_required
 def update_course(course_id):
-    if request.user.get("role") != "admin":
-        return jsonify({"message": "Unauthorized"}), 403
+    _, err = _require_lms(request.user, write=True)
+    if err: return err
     try:
         obj = ObjectId(course_id)
     except Exception:
@@ -3183,8 +3213,8 @@ def update_course(course_id):
 @app.route("/api/admin/lms/courses/<course_id>", methods=["DELETE"])
 @token_required
 def delete_course(course_id):
-    if request.user.get("role") != "admin":
-        return jsonify({"message": "Unauthorized"}), 403
+    _, err = _require_lms(request.user, write=True)
+    if err: return err
     try:
         obj = ObjectId(course_id)
     except Exception:
@@ -3199,8 +3229,8 @@ def delete_course(course_id):
 @app.route("/api/admin/lms/courses/<course_id>/assign", methods=["POST"])
 @token_required
 def assign_course(course_id):
-    if request.user.get("role") != "admin":
-        return jsonify({"message": "Unauthorized"}), 403
+    _, err = _require_lms(request.user, write=True)
+    if err: return err
     try:
         course_obj = ObjectId(course_id)
     except Exception:
@@ -3283,8 +3313,8 @@ def assign_course(course_id):
 @app.route("/api/admin/lms/progress", methods=["GET"])
 @token_required
 def lms_progress():
-    if request.user.get("role") != "admin":
-        return jsonify({"message": "Unauthorized"}), 403
+    _, err = _require_lms(request.user)
+    if err: return err
     course_id = request.args.get("course_id")
     query = {"course_id": course_id} if course_id else {}
     rows = list(lms_progress_col.find(query))
