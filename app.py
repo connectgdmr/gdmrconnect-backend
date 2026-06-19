@@ -4563,9 +4563,8 @@ def ats_doc_request(candidate_id):
          "$push": {"documents": {"$each": new_entries}}},
     )
 
-    frontend_url = os.getenv("FRONTEND_URL", "https://connect.gdmrfoundation.com")
-    upload_link  = f"{frontend_url}/ats/documents/{token}"
-    doc_list     = "\n".join(f"  • {d}" for d in required_docs)
+    upload_link = f"https://www.gdmrconnect.com/documents/{token}"
+    doc_list    = "\n".join(f"  • {d}" for d in required_docs)
     body = (
         f"Dear {candidate.get('name', 'Candidate')},\n\n"
         f"As part of the hiring process at GDMR Foundation, please upload the following documents:\n\n"
@@ -4689,57 +4688,125 @@ def ats_get_doc_checklist(doc_token):
     """Return the document checklist for this candidate (no auth — token is the credential)."""
     c = ats_candidates_col.find_one(
         {"doc_token": doc_token},
-        {"name": 1, "email": 1, "documents": 1}
+        {"name": 1, "role": 1, "documents": 1}
     )
     if not c:
         return jsonify({"message": "Invalid or expired link"}), 404
-    return jsonify({"name": c.get("name"), "documents": c.get("documents", [])}), 200
+    docs = c.get("documents") or []
+    return jsonify({
+        "candidate_name": c.get("name", ""),
+        "job_role":       c.get("role", ""),
+        "required":       [d["name"] for d in docs if d.get("required")],
+        "documents":      [{"name": d.get("name"), "url": d.get("url"), "status": d.get("status")} for d in docs],
+    }), 200
 
 
 @app.route("/api/ats/documents/<doc_token>", methods=["POST"])
 def ats_upload_doc(doc_token):
-    """Candidate uploads a document via their secure link."""
+    """Candidate uploads a document via their secure link (multipart: document=<file>, doc_name=<str>)."""
     c = ats_candidates_col.find_one({"doc_token": doc_token}, {"_id": 1, "documents": 1})
     if not c:
         return jsonify({"message": "Invalid or expired link"}), 404
 
     doc_name = (request.form.get("doc_name") or "").strip()
-    file     = request.files.get("file")
+    file     = request.files.get("document")
     if not doc_name or not file:
-        return jsonify({"message": "doc_name and file are required"}), 400
+        return jsonify({"message": "doc_name and document are required"}), 400
 
-    # Validate: PDF / image only, 10 MB cap
-    allowed_mime = {"application/pdf", "image/jpeg", "image/png", "image/jpg"}
-    if file.content_type not in allowed_mime:
-        return jsonify({"message": "Only PDF and image files are accepted"}), 400
+    # ── Size check (8 MB) ──────────────────────────────────────────────────
     file.seek(0, 2)
-    if file.tell() > 10 * 1024 * 1024:
-        return jsonify({"message": "File too large (max 10 MB)"}), 400
+    if file.tell() > 8 * 1024 * 1024:
+        return jsonify({"message": "File too large (max 8 MB)"}), 400
     file.seek(0)
 
+    # ── MIME + magic bytes validation ──────────────────────────────────────
+    header = file.read(8)
+    file.seek(0)
+    MAGIC = {
+        b"%PDF-":                        "application/pdf",
+        b"\xff\xd8\xff":                 "image/jpeg",
+        b"\x89PNG\r\n\x1a\n":           "image/png",
+    }
+    magic_ok = any(header[:len(sig)] == sig for sig in MAGIC)
+    mime_ok  = file.content_type in {"application/pdf", "image/jpeg", "image/png", "image/jpg"}
+    if not magic_ok or not mime_ok:
+        return jsonify({"message": "Only PDF and image files (JPEG, PNG) are accepted"}), 400
+
+    # ── Cloudinary upload ──────────────────────────────────────────────────
+    candidate_id = str(c["_id"])
     try:
         import cloudinary.uploader as _cu
-        res = _cu.upload(file, resource_type="raw", folder="ats_documents")
+        res = _cu.upload(
+            file,
+            resource_type="auto",
+            folder=f"gdmr/ats_docs/{candidate_id}",
+            use_filename=True,
+            unique_filename=True,
+        )
         url = res.get("secure_url")
     except Exception as e:
         return jsonify({"message": f"Upload failed: {str(e)}"}), 500
 
+    # ── Persist — replace existing entry with same name, or append ─────────
     now  = datetime.now(timezone.utc)
-    docs = list(c.get("documents", []))
-    updated = False
+    docs = list(c.get("documents") or [])
+    replaced = False
     for d in docs:
         if d.get("name") == doc_name:
-            d.update({"url": url, "status": "Uploaded", "uploaded_at": now})
-            updated = True
+            d.update({"url": url, "status": "Pending", "uploaded_at": now})
+            replaced = True
             break
-    if not updated:
-        docs.append({"name": doc_name, "url": url, "status": "Uploaded", "required": False, "uploaded_at": now})
+    if not replaced:
+        docs.append({"name": doc_name, "url": url, "status": "Pending", "required": False, "uploaded_at": now})
 
     ats_candidates_col.update_one(
         {"_id": c["_id"]},
         {"$set": {"documents": docs, "updated_at": now}}
     )
-    return jsonify({"message": "Document uploaded", "url": url}), 200
+    return jsonify({"documents": docs}), 200
+
+
+@app.route("/api/admin/ats/candidates/<candidate_id>/document", methods=["PUT"])
+@token_required
+def ats_review_document(candidate_id):
+    """HR approves, rejects, or requests re-upload of a candidate's document."""
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    data       = request.json or {}
+    doc_name   = (data.get("name") or "").strip()
+    new_status = (data.get("status") or "").strip()
+    allowed    = ("Approved", "Rejected", "Re-upload Requested")
+    if not doc_name:
+        return jsonify({"message": "name is required"}), 400
+    if new_status not in allowed:
+        return jsonify({"message": f"status must be one of: {', '.join(allowed)}"}), 400
+
+    candidate = ats_candidates_col.find_one({"_id": obj}, {"documents": 1})
+    if not candidate:
+        return jsonify({"message": "Candidate not found"}), 404
+
+    docs    = list(candidate.get("documents") or [])
+    matched = False
+    for d in docs:
+        if d.get("name") == doc_name:
+            d["status"]      = new_status
+            d["reviewed_at"] = datetime.now(timezone.utc)
+            d["reviewed_by"] = str(request.user["_id"])
+            matched = True
+            break
+    if not matched:
+        return jsonify({"message": f"Document '{doc_name}' not found on this candidate"}), 404
+
+    ats_candidates_col.update_one(
+        {"_id": obj},
+        {"$set": {"documents": docs, "updated_at": datetime.now(timezone.utc)}}
+    )
+    return jsonify({"documents": docs}), 200
 
 
 @app.route("/api/my/work-plans", methods=["GET"])
