@@ -141,6 +141,9 @@ work_plans_col        = db["work_plans"]
 # --- Clients ---
 clients_col           = db["clients"]
 
+# --- ATS (Applicant Tracking System) ---
+ats_candidates_col    = db["ats_candidates"]
+
 # Local Upload Fallback Directory (Used if Cloudinary is unavailable)
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -187,6 +190,11 @@ try:
     work_plans_col.create_index([("date", 1), ("status", 1)], background=True)
     work_plans_col.create_index([("department", 1), ("date", 1)], background=True)
     clients_col.create_index("name", unique=True, background=True)
+    ats_candidates_col.create_index("email", background=True)
+    ats_candidates_col.create_index("status", background=True)
+    ats_candidates_col.create_index("department", background=True)
+    ats_candidates_col.create_index("doc_token", background=True)
+    ats_candidates_col.create_index([("applied_at", -1)], background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
@@ -4317,6 +4325,421 @@ def delete_client(client_id):
     if result.deleted_count == 0:
         return jsonify({"message": "Client not found"}), 404
     return jsonify({"message": "Client deleted"}), 200
+
+
+# =============================================================================
+# ATS — APPLICANT TRACKING SYSTEM
+# =============================================================================
+
+ATS_STATUSES = (
+    "Applied", "Screening", "Interview",
+    "Offer Released", "Offer Accepted", "Hired",
+    "Rejected", "Withdrawn",
+)
+
+DOC_CHECKLIST_DEFAULT = [
+    "Resume / CV",
+    "Government ID Proof",
+    "Address Proof",
+    "Educational Certificates",
+    "Experience / Relieving Letters",
+]
+
+
+def _ats_allowed(user):
+    role = user.get("role")
+    if role == "admin":
+        return True
+    dept = (user.get("department") or "").strip().lower()
+    if "hr" in dept or "human resource" in dept:
+        return True
+    if role == "manager":
+        return True
+    return False
+
+
+def _ats_scope_query(user):
+    """Return base MongoDB filter scoped to what this user may see."""
+    role = user.get("role")
+    dept = (user.get("department") or "").strip().lower()
+    if role == "admin" or "hr" in dept or "human resource" in dept:
+        return {}
+    return {"department": user.get("department")}  # manager → their dept only
+
+
+def _serialize_ats(c):
+    c["_id"] = str(c["_id"])
+    return c
+
+
+# ── Admin endpoints ──────────────────────────────────────────────────────────
+
+@app.route("/api/admin/ats/candidates", methods=["GET"])
+@token_required
+def ats_list_candidates():
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    query = _ats_scope_query(request.user)
+    candidates = list(ats_candidates_col.find(query).sort("applied_at", -1))
+    return jsonify([_serialize_ats(c) for c in candidates]), 200
+
+
+@app.route("/api/admin/ats/candidates", methods=["POST"])
+@token_required
+def ats_create_candidate():
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    data = request.json or {}
+    name  = str(data.get("name",  "")).strip()
+    email = str(data.get("email", "")).strip()
+    if not name or not email:
+        return jsonify({"message": "name and email are required"}), 400
+
+    skills = data.get("skills", [])
+    if isinstance(skills, str):
+        skills = [s.strip() for s in skills.split(",") if s.strip()]
+
+    now = datetime.now(timezone.utc)
+    doc = {
+        "name":             name,
+        "email":            email,
+        "phone":            str(data.get("phone", "")).strip(),
+        "department":       str(data.get("department", "")).strip(),
+        "role":             str(data.get("role", "")).strip(),
+        "source":           str(data.get("source", "")).strip(),
+        "status":           "Applied",
+        "skills":           skills,
+        "experience_years": data.get("experience_years"),
+        "current_company":  str(data.get("current_company", "")).strip(),
+        "resume_url":       str(data.get("resume_url", "")).strip(),
+        "notes":            str(data.get("notes", "")).strip(),
+        "status_history":   [{"status": "Applied", "at": now, "by": str(request.user["_id"])}],
+        "recordings":       [],
+        "portfolio_links":  [],
+        "documents":        [],
+        "doc_token":        None,
+        "applied_at":       now,
+        "created_by":       str(request.user["_id"]),
+        "created_at":       now,
+        "updated_at":       now,
+    }
+    res = ats_candidates_col.insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    return jsonify(doc), 201
+
+
+@app.route("/api/admin/ats/candidates/<candidate_id>", methods=["PUT"])
+@token_required
+def ats_update_candidate(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    data = request.json or {}
+    editable = [
+        "name", "email", "phone", "department", "role", "source",
+        "skills", "experience_years", "current_company",
+        "resume_url", "notes", "joining_date",
+    ]
+    update = {"updated_at": datetime.now(timezone.utc)}
+    for f in editable:
+        if f in data:
+            update[f] = data[f]
+    if "skills" in update and isinstance(update["skills"], str):
+        update["skills"] = [s.strip() for s in update["skills"].split(",") if s.strip()]
+
+    result = ats_candidates_col.update_one({"_id": obj}, {"$set": update})
+    if result.matched_count == 0:
+        return jsonify({"message": "Candidate not found"}), 404
+    return jsonify(_serialize_ats(ats_candidates_col.find_one({"_id": obj}))), 200
+
+
+@app.route("/api/admin/ats/candidates/<candidate_id>/status", methods=["PUT"])
+@token_required
+def ats_update_status(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    status = (request.json or {}).get("status", "")
+    if status not in ATS_STATUSES:
+        return jsonify({"message": f"status must be one of: {', '.join(ATS_STATUSES)}"}), 400
+
+    now = datetime.now(timezone.utc)
+    history_entry = {"status": status, "at": now, "by": str(request.user["_id"])}
+    set_fields    = {"status": status, "updated_at": now}
+    if status == "Hired":           set_fields["hired_at"]          = now
+    elif status == "Offer Released": set_fields["offer_released_at"] = now
+    elif status == "Offer Accepted": set_fields["offer_accepted_at"] = now
+
+    result = ats_candidates_col.update_one(
+        {"_id": obj},
+        {"$set": set_fields, "$push": {"status_history": history_entry}}
+    )
+    if result.matched_count == 0:
+        return jsonify({"message": "Candidate not found"}), 404
+    return jsonify(_serialize_ats(ats_candidates_col.find_one({"_id": obj}))), 200
+
+
+@app.route("/api/admin/ats/candidates/<candidate_id>/recording", methods=["POST"])
+@token_required
+def ats_add_recording(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    data = request.json or {}
+    url  = str(data.get("url", "")).strip()
+    if not url:
+        return jsonify({"message": "url is required"}), 400
+    entry = {
+        "type":     str(data.get("type", "")).strip(),
+        "url":      url,
+        "added_at": datetime.now(timezone.utc),
+        "added_by": str(request.user["_id"]),
+    }
+    result = ats_candidates_col.update_one({"_id": obj}, {"$push": {"recordings": entry}})
+    if result.matched_count == 0:
+        return jsonify({"message": "Candidate not found"}), 404
+    return jsonify({"message": "Recording added"}), 200
+
+
+@app.route("/api/admin/ats/candidates/<candidate_id>/portfolio", methods=["POST"])
+@token_required
+def ats_add_portfolio(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    url = str((request.json or {}).get("url", "")).strip()
+    if not url:
+        return jsonify({"message": "url is required"}), 400
+    result = ats_candidates_col.update_one({"_id": obj}, {"$addToSet": {"portfolio_links": url}})
+    if result.matched_count == 0:
+        return jsonify({"message": "Candidate not found"}), 404
+    return jsonify({"message": "Portfolio link added"}), 200
+
+
+@app.route("/api/admin/ats/candidates/<candidate_id>/doc-request", methods=["POST"])
+@token_required
+def ats_doc_request(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    candidate = ats_candidates_col.find_one({"_id": obj}, {"email": 1, "name": 1, "doc_token": 1, "documents": 1})
+    if not candidate:
+        return jsonify({"message": "Candidate not found"}), 404
+
+    token         = candidate.get("doc_token") or secrets.token_urlsafe(32)
+    data          = request.json or {}
+    required_docs = data.get("required_docs") or DOC_CHECKLIST_DEFAULT
+
+    existing_names = {d["name"] for d in (candidate.get("documents") or [])}
+    new_entries = [
+        {"name": doc, "url": None, "status": "Pending", "required": True}
+        for doc in required_docs if doc not in existing_names
+    ]
+
+    now = datetime.now(timezone.utc)
+    ats_candidates_col.update_one(
+        {"_id": obj},
+        {"$set": {"doc_token": token, "updated_at": now},
+         "$push": {"documents": {"$each": new_entries}}},
+    )
+
+    frontend_url = os.getenv("FRONTEND_URL", "https://connect.gdmrfoundation.com")
+    upload_link  = f"{frontend_url}/ats/documents/{token}"
+    doc_list     = "\n".join(f"  • {d}" for d in required_docs)
+    body = (
+        f"Dear {candidate.get('name', 'Candidate')},\n\n"
+        f"As part of the hiring process at GDMR Foundation, please upload the following documents:\n\n"
+        f"{doc_list}\n\n"
+        f"Upload link: {upload_link}\n\n"
+        f"Regards,\nGDMR Foundation HR Team"
+    )
+    threading.Thread(
+        target=send_email,
+        args=(candidate["email"], "Action Required: Upload Your Documents – GDMR Foundation", body),
+        daemon=True,
+    ).start()
+
+    return jsonify({"message": "Document request sent", "upload_link": upload_link, "token": token}), 200
+
+
+@app.route("/api/admin/ats/stats", methods=["GET"])
+@token_required
+def ats_stats():
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    query = _ats_scope_query(request.user)
+    all_c = list(ats_candidates_col.find(query, {
+        "status": 1, "source": 1, "department": 1, "role": 1,
+        "applied_at": 1, "hired_at": 1,
+    }))
+
+    total           = len(all_c)
+    offers_released = sum(1 for c in all_c if c.get("status") in ("Offer Released", "Offer Accepted", "Hired"))
+    offers_accepted = sum(1 for c in all_c if c.get("status") in ("Offer Accepted", "Hired"))
+    hired           = sum(1 for c in all_c if c.get("status") == "Hired")
+    joining_ratio   = round(hired / offers_released * 100) if offers_released else 0
+
+    by_status, by_source, by_dept, by_role = {}, {}, {}, {}
+    hired_by_src, hire_days = {}, []
+
+    for c in all_c:
+        s   = c.get("status") or "Unknown"
+        src = c.get("source")     or "Unknown"
+        dpt = c.get("department") or "Unknown"
+        rl  = c.get("role")       or "Unknown"
+        by_status[s]   = by_status.get(s,   0) + 1
+        by_source[src] = by_source.get(src, 0) + 1
+        by_dept[dpt]   = by_dept.get(dpt,   0) + 1
+        by_role[rl]    = by_role.get(rl,    0) + 1
+        if c.get("status") == "Hired":
+            hired_by_src[src] = hired_by_src.get(src, 0) + 1
+            if c.get("applied_at") and c.get("hired_at"):
+                days = (c["hired_at"] - c["applied_at"]).days
+                if days >= 0:
+                    hire_days.append(days)
+
+    time_to_hire = round(sum(hire_days) / len(hire_days)) if hire_days else None
+    source_effectiveness = [
+        {
+            "source": src,
+            "total":  by_source[src],
+            "hired":  hired_by_src.get(src, 0),
+            "rate":   round(hired_by_src.get(src, 0) / by_source[src] * 100),
+        }
+        for src in by_source
+    ]
+
+    return jsonify({
+        "total":                total,
+        "offers_released":      offers_released,
+        "offers_accepted":      offers_accepted,
+        "hired":                hired,
+        "joining_ratio":        joining_ratio,
+        "by_status":            [{"status": k, "count": v} for k, v in by_status.items()],
+        "by_source":            [{"source": k, "count": v} for k, v in by_source.items()],
+        "by_department":        [{"department": k, "count": v} for k, v in by_dept.items()],
+        "by_role":              [{"role": k, "count": v} for k, v in by_role.items()],
+        "time_to_hire":         time_to_hire,
+        "source_effectiveness": source_effectiveness,
+    }), 200
+
+
+# ── Resume upload + auto-parse (optional) ────────────────────────────────────
+
+@app.route("/api/admin/ats/candidates/upload", methods=["POST"])
+@token_required
+def ats_upload_resume():
+    """Upload a resume to Cloudinary and attempt basic text parsing."""
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"message": "file is required"}), 400
+
+    try:
+        import cloudinary.uploader as _cu
+        result     = _cu.upload(file, resource_type="raw", folder="ats_resumes")
+        resume_url = result.get("secure_url", "")
+    except Exception as e:
+        return jsonify({"message": f"Upload failed: {str(e)}"}), 500
+
+    # Best-effort text extraction — works if pdfplumber is installed
+    parsed = {"name": "", "email": "", "phone": "", "skills": []}
+    try:
+        import pdfplumber, io as _io
+        file.seek(0)
+        with pdfplumber.open(_io.BytesIO(file.read())) as pdf:
+            text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+        emails = re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)
+        phones = re.findall(r"(?:\+91[\s-]?)?[6-9]\d{9}", text)
+        lines  = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if emails: parsed["email"] = emails[0]
+        if phones: parsed["phone"] = phones[0]
+        if lines:  parsed["name"]  = lines[0]
+    except Exception:
+        pass  # pdfplumber unavailable or parse failed — return empty parsed
+
+    return jsonify({"resume_url": resume_url, "parsed": parsed}), 200
+
+
+# ── Candidate-facing (public, tokenized) ─────────────────────────────────────
+
+@app.route("/api/ats/documents/<doc_token>", methods=["GET"])
+def ats_get_doc_checklist(doc_token):
+    """Return the document checklist for this candidate (no auth — token is the credential)."""
+    c = ats_candidates_col.find_one(
+        {"doc_token": doc_token},
+        {"name": 1, "email": 1, "documents": 1}
+    )
+    if not c:
+        return jsonify({"message": "Invalid or expired link"}), 404
+    return jsonify({"name": c.get("name"), "documents": c.get("documents", [])}), 200
+
+
+@app.route("/api/ats/documents/<doc_token>", methods=["POST"])
+def ats_upload_doc(doc_token):
+    """Candidate uploads a document via their secure link."""
+    c = ats_candidates_col.find_one({"doc_token": doc_token}, {"_id": 1, "documents": 1})
+    if not c:
+        return jsonify({"message": "Invalid or expired link"}), 404
+
+    doc_name = (request.form.get("doc_name") or "").strip()
+    file     = request.files.get("file")
+    if not doc_name or not file:
+        return jsonify({"message": "doc_name and file are required"}), 400
+
+    # Validate: PDF / image only, 10 MB cap
+    allowed_mime = {"application/pdf", "image/jpeg", "image/png", "image/jpg"}
+    if file.content_type not in allowed_mime:
+        return jsonify({"message": "Only PDF and image files are accepted"}), 400
+    file.seek(0, 2)
+    if file.tell() > 10 * 1024 * 1024:
+        return jsonify({"message": "File too large (max 10 MB)"}), 400
+    file.seek(0)
+
+    try:
+        import cloudinary.uploader as _cu
+        res = _cu.upload(file, resource_type="raw", folder="ats_documents")
+        url = res.get("secure_url")
+    except Exception as e:
+        return jsonify({"message": f"Upload failed: {str(e)}"}), 500
+
+    now  = datetime.now(timezone.utc)
+    docs = list(c.get("documents", []))
+    updated = False
+    for d in docs:
+        if d.get("name") == doc_name:
+            d.update({"url": url, "status": "Uploaded", "uploaded_at": now})
+            updated = True
+            break
+    if not updated:
+        docs.append({"name": doc_name, "url": url, "status": "Uploaded", "required": False, "uploaded_at": now})
+
+    ats_candidates_col.update_one(
+        {"_id": c["_id"]},
+        {"$set": {"documents": docs, "updated_at": now}}
+    )
+    return jsonify({"message": "Document uploaded", "url": url}), 200
 
 
 @app.route("/api/my/work-plans", methods=["GET"])
