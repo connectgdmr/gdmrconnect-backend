@@ -144,6 +144,10 @@ clients_col           = db["clients"]
 # --- ATS (Applicant Tracking System) ---
 ats_candidates_col    = db["ats_candidates"]
 
+# --- Team Chat ---
+conversations_col     = db["conversations"]
+messages_col          = db["messages"]
+
 # Local Upload Fallback Directory (Used if Cloudinary is unavailable)
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -195,6 +199,11 @@ try:
     ats_candidates_col.create_index("department", background=True)
     ats_candidates_col.create_index("doc_token", background=True)
     ats_candidates_col.create_index([("applied_at", -1)], background=True)
+    conversations_col.create_index("members", background=True)
+    conversations_col.create_index([("last_at", -1)], background=True)
+    conversations_col.create_index([("type", 1), ("members", 1)], background=True)
+    messages_col.create_index([("conversation_id", 1), ("created_at", 1)], background=True)
+    messages_col.create_index([("conversation_id", 1), ("read_by", 1)], background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
@@ -5233,6 +5242,231 @@ def send_weekly_work_reports():
             threading.Thread(target=send_email, args=(m["email"], f"Weekly Work Report — {dept} — {today_str}", body), daemon=True).start()
         except Exception as e:
             print(f"Weekly manager report failed for {m.get('email')}: {e}")
+
+
+# =============================================================================
+# TEAM CHAT
+# =============================================================================
+
+def _serialize_conv(c, uid):
+    c["_id"] = str(c["_id"])
+    return c
+
+
+def _member_check(conversation_id, uid):
+    """Return the conversation doc if uid is a member, else None."""
+    try:
+        obj = ObjectId(conversation_id)
+    except Exception:
+        return None
+    return conversations_col.find_one({"_id": obj, "members": uid})
+
+
+@app.route("/api/chat/users", methods=["GET"])
+@token_required
+def chat_users():
+    """All active staff the caller may message, excluding themselves."""
+    uid  = str(request.user["_id"])
+    rows = []
+    for u in users_col.find(
+        {"_id": {"$ne": ObjectId(uid)}, "resignation.notice_date": None},
+        {"name": 1, "role": 1, "department": 1}
+    ):
+        rows.append({
+            "_id":        str(u["_id"]),
+            "name":       u.get("name", ""),
+            "role":       u.get("role", ""),
+            "department": u.get("department", ""),
+        })
+    return jsonify({"users": rows}), 200
+
+
+@app.route("/api/chat/conversations", methods=["GET"])
+@token_required
+def chat_conversations():
+    """Current user's DMs + channels, sorted newest-first, with per-conversation unread count."""
+    uid   = str(request.user["_id"])
+    convs = list(conversations_col.find({"members": uid}).sort("last_at", -1))
+    if not convs:
+        return jsonify({"conversations": []}), 200
+
+    conv_ids = [str(c["_id"]) for c in convs]
+
+    # Batch all unread counts in one aggregation — avoids N queries
+    unread_map = {
+        r["_id"]: r["count"]
+        for r in messages_col.aggregate([
+            {"$match": {"conversation_id": {"$in": conv_ids}, "read_by": {"$nin": [uid]}}},
+            {"$group": {"_id": "$conversation_id", "count": {"$sum": 1}}},
+        ])
+    }
+
+    result = []
+    for c in convs:
+        cid = str(c["_id"])
+        result.append({
+            "_id":          cid,
+            "type":         c.get("type"),
+            "name":         c.get("name"),
+            "members":      c.get("members", []),
+            "last_message": c.get("last_message"),
+            "last_at":      c.get("last_at"),
+            "unread":       unread_map.get(cid, 0),
+        })
+    return jsonify({"conversations": result}), 200
+
+
+@app.route("/api/chat/dm", methods=["POST"])
+@token_required
+def chat_create_dm():
+    """Find-or-create the 1-to-1 DM between the caller and another user (idempotent)."""
+    uid     = str(request.user["_id"])
+    peer_id = str((request.json or {}).get("user_id", ""))
+    if not peer_id:
+        return jsonify({"message": "user_id is required"}), 400
+    if peer_id == uid:
+        return jsonify({"message": "Cannot DM yourself"}), 400
+
+    # Verify peer exists
+    try:
+        peer = users_col.find_one({"_id": ObjectId(peer_id)}, {"name": 1})
+    except Exception:
+        peer = None
+    if not peer:
+        return jsonify({"message": "User not found"}), 404
+
+    # Idempotent: find existing DM with exactly these two members
+    existing = conversations_col.find_one({
+        "type":    "dm",
+        "members": {"$all": [uid, peer_id], "$size": 2},
+    })
+    if existing:
+        existing["_id"] = str(existing["_id"])
+        return jsonify({"conversation": existing}), 200
+
+    now  = datetime.now(timezone.utc)
+    doc  = {
+        "type":         "dm",
+        "name":         None,   # DM names are derived client-side from the peer's name
+        "members":      [uid, peer_id],
+        "created_by":   uid,
+        "last_message": None,
+        "last_at":      now,
+        "created_at":   now,
+    }
+    res  = conversations_col.insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    return jsonify({"conversation": doc}), 201
+
+
+@app.route("/api/chat/channels", methods=["POST"])
+@token_required
+def chat_create_channel():
+    """Create a named channel. Caller is auto-added as member and creator."""
+    uid  = str(request.user["_id"])
+    data = request.json or {}
+    name = str(data.get("name", "")).strip()
+    if not name:
+        return jsonify({"message": "name is required"}), 400
+
+    members = list(data.get("members") or [])
+    if uid not in members:
+        members.append(uid)
+
+    now = datetime.now(timezone.utc)
+    doc = {
+        "type":         "channel",
+        "name":         name,
+        "members":      members,
+        "created_by":   uid,
+        "last_message": None,
+        "last_at":      now,
+        "created_at":   now,
+    }
+    res = conversations_col.insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    return jsonify({"conversation": doc}), 201
+
+
+@app.route("/api/chat/conversations/<conv_id>/messages", methods=["GET"])
+@token_required
+def chat_get_messages(conv_id):
+    """Return up to 200 messages oldest→newest. Caller must be a member."""
+    uid = str(request.user["_id"])
+    if not _member_check(conv_id, uid):
+        return jsonify({"message": "Conversation not found or access denied"}), 404
+
+    msgs = list(
+        messages_col.find({"conversation_id": conv_id})
+        .sort("created_at", 1)
+        .limit(200)
+    )
+    for m in msgs:
+        m["_id"] = str(m["_id"])
+    return jsonify({"messages": msgs}), 200
+
+
+@app.route("/api/chat/conversations/<conv_id>/messages", methods=["POST"])
+@token_required
+def chat_send_message(conv_id):
+    """Send a message. Caller must be a member. Updates conversation's last_message/last_at."""
+    uid  = str(request.user["_id"])
+    conv = _member_check(conv_id, uid)
+    if not conv:
+        return jsonify({"message": "Conversation not found or access denied"}), 404
+
+    text = str((request.json or {}).get("text", "")).strip()
+    if not text:
+        return jsonify({"message": "text is required"}), 400
+
+    now = datetime.now(timezone.utc)
+    msg = {
+        "conversation_id": conv_id,
+        "sender_id":       uid,
+        "sender_name":     request.user.get("name", ""),
+        "text":            text,
+        "created_at":      now,
+        "read_by":         [uid],   # sender has implicitly read their own message
+    }
+    res = messages_col.insert_one(msg)
+    msg["_id"] = str(res.inserted_id)
+
+    # Keep conversation list sorted and preview up-to-date
+    conversations_col.update_one(
+        {"_id": conv["_id"]},
+        {"$set": {"last_message": text[:120], "last_at": now}}
+    )
+    return jsonify(msg), 201
+
+
+@app.route("/api/chat/conversations/<conv_id>/read", methods=["POST"])
+@token_required
+def chat_mark_read(conv_id):
+    """Mark all messages in this conversation as read for the caller."""
+    uid = str(request.user["_id"])
+    if not _member_check(conv_id, uid):
+        return jsonify({"message": "Conversation not found or access denied"}), 404
+
+    messages_col.update_many(
+        {"conversation_id": conv_id, "read_by": {"$nin": [uid]}},
+        {"$addToSet": {"read_by": uid}}
+    )
+    return jsonify({"message": "Marked as read"}), 200
+
+
+@app.route("/api/chat/unread", methods=["GET"])
+@token_required
+def chat_unread_count():
+    """Total unread messages across all the caller's conversations (sidebar badge)."""
+    uid      = str(request.user["_id"])
+    conv_ids = [str(c["_id"]) for c in conversations_col.find({"members": uid}, {"_id": 1})]
+    if not conv_ids:
+        return jsonify({"count": 0}), 200
+    count = messages_col.count_documents({
+        "conversation_id": {"$in": conv_ids},
+        "read_by":         {"$nin": [uid]},
+    })
+    return jsonify({"count": count}), 200
 
 
 # Initialize the background scheduler
