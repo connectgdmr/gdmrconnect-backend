@@ -2197,6 +2197,60 @@ def assign_asset_to_office_admin(asset_id):
     return jsonify({"message": "Assignment emails sent successfully."}), 200
 
 
+@app.route("/api/manager/assets/<asset_id>/assign", methods=["POST"])
+@token_required
+def manager_assign_asset(asset_id):
+    """Manager or admin sends the asset-provisioning email and records the assignment."""
+    role = request.user.get("role")
+    if role not in ("admin", "manager"):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    try:
+        obj = ObjectId(asset_id)
+    except Exception:
+        return jsonify({"message": "Invalid asset ID"}), 400
+
+    data   = request.json or {}
+    emails = data.get("emails") or []
+    asset  = data.get("asset") or {}
+
+    if not emails:
+        return jsonify({"message": "At least one recipient email is required"}), 400
+
+    # Managers may only assign assets that belong to their own department
+    if role == "manager":
+        mgr_dept   = (request.user.get("department") or "").strip().lower()
+        asset_dept = (asset.get("department") or "").strip().lower()
+        if mgr_dept and asset_dept and mgr_dept != asset_dept:
+            return jsonify({"message": "You can only assign assets for your own department"}), 403
+
+    subject = f"Asset Request Approved — {asset.get('asset_name', 'Asset')}"
+    body = (
+        f"Dear Office Admin,\n\n"
+        f"An asset request has been approved and requires your processing.\n\n"
+        f"Employee  : {asset.get('employee_name', '—')}\n"
+        f"Department: {asset.get('department', '—')}\n"
+        f"Asset     : {asset.get('asset_name', '—')}\n"
+        f"Reason    : {asset.get('reason', '—')}\n\n"
+        f"Please proceed with the procurement or allocation of the above asset.\n\n"
+        f"Regards,\nGDMR Connect HRMS"
+    )
+    for email in emails:
+        threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
+
+    # Persist the assignment so the asset list can reflect it
+    assets_col.update_one(
+        {"_id": obj},
+        {"$set": {
+            "assigned_at":         datetime.now(timezone.utc),
+            "assigned_by":         str(request.user["_id"]),
+            "assigned_to_emails":  emails,
+        }}
+    )
+
+    return jsonify({"message": "Assignment emails sent successfully."}), 200
+
+
 # =============================================================================
 # 17. ANNOUNCEMENTS, CORRECTIONS & NOTIFICATIONS
 # =============================================================================
