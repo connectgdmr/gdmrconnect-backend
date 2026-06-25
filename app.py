@@ -5379,11 +5379,11 @@ def _member_check(conversation_id, uid):
 @app.route("/api/chat/users", methods=["GET"])
 @token_required
 def chat_users():
-    """All active staff the caller may message, excluding themselves."""
+    """All staff the caller may message, excluding themselves."""
     uid  = str(request.user["_id"])
     rows = []
     for u in users_col.find(
-        {"_id": {"$ne": ObjectId(uid)}, "resignation.notice_date": None},
+        {"_id": {"$ne": ObjectId(uid)}},
         {"name": 1, "role": 1, "department": 1}
     ):
         rows.append({
