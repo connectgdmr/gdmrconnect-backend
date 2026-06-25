@@ -1962,21 +1962,36 @@ def _send_leave_notification(leave_doc: dict, employee: dict):
         else:
             applied_str = str(applied_at or "")
 
-        # Resolve manager
+        # Resolve manager — try manager_id first, fall back to any manager in same department
         manager_email = None
         manager_id = employee.get("manager_id")
-        print(f"[leave-notify] employee={emp_name!r} manager_id={manager_id!r}")
+        print(f"[leave-notify] employee={emp_name!r} manager_id={manager_id!r} dept={department!r}")
         if manager_id:
             try:
                 mgr = users_col.find_one({"_id": ObjectId(str(manager_id))}, {"email": 1})
                 if mgr:
                     manager_email = mgr.get("email")
-                    print(f"[leave-notify] manager found: {manager_email!r}")
+                    print(f"[leave-notify] manager found by id: {manager_email!r}")
                 else:
                     print(f"[leave-notify] manager_id {manager_id!r} not found in users_col")
             except Exception as mgr_exc:
                 print(f"[leave-notify] manager lookup error: {mgr_exc}")
 
+        if not manager_email and department:
+            try:
+                dept_mgr = users_col.find_one(
+                    {"role": "manager", "department": department},
+                    {"email": 1},
+                )
+                if dept_mgr:
+                    manager_email = dept_mgr.get("email")
+                    print(f"[leave-notify] manager found by dept: {manager_email!r}")
+                else:
+                    print(f"[leave-notify] no manager found for dept={department!r}")
+            except Exception as dept_exc:
+                print(f"[leave-notify] dept manager lookup error: {dept_exc}")
+
+        # Always notify both: manager (To) + HR (Cc), or just HR if no manager resolved
         to_email  = manager_email or HR_EMAIL
         cc_list   = [HR_EMAIL] if manager_email and manager_email.lower() != HR_EMAIL.lower() else []
         reply_to  = emp_email or None
