@@ -4,13 +4,26 @@ import requests
 
 BREVO_URL = "https://api.brevo.com/v3/smtp/email"
 
-def send_email(to_email: str, subject: str, body: str, from_name="GDMR Connect", html_body: str = None):
+def send_email(
+    to_email: str,
+    subject: str,
+    body: str,
+    from_name: str = "GDMR Connect",
+    html_body: str = None,
+    cc_emails: list = None,
+    reply_to: str = None,
+):
     """Send email via Brevo API. Returns True on success, False on failure.
-    Pass html_body to send an HTML email; body is used as the plain-text fallback."""
 
-    # Read fresh every call — avoids the import-time race with load_dotenv()
+    Args:
+        to_email:   Primary recipient address.
+        subject:    Email subject line.
+        body:       Plain-text body (required; used as fallback when html_body is given).
+        html_body:  Optional HTML body; body becomes the plain-text fallback.
+        cc_emails:  Optional list of CC addresses (strings).
+        reply_to:   Optional Reply-To address.
+    """
     api_key = os.getenv("BREVO_API_KEY")
-
     if not api_key:
         print("[Brevo] ERROR: BREVO_API_KEY environment variable is not set.")
         return False
@@ -22,24 +35,27 @@ def send_email(to_email: str, subject: str, body: str, from_name="GDMR Connect",
     }
 
     payload = {
-        "sender": {"name": from_name, "email": "connect.gdmr@gmail.com"},
-        "to": [{"email": to_email}],
+        "sender":  {"name": from_name, "email": "connect.gdmr@gmail.com"},
+        "to":      [{"email": to_email}],
         "subject": subject,
     }
     if html_body:
         payload["htmlContent"] = html_body
-        payload["textContent"] = body   # plain-text fallback for email clients that don't render HTML
+        payload["textContent"] = body
     else:
         payload["textContent"] = body
+    if cc_emails:
+        payload["cc"] = [{"email": e} for e in cc_emails if e]
+    if reply_to:
+        payload["replyTo"] = {"email": reply_to}
 
     try:
         res = requests.post(BREVO_URL, headers=headers, json=payload, timeout=10)
         print(f"[Brevo] status={res.status_code} to={to_email} response={res.text[:200]}")
         if res.status_code in (200, 201):
             return True
-        else:
-            print(f"[Brevo] FAILED — status {res.status_code}: {res.text}")
-            return False
+        print(f"[Brevo] FAILED — status {res.status_code}: {res.text}")
+        return False
     except Exception as e:
         print(f"[Brevo] Exception sending to {to_email}: {e}")
         return False

@@ -1901,6 +1901,148 @@ def admin_employee_attendance(emp_id):
 # 15. LEAVE MANAGEMENT
 # =============================================================================
 
+import html as _html
+
+HR_EMAIL = "hr@gdmrfoundation.com"
+DASHBOARD_URL = "https://www.gdmrconnect.com"
+
+
+def _send_leave_notification(leave_doc: dict, employee: dict):
+    """Build and send a leave-request notification email to the manager and HR.
+    Intended to run inside a background daemon thread — all failures are swallowed."""
+    try:
+        emp_name    = employee.get("name", "Employee")
+        department  = employee.get("department", "")
+        designation = employee.get("position", "")
+        emp_email   = employee.get("email", "")
+
+        from_date  = leave_doc.get("from_date", "")
+        to_date    = leave_doc.get("to_date", "")
+        leave_type = leave_doc.get("type", "")
+        period     = leave_doc.get("period", "")
+        reason     = leave_doc.get("reason", "Not provided")
+        att_url    = leave_doc.get("attachment_url")
+        applied_at = leave_doc.get("applied_at")
+
+        def _fmt(ds):
+            try:
+                d = datetime.strptime(str(ds)[:10], "%Y-%m-%d")
+                return f"{d.day} {d.strftime('%b')} {d.year}"
+            except Exception:
+                return str(ds or "")
+
+        from_str = _fmt(from_date)
+        to_str   = _fmt(to_date)
+
+        try:
+            f_d   = datetime.strptime(str(from_date)[:10], "%Y-%m-%d").date()
+            t_d   = datetime.strptime(str(to_date)[:10],   "%Y-%m-%d").date()
+            delta = (t_d - f_d).days + 1
+        except Exception:
+            delta = 1
+
+        is_half = leave_type == "half" or (period and "half" in period.lower())
+        if is_half:
+            day_count_str = "0.5 days (Half Day)"
+        elif delta == 1:
+            day_count_str = "1 day"
+        else:
+            day_count_str = f"{delta} days"
+
+        if isinstance(applied_at, datetime):
+            _applied = applied_at.astimezone(IST)
+            applied_str = f"{_applied.day} {_applied.strftime('%b')} {_applied.year}, {_applied.strftime('%I:%M %p')} IST"
+        else:
+            applied_str = str(applied_at or "")
+
+        # Resolve manager
+        manager_email = None
+        manager_id = employee.get("manager_id")
+        if manager_id:
+            try:
+                mgr = users_col.find_one({"_id": ObjectId(str(manager_id))}, {"email": 1})
+                if mgr:
+                    manager_email = mgr.get("email")
+            except Exception:
+                pass
+
+        to_email  = manager_email or HR_EMAIL
+        cc_list   = [HR_EMAIL] if manager_email and manager_email.lower() != HR_EMAIL.lower() else []
+        reply_to  = emp_email or None
+
+        subject = (
+            f"Leave Request — {emp_name} "
+            f"({leave_type.title()}, {from_str} to {to_str})"
+        )
+
+        # HTML escape user-controlled fields
+        e_name  = _html.escape(emp_name)
+        e_dept  = _html.escape(department)
+        e_desig = _html.escape(designation)
+        e_type  = _html.escape(leave_type.title())
+        e_rsn   = _html.escape(str(reason))
+
+        att_row = (
+            f'<tr><td style="padding:8px 0;color:#94a3b8;width:140px">Attachment</td>'
+            f'<td style="padding:8px 0"><a href="{_html.escape(att_url)}" style="color:#34a06a">View document</a></td></tr>'
+            if att_url else ""
+        )
+
+        html_body = f"""
+<div style="font-family:'Segoe UI',Arial,sans-serif;max-width:600px;margin:auto;border:1px solid #e6eaef;border-radius:12px;overflow:hidden">
+  <div style="background:#34a06a;color:#fff;padding:18px 24px">
+    <h2 style="margin:0;font-size:18px">GDMR Connect — New Leave Request</h2>
+  </div>
+  <div style="padding:24px;color:#0f172a">
+    <p style="margin:0 0 16px;font-size:14px;color:#475569">
+      A new leave request has been submitted and requires your review.
+    </p>
+    <table style="width:100%;border-collapse:collapse;font-size:14px">
+      <tr><td style="padding:8px 0;color:#94a3b8;width:140px">Employee</td><td style="padding:8px 0;font-weight:600">{e_name}</td></tr>
+      <tr><td style="padding:8px 0;color:#94a3b8">Department</td><td style="padding:8px 0">{e_dept}</td></tr>
+      <tr><td style="padding:8px 0;color:#94a3b8">Designation</td><td style="padding:8px 0">{e_desig}</td></tr>
+      <tr><td style="padding:8px 0;color:#94a3b8">Leave Type</td><td style="padding:8px 0">{e_type}</td></tr>
+      <tr><td style="padding:8px 0;color:#94a3b8">From</td><td style="padding:8px 0">{from_str}</td></tr>
+      <tr><td style="padding:8px 0;color:#94a3b8">To</td><td style="padding:8px 0">{to_str}</td></tr>
+      <tr><td style="padding:8px 0;color:#94a3b8">Total Days</td><td style="padding:8px 0">{day_count_str}</td></tr>
+      <tr><td style="padding:8px 0;color:#94a3b8;vertical-align:top">Reason</td><td style="padding:8px 0">{e_rsn}</td></tr>
+      <tr><td style="padding:8px 0;color:#94a3b8">Applied On</td><td style="padding:8px 0">{applied_str}</td></tr>
+      {att_row}
+    </table>
+    <a href="{DASHBOARD_URL}" style="display:inline-block;margin-top:22px;background:#34a06a;color:#fff;text-decoration:none;padding:11px 22px;border-radius:8px;font-weight:600;font-size:14px">Review in Dashboard</a>
+  </div>
+  <div style="background:#f8fafc;padding:14px 24px;font-size:12px;color:#94a3b8;text-align:center">
+    This is an automated message from GDMR Connect HRMS. Do not reply directly to this email.
+  </div>
+</div>"""
+
+        plain = (
+            f"New Leave Request — {emp_name}\n\n"
+            f"Employee:    {emp_name}\n"
+            f"Department:  {department}\n"
+            f"Designation: {designation}\n"
+            f"Leave Type:  {leave_type.title()}\n"
+            f"From:        {from_str}\n"
+            f"To:          {to_str}\n"
+            f"Total Days:  {day_count_str}\n"
+            f"Reason:      {reason}\n"
+            f"Applied On:  {applied_str}\n"
+            + (f"Attachment:  {att_url}\n" if att_url else "")
+            + f"\nReview at: {DASHBOARD_URL}"
+        )
+
+        send_email(
+            to_email  = to_email,
+            subject   = subject,
+            body      = plain,
+            html_body = html_body,
+            cc_emails = cc_list,
+            reply_to  = reply_to,
+        )
+    except Exception as exc:
+        print(f"[leave-notify] Failed to send notification: {exc}")
+
+
 @app.route("/api/leaves", methods=["POST"])
 @token_required
 def apply_leave():
@@ -1966,6 +2108,13 @@ def apply_leave():
     }
 
     res = leaves_col.insert_one(leave)
+
+    threading.Thread(
+        target=_send_leave_notification,
+        args=(leave, dict(request.user)),
+        daemon=True,
+    ).start()
+
     return jsonify({"message": "Applied", "id": str(res.inserted_id)}), 201
 
 
