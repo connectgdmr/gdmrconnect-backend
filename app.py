@@ -1740,6 +1740,8 @@ def checkin_photo():
     if not img_data:
         return jsonify({"message": "No image data received from frontend."}), 400
 
+    location = data.get("location") or None  # optional — never block on missing
+
     try:
         upload_result = cloudinary.uploader.upload(img_data, folder="attendance_photos")
         photo_url = upload_result.get("secure_url")
@@ -1748,13 +1750,14 @@ def checkin_photo():
         return jsonify({"message": "Image upload failed. Check connection."}), 500
 
     attendance_col.insert_one({
-        "user_id": uid,
-        "type": "checkin",
-        "date": today_str,
-        "day_type": day_type,
-        "time": datetime.now(timezone.utc),
-        "photo_url": photo_url, 
-        "status_indicator": status_indicator 
+        "user_id":          uid,
+        "type":             "checkin",
+        "date":             today_str,
+        "day_type":         day_type,
+        "time":             datetime.now(timezone.utc),
+        "photo_url":        photo_url,
+        "status_indicator": status_indicator,
+        "location":         location,
     })
 
     return jsonify({"message": f"Checked in successfully ({status_indicator})"}), 200
@@ -1834,6 +1837,8 @@ def checkout_photo():
     if not img_data:
         return jsonify({"message": "No image data provided"}), 400
 
+    location = data.get("location") or None  # optional — never block on missing
+
     try:
         upload_result = cloudinary.uploader.upload(img_data, folder="attendance_photos")
         photo_url = upload_result.get("secure_url")
@@ -1842,13 +1847,14 @@ def checkout_photo():
         return jsonify({"message": "Image upload failed"}), 500
 
     attendance_col.insert_one({
-        "user_id": uid,
-        "type": "checkout",
-        "date": str(today),
-        "time": datetime.now(timezone.utc),
-        "photo_url": photo_url,
-        "day_type": final_day_type,
-        "status_indicator": status_indicator
+        "user_id":          uid,
+        "type":             "checkout",
+        "date":             str(today),
+        "time":             datetime.now(timezone.utc),
+        "photo_url":        photo_url,
+        "day_type":         final_day_type,
+        "status_indicator": status_indicator,
+        "location":         location,
     })
 
     return jsonify({"message": f"Checked out successfully ({final_day_type}, {status_indicator})"}), 200
