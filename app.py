@@ -5415,17 +5415,38 @@ def chat_conversations():
         ])
     }
 
+    # Batch-fetch member names so DM peer names are available client-side
+    all_member_ids = {m for c in convs for m in c.get("members", [])}
+    member_name_map = {uid: request.user.get("name", "")}
+    oids = []
+    for m in all_member_ids:
+        if m != uid:
+            try:
+                oids.append(ObjectId(m))
+            except Exception:
+                pass
+    for u in users_col.find({"_id": {"$in": oids}}, {"name": 1}):
+        member_name_map[str(u["_id"])] = u.get("name", "")
+
     result = []
     for c in convs:
-        cid    = str(c["_id"])
+        cid     = str(c["_id"])
         last_at = c.get("last_at")
+        # Guard: last_at may be a datetime (normal) or an ISO string (written by a
+        # previous bug where now.isoformat() was persisted). Handle both.
+        if isinstance(last_at, datetime):
+            last_at_iso = last_at.isoformat()
+        elif isinstance(last_at, str):
+            last_at_iso = last_at
+        else:
+            last_at_iso = None
         result.append({
             "_id":          cid,
             "type":         c.get("type"),
             "name":         c.get("name"),
-            "members":      c.get("members", []),
+            "members":      [{"_id": m, "name": member_name_map.get(m, "")} for m in c.get("members", [])],
             "last_message": c.get("last_message"),
-            "last_at":      last_at.isoformat() if last_at else None,
+            "last_at":      last_at_iso,
             "unread":       unread_map.get(cid, 0),
         })
     return jsonify({"conversations": result}), 200
@@ -5465,15 +5486,17 @@ def chat_create_dm():
     now  = datetime.now(timezone.utc)
     doc  = {
         "type":         "dm",
-        "name":         None,   # DM names are derived client-side from the peer's name
+        "name":         None,
         "members":      [uid, peer_id],
         "created_by":   uid,
         "last_message": None,
-        "last_at":      now.isoformat(),
-        "created_at":   now.isoformat(),
+        "last_at":      now,        # datetime in MongoDB — never isoformat() at storage time
+        "created_at":   now,
     }
     res  = conversations_col.insert_one(doc)
-    doc["_id"] = str(res.inserted_id)
+    doc["_id"]        = str(res.inserted_id)
+    doc["last_at"]    = now.isoformat()
+    doc["created_at"] = now.isoformat()
     return jsonify({"conversation": doc}), 201
 
 
@@ -5498,11 +5521,13 @@ def chat_create_channel():
         "members":      members,
         "created_by":   uid,
         "last_message": None,
-        "last_at":      now.isoformat(),
-        "created_at":   now.isoformat(),
+        "last_at":      now,        # datetime in MongoDB
+        "created_at":   now,
     }
     res = conversations_col.insert_one(doc)
-    doc["_id"] = str(res.inserted_id)
+    doc["_id"]        = str(res.inserted_id)
+    doc["last_at"]    = now.isoformat()
+    doc["created_at"] = now.isoformat()
     return jsonify({"conversation": doc}), 201
 
 
