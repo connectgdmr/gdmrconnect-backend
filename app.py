@@ -1909,7 +1909,11 @@ DASHBOARD_URL = "https://www.gdmrconnect.com"
 
 def _send_leave_notification(leave_doc: dict, employee: dict):
     """Build and send a leave-request notification email to the manager and HR.
-    Intended to run inside a background daemon thread — all failures are swallowed."""
+    Runs inside a background daemon thread; logs every step so failures are diagnosable."""
+    import traceback
+
+    print("[leave-notify] thread started")
+
     try:
         emp_name    = employee.get("name", "Employee")
         department  = employee.get("department", "")
@@ -1918,8 +1922,8 @@ def _send_leave_notification(leave_doc: dict, employee: dict):
 
         from_date  = leave_doc.get("from_date", "")
         to_date    = leave_doc.get("to_date", "")
-        leave_type = leave_doc.get("type", "")
-        period     = leave_doc.get("period", "")
+        leave_type = leave_doc.get("type", "") or ""
+        period     = leave_doc.get("period", "") or ""
         reason     = leave_doc.get("reason", "Not provided")
         att_url    = leave_doc.get("attachment_url")
         applied_at = leave_doc.get("applied_at")
@@ -1941,7 +1945,7 @@ def _send_leave_notification(leave_doc: dict, employee: dict):
         except Exception:
             delta = 1
 
-        is_half = leave_type == "half" or (period and "half" in period.lower())
+        is_half = leave_type == "half" or ("half" in period.lower())
         if is_half:
             day_count_str = "0.5 days (Half Day)"
         elif delta == 1:
@@ -1951,24 +1955,32 @@ def _send_leave_notification(leave_doc: dict, employee: dict):
 
         if isinstance(applied_at, datetime):
             _applied = applied_at.astimezone(IST)
-            applied_str = f"{_applied.day} {_applied.strftime('%b')} {_applied.year}, {_applied.strftime('%I:%M %p')} IST"
+            applied_str = (
+                f"{_applied.day} {_applied.strftime('%b')} {_applied.year}, "
+                f"{_applied.strftime('%I:%M %p')} IST"
+            )
         else:
             applied_str = str(applied_at or "")
 
         # Resolve manager
         manager_email = None
         manager_id = employee.get("manager_id")
+        print(f"[leave-notify] employee={emp_name!r} manager_id={manager_id!r}")
         if manager_id:
             try:
                 mgr = users_col.find_one({"_id": ObjectId(str(manager_id))}, {"email": 1})
                 if mgr:
                     manager_email = mgr.get("email")
-            except Exception:
-                pass
+                    print(f"[leave-notify] manager found: {manager_email!r}")
+                else:
+                    print(f"[leave-notify] manager_id {manager_id!r} not found in users_col")
+            except Exception as mgr_exc:
+                print(f"[leave-notify] manager lookup error: {mgr_exc}")
 
         to_email  = manager_email or HR_EMAIL
         cc_list   = [HR_EMAIL] if manager_email and manager_email.lower() != HR_EMAIL.lower() else []
         reply_to  = emp_email or None
+        print(f"[leave-notify] to={to_email!r} cc={cc_list!r} reply_to={reply_to!r}")
 
         subject = (
             f"Leave Request — {emp_name} "
@@ -2031,7 +2043,8 @@ def _send_leave_notification(leave_doc: dict, employee: dict):
             + f"\nReview at: {DASHBOARD_URL}"
         )
 
-        send_email(
+        print(f"[leave-notify] calling send_email subject={subject!r}")
+        ok = send_email(
             to_email  = to_email,
             subject   = subject,
             body      = plain,
@@ -2039,8 +2052,10 @@ def _send_leave_notification(leave_doc: dict, employee: dict):
             cc_emails = cc_list,
             reply_to  = reply_to,
         )
+        print(f"[leave-notify] send_email returned {ok}")
+
     except Exception as exc:
-        print(f"[leave-notify] Failed to send notification: {exc}")
+        print(f"[leave-notify] EXCEPTION: {exc}\n{traceback.format_exc()}")
 
 
 @app.route("/api/leaves", methods=["POST"])
