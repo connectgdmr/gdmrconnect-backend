@@ -1962,17 +1962,40 @@ def _send_leave_notification(leave_doc: dict, employee: dict):
         else:
             applied_str = str(applied_at or "")
 
-        # Leaves this employee applied in the current calendar month
+        # Leaves this employee applied in the current calendar month (with status breakdown)
+        monthly_leave_count = 0
+        monthly_breakdown   = ""
         try:
             emp_uid_str = str(employee.get("_id", ""))
-            now_utc = datetime.now(timezone.utc)
+            now_utc     = datetime.now(timezone.utc)
             month_start = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            monthly_leave_count = leaves_col.count_documents({
-                "user_id":    emp_uid_str,
-                "applied_at": {"$gte": month_start},
-            })
+
+            status_counts = {
+                r["_id"]: r["n"]
+                for r in leaves_col.aggregate([
+                    {"$match": {"user_id": emp_uid_str, "applied_at": {"$gte": month_start}}},
+                    {"$group": {"_id": "$status", "n": {"$sum": 1}}},
+                ])
+            }
+            monthly_leave_count = sum(status_counts.values())
+
+            # Build "2 applied · 1 Approved · 1 Pending" style string
+            parts = []
+            if status_counts.get("Approved"):
+                parts.append(f"{status_counts['Approved']} Approved")
+            if status_counts.get("Pending"):
+                parts.append(f"{status_counts['Pending']} Pending")
+            if status_counts.get("Rejected"):
+                parts.append(f"{status_counts['Rejected']} Rejected")
+            monthly_breakdown = " · ".join(parts) if parts else ""
         except Exception:
             monthly_leave_count = 0
+            monthly_breakdown   = ""
+
+        monthly_detail = (
+            f"{monthly_leave_count} applied · {monthly_breakdown}"
+            if monthly_breakdown else str(monthly_leave_count)
+        )
 
         # Resolve manager — try manager_id first, fall back to any manager in same department
         manager_email = None
@@ -2046,7 +2069,7 @@ def _send_leave_notification(leave_doc: dict, employee: dict):
       <tr><td style="padding:8px 0;color:#94a3b8">Total Days</td><td style="padding:8px 0">{day_count_str}</td></tr>
       <tr><td style="padding:8px 0;color:#94a3b8;vertical-align:top">Reason</td><td style="padding:8px 0">{e_rsn}</td></tr>
       <tr><td style="padding:8px 0;color:#94a3b8">Applied On</td><td style="padding:8px 0">{applied_str}</td></tr>
-      <tr><td style="padding:8px 0;color:#94a3b8">Leaves This Month</td><td style="padding:8px 0">{monthly_leave_count}</td></tr>
+      <tr><td style="padding:8px 0;color:#94a3b8">Leaves This Month</td><td style="padding:8px 0;font-weight:600">{monthly_detail}</td></tr>
       {att_row}
     </table>
     <a href="{DASHBOARD_URL}" style="display:inline-block;margin-top:22px;background:#34a06a;color:#fff;text-decoration:none;padding:11px 22px;border-radius:8px;font-weight:600;font-size:14px">Review in Dashboard</a>
@@ -2067,7 +2090,7 @@ def _send_leave_notification(leave_doc: dict, employee: dict):
             f"Total Days:  {day_count_str}\n"
             f"Reason:      {reason}\n"
             f"Applied On:  {applied_str}\n"
-            f"Leaves This Month: {monthly_leave_count}\n"
+            f"Leaves This Month: {monthly_detail}\n"
             + (f"Attachment:  {att_url}\n" if att_url else "")
             + f"\nReview at: {DASHBOARD_URL}"
         )
