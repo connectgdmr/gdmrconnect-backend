@@ -5376,6 +5376,19 @@ def _member_check(conversation_id, uid):
     return conversations_col.find_one({"_id": obj, "members": uid})
 
 
+def _refresh_conv_preview(conv_id_str):
+    """Recompute last_message/last_at from the most recent remaining message."""
+    latest = messages_col.find_one(
+        {"conversation_id": conv_id_str},
+        sort=[("created_at", -1)]
+    )
+    if latest:
+        update = {"last_message": latest.get("text", "")[:120], "last_at": latest.get("created_at")}
+    else:
+        update = {"last_message": None, "last_at": None}
+    conversations_col.update_one({"_id": ObjectId(conv_id_str)}, {"$set": update})
+
+
 @app.route("/api/chat/users", methods=["GET"])
 @token_required
 def chat_users():
@@ -5598,6 +5611,105 @@ def chat_mark_read(conv_id):
         {"$addToSet": {"read_by": uid}}
     )
     return jsonify({"message": "Marked as read"}), 200
+
+
+@app.route("/api/chat/conversations/<conv_id>/messages/<msg_id>", methods=["PUT"])
+@token_required
+def chat_edit_message(conv_id, msg_id):
+    """Edit a message. Only the original sender may edit."""
+    uid = str(request.user["_id"])
+    if not _member_check(conv_id, uid):
+        return jsonify({"message": "Conversation not found or access denied"}), 404
+
+    try:
+        msg_obj = ObjectId(msg_id)
+    except Exception:
+        return jsonify({"message": "Invalid message ID"}), 400
+
+    msg = messages_col.find_one({"_id": msg_obj, "conversation_id": conv_id})
+    if not msg:
+        return jsonify({"message": "Message not found"}), 404
+    if msg.get("sender_id") != uid:
+        return jsonify({"message": "You can only edit your own messages"}), 403
+
+    text = str((request.json or {}).get("text", "")).strip()
+    if not text:
+        return jsonify({"message": "text is required"}), 400
+
+    now = datetime.now(timezone.utc)
+    messages_col.update_one(
+        {"_id": msg_obj},
+        {"$set": {"text": text, "edited": True, "edited_at": now}}
+    )
+    _refresh_conv_preview(conv_id)
+
+    updated = messages_col.find_one({"_id": msg_obj})
+    updated["_id"] = str(updated["_id"])
+    for f in ("created_at", "edited_at"):
+        if isinstance(updated.get(f), datetime):
+            updated[f] = updated[f].isoformat()
+    return jsonify(updated), 200
+
+
+@app.route("/api/chat/conversations/<conv_id>/messages/<msg_id>", methods=["DELETE"])
+@token_required
+def chat_delete_message(conv_id, msg_id):
+    """Delete a single message. Sender may delete their own; admin may delete any."""
+    uid = str(request.user["_id"])
+    if not _member_check(conv_id, uid):
+        return jsonify({"message": "Conversation not found or access denied"}), 404
+
+    try:
+        msg_obj = ObjectId(msg_id)
+    except Exception:
+        return jsonify({"message": "Invalid message ID"}), 400
+
+    msg = messages_col.find_one({"_id": msg_obj, "conversation_id": conv_id})
+    if not msg:
+        return jsonify({"message": "Message not found"}), 404
+
+    if msg.get("sender_id") != uid and request.user.get("role") != "admin":
+        return jsonify({"message": "You can only delete your own messages"}), 403
+
+    messages_col.delete_one({"_id": msg_obj})
+    _refresh_conv_preview(conv_id)
+    return jsonify({"message": "deleted"}), 200
+
+
+@app.route("/api/chat/conversations/<conv_id>/messages", methods=["DELETE"])
+@token_required
+def chat_clear_messages(conv_id):
+    """Clear all messages in a conversation. Admin only."""
+    uid = str(request.user["_id"])
+    if not _member_check(conv_id, uid):
+        return jsonify({"message": "Conversation not found or access denied"}), 404
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Admin only"}), 403
+
+    messages_col.delete_many({"conversation_id": conv_id})
+    conversations_col.update_one(
+        {"_id": ObjectId(conv_id)},
+        {"$set": {"last_message": None, "last_at": None}}
+    )
+    return jsonify({"message": "cleared"}), 200
+
+
+@app.route("/api/chat/conversations/<conv_id>", methods=["DELETE"])
+@token_required
+def chat_delete_conversation(conv_id):
+    """Delete a channel and all its messages. Admin only. DMs are not deletable."""
+    uid  = str(request.user["_id"])
+    conv = _member_check(conv_id, uid)
+    if not conv:
+        return jsonify({"message": "Conversation not found or access denied"}), 404
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Admin only"}), 403
+    if conv.get("type") != "channel":
+        return jsonify({"message": "Only channels can be deleted. DMs cannot be removed."}), 400
+
+    messages_col.delete_many({"conversation_id": conv_id})
+    conversations_col.delete_one({"_id": ObjectId(conv_id)})
+    return jsonify({"message": "deleted"}), 200
 
 
 @app.route("/api/chat/unread", methods=["GET"])
