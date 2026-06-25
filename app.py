@@ -4520,6 +4520,42 @@ def ats_update_candidate(candidate_id):
     return jsonify(_serialize_ats(ats_candidates_col.find_one({"_id": obj}))), 200
 
 
+@app.route("/api/admin/ats/candidates/<candidate_id>", methods=["DELETE"])
+@token_required
+def ats_delete_candidate(candidate_id):
+    """Delete a candidate document plus all their data. Best-effort Cloudinary cleanup."""
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    candidate = ats_candidates_col.find_one({"_id": obj}, {"resume_url": 1})
+    if not candidate:
+        return jsonify({"message": "Candidate not found"}), 404
+
+    # Wipe all uploaded documents from Cloudinary (best-effort, non-blocking)
+    try:
+        import cloudinary.api as _capi
+        _capi.delete_resources_by_prefix(f"gdmr/ats_docs/{candidate_id}")
+    except Exception as _e:
+        print(f"[ats-delete] Cloudinary doc folder cleanup failed: {_e}")
+
+    # Best-effort resume cleanup
+    resume_url = candidate.get("resume_url") or ""
+    if resume_url and "cloudinary.com" in resume_url:
+        try:
+            m = re.search(r"/upload/(?:v\d+/)?(.+?)(?:\.[^./?]+)?$", resume_url)
+            if m:
+                cloudinary.uploader.destroy(m.group(1), resource_type="raw")
+        except Exception as _e:
+            print(f"[ats-delete] Cloudinary resume cleanup failed: {_e}")
+
+    ats_candidates_col.delete_one({"_id": obj})
+    return jsonify({"message": "deleted"}), 200
+
+
 @app.route("/api/admin/ats/candidates/<candidate_id>/status", methods=["PUT"])
 @token_required
 def ats_update_status(candidate_id):
@@ -4760,7 +4796,10 @@ def ats_get_doc_checklist(doc_token):
         "candidate_name": c.get("name", ""),
         "job_role":       c.get("role", ""),
         "required":       [d["name"] for d in docs if d.get("required")],
-        "documents":      [{"name": d.get("name"), "url": d.get("url"), "status": d.get("status")} for d in docs],
+        "documents":      [
+            {"name": d.get("name"), "url": d.get("url"), "status": d.get("status")}
+            for d in docs if d.get("url")   # only files the candidate has actually uploaded
+        ],
     }), 200
 
 
@@ -4776,10 +4815,10 @@ def ats_upload_doc(doc_token):
     if not doc_name or not file:
         return jsonify({"message": "doc_name and document are required"}), 400
 
-    # ── Size check (8 MB) ──────────────────────────────────────────────────
+    # ── Size check (15 MB) ─────────────────────────────────────────────────
     file.seek(0, 2)
-    if file.tell() > 8 * 1024 * 1024:
-        return jsonify({"message": "File too large (max 8 MB)"}), 400
+    if file.tell() > 15 * 1024 * 1024:
+        return jsonify({"message": "File too large (max 15 MB)"}), 400
     file.seek(0)
 
     # ── MIME + magic bytes validation ──────────────────────────────────────
@@ -4826,7 +4865,18 @@ def ats_upload_doc(doc_token):
         {"_id": c["_id"]},
         {"$set": {"documents": docs, "updated_at": now}}
     )
-    return jsonify({"documents": docs}), 200
+
+    # Return only actually-uploaded docs (skip pre-seeded placeholders with no url)
+    safe_docs = []
+    for d in docs:
+        if not d.get("url"):
+            continue
+        d2 = dict(d)
+        for f in ("uploaded_at", "reviewed_at"):
+            if isinstance(d2.get(f), datetime):
+                d2[f] = d2[f].isoformat()
+        safe_docs.append(d2)
+    return jsonify({"url": url, "documents": safe_docs}), 200
 
 
 @app.route("/api/admin/ats/candidates/<candidate_id>/document", methods=["PUT"])
@@ -5303,14 +5353,15 @@ def chat_conversations():
 
     result = []
     for c in convs:
-        cid = str(c["_id"])
+        cid    = str(c["_id"])
+        last_at = c.get("last_at")
         result.append({
             "_id":          cid,
             "type":         c.get("type"),
             "name":         c.get("name"),
             "members":      c.get("members", []),
             "last_message": c.get("last_message"),
-            "last_at":      c.get("last_at"),
+            "last_at":      last_at.isoformat() if last_at else None,
             "unread":       unread_map.get(cid, 0),
         })
     return jsonify({"conversations": result}), 200
@@ -5342,6 +5393,9 @@ def chat_create_dm():
     })
     if existing:
         existing["_id"] = str(existing["_id"])
+        for f in ("last_at", "created_at"):
+            if isinstance(existing.get(f), datetime):
+                existing[f] = existing[f].isoformat()
         return jsonify({"conversation": existing}), 200
 
     now  = datetime.now(timezone.utc)
@@ -5351,8 +5405,8 @@ def chat_create_dm():
         "members":      [uid, peer_id],
         "created_by":   uid,
         "last_message": None,
-        "last_at":      now,
-        "created_at":   now,
+        "last_at":      now.isoformat(),
+        "created_at":   now.isoformat(),
     }
     res  = conversations_col.insert_one(doc)
     doc["_id"] = str(res.inserted_id)
@@ -5380,8 +5434,8 @@ def chat_create_channel():
         "members":      members,
         "created_by":   uid,
         "last_message": None,
-        "last_at":      now,
-        "created_at":   now,
+        "last_at":      now.isoformat(),
+        "created_at":   now.isoformat(),
     }
     res = conversations_col.insert_one(doc)
     doc["_id"] = str(res.inserted_id)
@@ -5403,6 +5457,8 @@ def chat_get_messages(conv_id):
     )
     for m in msgs:
         m["_id"] = str(m["_id"])
+        if isinstance(m.get("created_at"), datetime):
+            m["created_at"] = m["created_at"].isoformat()
     return jsonify({"messages": msgs}), 200
 
 
@@ -5430,6 +5486,7 @@ def chat_send_message(conv_id):
     }
     res = messages_col.insert_one(msg)
     msg["_id"] = str(res.inserted_id)
+    msg["created_at"] = now.isoformat()
 
     # Keep conversation list sorted and preview up-to-date
     conversations_col.update_one(
