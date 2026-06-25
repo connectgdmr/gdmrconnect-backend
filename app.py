@@ -31,6 +31,8 @@ from bson import ObjectId
 from datetime import datetime, timedelta, timezone, time
 import pytz
 from flask_bcrypt import Bcrypt
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import threading
 import cloudinary
 import cloudinary.uploader
@@ -42,7 +44,20 @@ from apscheduler.schedulers.background import BackgroundScheduler
 load_dotenv()
 
 app = Flask(__name__)
+app.config['BCRYPT_LOG_ROUNDS'] = 12   # explicit cost; Flask-Bcrypt default is already 12
 bcrypt = Bcrypt(app)
+
+# Timing-safe dummy hash — used when a login email is not found so response
+# time stays constant and doesn't leak whether the account exists.
+_DUMMY_HASH = bcrypt.generate_password_hash("__dummy__sentinel__").decode()
+
+# Rate limiter — memory:// resets on restart; set REDIS_URL env var for persistence
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=[],
+    storage_uri=os.getenv("REDIS_URL", "memory://"),
+)
 
 # =============================================================================
 # 2. CLOUDINARY CONFIGURATION (For Image Uploads & Assets)
@@ -219,6 +234,16 @@ try:
 except Exception as _mig_err:
     print(f"Warning: shift migration failed: {_mig_err}")
 
+try:
+    _lk_count = users_col.update_many(
+        {"failed_login_attempts": {"$exists": False}},
+        {"$set": {"failed_login_attempts": 0, "locked_until": None}}
+    ).modified_count
+    if _lk_count:
+        print(f"Startup migration: added lockout fields to {_lk_count} user(s).")
+except Exception as _lk_err:
+    print(f"Warning: lockout migration failed: {_lk_err}")
+
 
 # =============================================================================
 # 5. UTILITY & HELPER FUNCTIONS
@@ -258,6 +283,19 @@ def is_strong_password(password):
     if not re.search(r"\d", password): return False
     if not re.search(r"[@$!%*?&#^_\-]", password): return False
     return True
+
+
+# C0 control chars except \t (0x09) \n (0x0a) \r (0x0d) — never belong in form fields
+_CTRL_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+def _sanitize(value, max_len=500):
+    """Strip control characters and enforce a length cap. Returns '' for non-strings."""
+    if not isinstance(value, str):
+        return ""
+    return _CTRL_RE.sub("", value).strip()[:max_len]
+
+def _valid_email(email):
+    return bool(re.match(r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$', email))
 
 
 def _serialize_emp_status(user_doc):
@@ -397,24 +435,46 @@ def token_required(f):
 # =============================================================================
 
 @app.route("/api/login", methods=["POST"])
+@limiter.limit("10 per minute")
 def login():
-    """
-    Authenticates a user against the database and returns a short-lived JWT token.
-    Provides basic user payload so the frontend knows how to route the dashboard.
-    """
-    data = request.json
-    email = data.get("email")
-    password = data.get("password")
+    data     = request.get_json(silent=True) or {}
+    email    = _sanitize(data.get("email") or "", max_len=254).lower()
+    password = data.get("password") or ""
 
     if not email or not password:
         return jsonify({"message": "Email and password are required."}), 400
+    if not _valid_email(email):
+        # Fail fast on bad format without a DB hit — still generic message
+        return jsonify({"message": "Incorrect email or password."}), 401
 
     user = users_col.find_one({"email": email})
-    
-    if not user or not bcrypt.check_password_hash(user["password"], password):
-        return jsonify({"message": "Invalid credentials. Please check your email and password."}), 401
 
-    # Generate Token valid for 4 hours
+    if not user:
+        # Constant-time dummy compare prevents timing-based account enumeration
+        bcrypt.check_password_hash(_DUMMY_HASH, password)
+        return jsonify({"message": "Incorrect email or password."}), 401
+
+    # Account lockout check
+    now          = datetime.now(timezone.utc)
+    locked_until = user.get("locked_until")
+    if locked_until and locked_until > now:
+        mins_left = max(1, int((locked_until - now).total_seconds() / 60) + 1)
+        return jsonify({"message": f"Account locked due to too many failed attempts. Try again in {mins_left} minute(s)."}), 423
+
+    if not bcrypt.check_password_hash(user["password"], password):
+        attempts    = user.get("failed_login_attempts", 0) + 1
+        lock_fields = {"failed_login_attempts": attempts}
+        if attempts >= 5:
+            lock_fields["locked_until"] = now + timedelta(minutes=15)
+        users_col.update_one({"_id": user["_id"]}, {"$set": lock_fields})
+        return jsonify({"message": "Incorrect email or password."}), 401
+
+    # Success — clear lockout state
+    users_col.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"failed_login_attempts": 0, "locked_until": None}}
+    )
+
     token = jwt.encode({
         "user_id": str(user["_id"]),
         "exp": datetime.now(timezone.utc) + timedelta(hours=4)
@@ -423,7 +483,7 @@ def login():
     return jsonify({
         "token": token,
         "role": user.get("role", "employee"),
-        "password_changed": user.get("password_changed", False), 
+        "password_changed": user.get("password_changed", False),
         "user": {
             "name": user.get("name"),
             "email": user.get("email"),
@@ -462,14 +522,18 @@ def set_own_password():
     return jsonify({"message": "Password updated successfully!"}), 200
 
 
+def _forgot_pw_key():
+    """Rate-limit key = IP + normalised email so per-account hammering is capped too."""
+    data  = request.get_json(silent=True) or {}
+    email = _sanitize(data.get("email") or "", 254).lower()
+    return f"{get_remote_address()}:{email}"
+
+
 @app.route("/api/forgot-password", methods=["POST"])
+@limiter.limit("5 per hour", key_func=_forgot_pw_key)
 def forgot_password():
-    """
-    Generates a temporary secure password and emails it to the user.
-    Flags the user account to require a password change on next login.
-    """
-    data = request.json
-    email = data.get("email")
+    data  = request.get_json(silent=True) or {}
+    email = _sanitize(data.get("email") or "", max_len=254).lower()
 
     user = users_col.find_one({"email": email})
     if not user:
