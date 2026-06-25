@@ -20,7 +20,7 @@ Key Modules Included:
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
-import base64, os, re, csv, io, secrets, gzip
+import base64, os, re, csv, io, secrets, gzip, time as _time
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -5526,6 +5526,12 @@ def send_weekly_work_reports():
 # TEAM CHAT
 # =============================================================================
 
+# In-memory typing indicators: {conv_id: {user_id: monotonic_timestamp}}
+# Works correctly for single-worker deployments (Railway default).
+_typing_state: dict = {}
+_typing_lock = threading.Lock()
+
+
 def _serialize_conv(c, uid):
     c["_id"] = str(c["_id"])
     return c
@@ -5711,20 +5717,29 @@ def chat_create_channel():
 @app.route("/api/chat/conversations/<conv_id>/messages", methods=["GET"])
 @token_required
 def chat_get_messages(conv_id):
-    """Return up to 200 messages oldest→newest. Caller must be a member."""
-    uid = str(request.user["_id"])
-    if not _member_check(conv_id, uid):
+    """Return up to 200 messages oldest→newest. Filters hidden_for and per-user cleared_at."""
+    uid  = str(request.user["_id"])
+    conv = _member_check(conv_id, uid)
+    if not conv:
         return jsonify({"message": "Conversation not found or access denied"}), 404
 
-    msgs = list(
-        messages_col.find({"conversation_id": conv_id})
-        .sort("created_at", 1)
-        .limit(200)
-    )
+    query: dict = {
+        "conversation_id": conv_id,
+        "hidden_for":      {"$nin": [uid]},
+    }
+    # Per-user "clear for me": only return messages sent after the caller's clear timestamp
+    user_cleared_at = (conv.get("cleared_at") or {}).get(uid)
+    if user_cleared_at:
+        query["created_at"] = {"$gt": user_cleared_at}
+
+    msgs = list(messages_col.find(query).sort("created_at", 1).limit(200))
     for m in msgs:
         m["_id"] = str(m["_id"])
         if isinstance(m.get("created_at"), datetime):
             m["created_at"] = m["created_at"].isoformat()
+        if isinstance(m.get("edited_at"), datetime):
+            m["edited_at"] = m["edited_at"].isoformat()
+        m.pop("hidden_for", None)   # internal field — don't expose to client
     return jsonify({"messages": msgs}), 200
 
 
@@ -5861,15 +5876,17 @@ def chat_clear_messages(conv_id):
 @app.route("/api/chat/conversations/<conv_id>", methods=["DELETE"])
 @token_required
 def chat_delete_conversation(conv_id):
-    """Delete a channel and all its messages. Admin only. DMs are not deletable."""
+    """Delete a channel and all its messages. Allowed for admin or the channel's creator."""
     uid  = str(request.user["_id"])
     conv = _member_check(conv_id, uid)
     if not conv:
         return jsonify({"message": "Conversation not found or access denied"}), 404
-    if request.user.get("role") != "admin":
-        return jsonify({"message": "Admin only"}), 403
     if conv.get("type") != "channel":
         return jsonify({"message": "Only channels can be deleted. DMs cannot be removed."}), 400
+    is_admin   = request.user.get("role") == "admin"
+    is_creator = conv.get("created_by") == uid
+    if not is_admin and not is_creator:
+        return jsonify({"message": "Only the channel creator or an admin may delete this channel"}), 403
 
     messages_col.delete_many({"conversation_id": conv_id})
     conversations_col.delete_one({"_id": ObjectId(conv_id)})
@@ -5889,6 +5906,137 @@ def chat_unread_count():
         "read_by":         {"$nin": [uid]},
     })
     return jsonify({"count": count}), 200
+
+
+# ── Presence ─────────────────────────────────────────────────────────────────
+
+@app.route("/api/chat/heartbeat", methods=["POST"])
+@token_required
+def chat_heartbeat():
+    """Mark the caller as online by stamping last_seen = now on their user doc."""
+    uid = str(request.user["_id"])
+    now = datetime.now(timezone.utc)
+    users_col.update_one({"_id": ObjectId(uid)}, {"$set": {"last_seen": now}})
+    return jsonify({"ok": True}), 200
+
+
+@app.route("/api/chat/online", methods=["GET"])
+@token_required
+def chat_online():
+    """Return user ids seen in the last 60 seconds (i.e. last_seen >= now - 60s)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
+    online = [
+        str(u["_id"])
+        for u in users_col.find({"last_seen": {"$gte": cutoff}}, {"_id": 1})
+    ]
+    return jsonify({"online": online}), 200
+
+
+# ── Typing indicators ─────────────────────────────────────────────────────────
+
+@app.route("/api/chat/conversations/<conv_id>/typing", methods=["POST"])
+@token_required
+def chat_typing_post(conv_id):
+    """Record that the caller is currently typing in this conversation (TTL ~6s)."""
+    uid = str(request.user["_id"])
+    if not _member_check(conv_id, uid):
+        return jsonify({"message": "Conversation not found or access denied"}), 404
+    with _typing_lock:
+        if conv_id not in _typing_state:
+            _typing_state[conv_id] = {}
+        _typing_state[conv_id][uid] = _time.monotonic()
+    return jsonify({"ok": True}), 200
+
+
+@app.route("/api/chat/conversations/<conv_id>/typing", methods=["GET"])
+@token_required
+def chat_typing_get(conv_id):
+    """Return members who sent a typing event in the last 6 seconds, excluding the caller."""
+    uid = str(request.user["_id"])
+    if not _member_check(conv_id, uid):
+        return jsonify({"message": "Conversation not found or access denied"}), 404
+
+    cutoff = _time.monotonic() - 6.0
+    active_ids = []
+    with _typing_lock:
+        for user_id, ts in list(_typing_state.get(conv_id, {}).items()):
+            if ts >= cutoff and user_id != uid:
+                active_ids.append(user_id)
+
+    typing = []
+    if active_ids:
+        oids = []
+        for aid in active_ids:
+            try:
+                oids.append(ObjectId(aid))
+            except Exception:
+                pass
+        for u in users_col.find({"_id": {"$in": oids}}, {"name": 1}):
+            typing.append({"_id": str(u["_id"]), "name": u.get("name", "")})
+
+    return jsonify({"typing": typing}), 200
+
+
+# ── Per-user hide / clear ─────────────────────────────────────────────────────
+
+@app.route("/api/chat/conversations/<conv_id>/messages/<msg_id>/hide", methods=["POST"])
+@token_required
+def chat_hide_message(conv_id, msg_id):
+    """Hide one message for the caller only (delete-for-me). Other members still see it."""
+    uid = str(request.user["_id"])
+    if not _member_check(conv_id, uid):
+        return jsonify({"message": "Conversation not found or access denied"}), 404
+
+    try:
+        msg_obj = ObjectId(msg_id)
+    except Exception:
+        return jsonify({"message": "Invalid message ID"}), 400
+
+    result = messages_col.update_one(
+        {"_id": msg_obj, "conversation_id": conv_id},
+        {"$addToSet": {"hidden_for": uid}},
+    )
+    if result.matched_count == 0:
+        return jsonify({"message": "Message not found"}), 404
+    return jsonify({"ok": True}), 200
+
+
+@app.route("/api/chat/conversations/<conv_id>/clear", methods=["POST"])
+@token_required
+def chat_clear_for_me(conv_id):
+    """Clear all current messages for the caller only (clear-for-me).
+    Stores a per-user cleared_at timestamp; chat_get_messages filters messages older than it."""
+    uid  = str(request.user["_id"])
+    conv = _member_check(conv_id, uid)
+    if not conv:
+        return jsonify({"message": "Conversation not found or access denied"}), 404
+
+    now = datetime.now(timezone.utc)
+    conversations_col.update_one(
+        {"_id": ObjectId(conv_id)},
+        {"$set": {f"cleared_at.{uid}": now}},
+    )
+    return jsonify({"ok": True}), 200
+
+
+# ── Channel membership ────────────────────────────────────────────────────────
+
+@app.route("/api/chat/conversations/<conv_id>/leave", methods=["POST"])
+@token_required
+def chat_leave_channel(conv_id):
+    """Remove the caller from a channel's member list. DMs cannot be left."""
+    uid  = str(request.user["_id"])
+    conv = _member_check(conv_id, uid)
+    if not conv:
+        return jsonify({"message": "Conversation not found or access denied"}), 404
+    if conv.get("type") == "dm":
+        return jsonify({"message": "You cannot leave a DM conversation"}), 400
+
+    conversations_col.update_one(
+        {"_id": ObjectId(conv_id)},
+        {"$pull": {"members": uid}},
+    )
+    return jsonify({"ok": True}), 200
 
 
 # Initialize the background scheduler
