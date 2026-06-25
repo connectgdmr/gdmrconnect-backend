@@ -4681,9 +4681,24 @@ def delete_client(client_id):
 # =============================================================================
 
 ATS_STATUSES = (
-    "Applied", "Screening", "Interview",
-    "Offer Released", "Offer Accepted", "Hired",
-    "Rejected", "Withdrawn",
+    "Applied",
+    "Screening Call Scheduled",
+    "Technical Assessment",
+    "Technical Interview",
+    "HR Interview",
+    "Management Interview",
+    "Shortlisted",
+    "Documentation Pending",
+    "Offer Released",
+    "Offer Accepted",
+    "Joined",
+    "Rejected",
+    "On Hold",
+    "Withdrawn",
+    # Legacy values kept so existing records remain valid
+    "Screening",
+    "Interview",
+    "Hired",
 )
 
 DOC_CHECKLIST_DEFAULT = [
@@ -4718,7 +4733,310 @@ def _ats_scope_query(user):
 
 def _serialize_ats(c):
     c["_id"] = str(c["_id"])
+    for f in ("applied_at", "created_at", "updated_at",
+              "hired_at", "offer_released_at", "offer_accepted_at"):
+        if isinstance(c.get(f), datetime):
+            c[f] = c[f].isoformat()
+    for entry in c.get("status_history", []):
+        if isinstance(entry.get("at"), datetime):
+            entry["at"] = entry["at"].isoformat()
+    for rec in c.get("recordings", []):
+        if isinstance(rec.get("added_at"), datetime):
+            rec["added_at"] = rec["added_at"].isoformat()
+    for doc in c.get("documents", []):
+        if isinstance(doc.get("uploaded_at"), datetime):
+            doc["uploaded_at"] = doc["uploaded_at"].isoformat()
+        if isinstance(doc.get("reviewed_at"), datetime):
+            doc["reviewed_at"] = doc["reviewed_at"].isoformat()
     return c
+
+
+_ATS_BRAND = "#34a06a"
+_ATS_DASH   = "https://www.gdmrconnect.com"
+
+def _ats_email_wrapper(inner_html, cta_label, cta_url):
+    """Wrap ATS email content in the standard GDMR branded shell."""
+    cta = (
+        f'<a href="{cta_url}" style="display:inline-block;margin-top:22px;'
+        f'background:{_ATS_BRAND};color:#fff;text-decoration:none;padding:11px 22px;'
+        f'border-radius:8px;font-weight:600;font-size:14px">{cta_label}</a>'
+        if cta_url else ""
+    )
+    return (
+        f'<div style="font-family:\'Segoe UI\',Arial,sans-serif;max-width:600px;'
+        f'margin:auto;border:1px solid #e6eaef;border-radius:12px;overflow:hidden">'
+        f'<div style="background:{_ATS_BRAND};color:#fff;padding:18px 24px">'
+        f'<h2 style="margin:0;font-size:18px">GDMR Foundation — Recruitment Update</h2></div>'
+        f'<div style="padding:24px;color:#0f172a;font-size:14px;line-height:1.6">'
+        f'{inner_html}{cta}</div>'
+        f'<div style="background:#f8fafc;padding:14px 24px;font-size:12px;color:#94a3b8;text-align:center">'
+        f'This is an automated message from GDMR Foundation. Do not reply directly.</div></div>'
+    )
+
+
+# Keys must match entries in ATS_STATUSES exactly.
+# Placeholders: {candidate_name}, {job_role}, {portal_url}
+# Omit a status key to send no email for that transition.
+STATUS_EMAIL_TEMPLATES = {
+    "Screening Call Scheduled": {
+        "subject": "Next Step: Screening Call — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "Thank you for applying for the {job_role} position at GDMR Foundation.\n"
+            "We have reviewed your application and would like to schedule a brief screening call "
+            "to learn more about your background and experience.\n\n"
+            "Our HR team will reach out shortly to confirm the date and time.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>Thank you for applying for the <strong>{job_role}</strong> role at GDMR Foundation.</p>"
+            "<p>We have reviewed your application and would like to schedule a brief <strong>Screening Call</strong> "
+            "to learn more about your background. Our HR team will reach out shortly to confirm the date and time.</p>"
+            "<p>We look forward to speaking with you!</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Technical Assessment": {
+        "subject": "Technical Assessment — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "Congratulations on clearing the initial screening for the {job_role} role.\n"
+            "The next step in your application is a Technical Assessment. "
+            "Our team will share the assessment details and timeline with you shortly.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>Congratulations on clearing the initial screening for the <strong>{job_role}</strong> role!</p>"
+            "<p>The next step is a <strong>Technical Assessment</strong>. "
+            "Our team will share the assessment link and instructions with you shortly.</p>"
+            "<p>Please keep an eye on your inbox.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Technical Interview": {
+        "subject": "Interview Invitation: Technical Round — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "We are pleased to invite you for a Technical Interview for the {job_role} position.\n"
+            "Our HR team will be in touch soon with the schedule and joining details.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>We are pleased to invite you for a <strong>Technical Interview</strong> "
+            "for the <strong>{job_role}</strong> position at GDMR Foundation.</p>"
+            "<p>Our HR team will share the schedule and joining link shortly. "
+            "Please confirm your availability when contacted.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "HR Interview": {
+        "subject": "Interview Invitation: HR Round — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "We are pleased to invite you for an HR Interview for the {job_role} position.\n"
+            "Our team will be in touch soon with the schedule and details.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>We are pleased to invite you for an <strong>HR Interview</strong> "
+            "for the <strong>{job_role}</strong> position at GDMR Foundation.</p>"
+            "<p>Our HR team will confirm the schedule and joining details shortly.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Management Interview": {
+        "subject": "Interview Invitation: Management Round — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "Congratulations on progressing to the Management Interview round for the {job_role} role.\n"
+            "Our team will reach out shortly with the schedule.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>Congratulations on progressing to the <strong>Management Interview</strong> "
+            "round for the <strong>{job_role}</strong> role!</p>"
+            "<p>Our team will share the schedule and details shortly.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Shortlisted": {
+        "subject": "Great News — You've Been Shortlisted! | GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "We are delighted to inform you that you have been shortlisted for the {job_role} role "
+            "at GDMR Foundation.\n\n"
+            "Our HR team will be in touch with you shortly regarding the next steps.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>We are delighted to inform you that you have been <strong>shortlisted</strong> "
+            "for the <strong>{job_role}</strong> role at GDMR Foundation! 🎉</p>"
+            "<p>Our HR team will be in touch shortly with details about the next steps in the process.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Documentation Pending": {
+        "subject": "Action Required: Upload Your Documents — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "As part of your selection process for the {job_role} role at GDMR Foundation, "
+            "we require you to upload certain documents.\n\n"
+            "Please use the following link to access your secure document portal:\n"
+            "{portal_url}\n\n"
+            "Kindly upload the required documents at the earliest.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>As part of your selection process for the <strong>{job_role}</strong> role, "
+            "we require you to upload certain documents via our secure portal.</p>"
+            "<p>Please click the button below to access your personalised document portal and "
+            "upload the requested files at the earliest.</p>",
+            "Upload Documents", "{portal_url}",
+        ),
+    },
+    "Offer Released": {
+        "subject": "Congratulations — Offer Letter | GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "We are thrilled to extend an offer of employment to you for the {job_role} role at GDMR Foundation.\n\n"
+            "Our HR team will be in touch shortly with the formal offer letter and onboarding details.\n\n"
+            "Congratulations and we look forward to welcoming you to the team!\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>We are thrilled to extend an <strong>offer of employment</strong> to you for the "
+            "<strong>{job_role}</strong> role at GDMR Foundation! 🎉</p>"
+            "<p>Our HR team will share the formal offer letter and onboarding details shortly. "
+            "Please review and revert at your earliest convenience.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Offer Accepted": {
+        "subject": "Offer Accepted — Welcome to GDMR Foundation!",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "We are overjoyed that you have accepted our offer for the {job_role} role!\n\n"
+            "Our HR team will reach out with your onboarding schedule and joining instructions.\n\n"
+            "Welcome to the GDMR family!\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>We are overjoyed that you have <strong>accepted our offer</strong> for the "
+            "<strong>{job_role}</strong> role! 🎊</p>"
+            "<p>Our HR team will reach out shortly with your onboarding schedule and joining instructions. "
+            "Welcome to the GDMR family — we can't wait to have you on board!</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Joined": {
+        "subject": "Welcome to GDMR Foundation!",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "A very warm welcome to GDMR Foundation!\n\n"
+            "We are excited to have you join us as {job_role}. "
+            "Your manager and HR team will guide you through the onboarding process.\n\n"
+            "We look forward to a wonderful journey together.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>A very warm welcome to <strong>GDMR Foundation</strong>! 🎉</p>"
+            "<p>We are thrilled to have you join us as <strong>{job_role}</strong>. "
+            "Your manager and HR team will guide you through your onboarding journey.</p>"
+            "<p>We look forward to achieving great things together!</p>",
+            "Visit GDMR Connect", _ATS_DASH,
+        ),
+    },
+    "Rejected": {
+        "subject": "Your Application Status — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "Thank you for your interest in the {job_role} position at GDMR Foundation "
+            "and for taking the time to go through our selection process.\n\n"
+            "After careful consideration, we regret to inform you that we will not be moving "
+            "forward with your application at this time.\n\n"
+            "We appreciate your effort and encourage you to apply for future openings that match your profile.\n\n"
+            "We wish you the very best in your career.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>Thank you for your interest in the <strong>{job_role}</strong> position at GDMR Foundation "
+            "and for the time and effort you invested in our selection process.</p>"
+            "<p>After careful consideration, we regret to inform you that we will not be moving "
+            "forward with your application at this time.</p>"
+            "<p>We truly appreciate your enthusiasm and encourage you to apply for future openings "
+            "that align with your skills. We wish you the very best in your career ahead.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "On Hold": {
+        "subject": "Application Update — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "We wanted to keep you informed that your application for the {job_role} role "
+            "is currently on hold.\n\n"
+            "We will get back to you as soon as there is an update. Thank you for your patience.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>We wanted to keep you informed that your application for the "
+            "<strong>{job_role}</strong> role is currently <strong>on hold</strong>.</p>"
+            "<p>We will reach out as soon as there is an update. Thank you for your patience.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    # "Applied", "Withdrawn", "Screening", "Interview", "Hired" — no email sent
+}
+
+
+def _send_ats_status_email(candidate: dict, status: str):
+    """Send a status-change email to the candidate. Logs failures — never raises."""
+    import traceback
+    try:
+        template = STATUS_EMAIL_TEMPLATES.get(status)
+        if not template:
+            return
+
+        name     = candidate.get("name", "Candidate")
+        job_role = (candidate.get("role") or candidate.get("department") or "the advertised position")
+        email    = (candidate.get("email") or "").strip()
+        if not email:
+            print(f"[ats-email] no email address on candidate {candidate.get('_id')} — skipping")
+            return
+
+        doc_token  = candidate.get("doc_token") or ""
+        portal_url = (
+            f"https://www.gdmrconnect.com/documents/{doc_token}"
+            if doc_token else _ATS_DASH
+        )
+
+        subject = template["subject"].format(
+            candidate_name=name, job_role=job_role, portal_url=portal_url
+        )
+        plain = template["plain"].format(
+            candidate_name=name, job_role=job_role, portal_url=portal_url
+        )
+        html = template["html"].format(
+            candidate_name=_html.escape(name),
+            job_role=_html.escape(job_role),
+            portal_url=portal_url,
+        )
+
+        ok = send_email(to_email=email, subject=subject, body=plain, html_body=html)
+        print(f"[ats-email] status={status!r} to={email!r} sent={ok}")
+    except Exception as exc:
+        print(f"[ats-email] EXCEPTION for status={status!r}: {exc}\n{traceback.format_exc()}")
 
 
 # ── Admin endpoints ──────────────────────────────────────────────────────────
@@ -4731,6 +5049,30 @@ def ats_list_candidates():
     query = _ats_scope_query(request.user)
     candidates = list(ats_candidates_col.find(query).sort("applied_at", -1))
     return jsonify([_serialize_ats(c) for c in candidates]), 200
+
+
+@app.route("/api/admin/ats/candidates/<candidate_id>", methods=["GET"])
+@token_required
+def ats_get_candidate(candidate_id):
+    """Return the full candidate document including all profile fields, status_history,
+    recordings, portfolio_links, and documents."""
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    candidate = ats_candidates_col.find_one({"_id": obj})
+    if not candidate:
+        return jsonify({"message": "Candidate not found"}), 404
+
+    # Scope check for managers
+    scope = _ats_scope_query(request.user)
+    if scope and candidate.get("department") != request.user.get("department"):
+        return jsonify({"message": "Access denied"}), 403
+
+    return jsonify(_serialize_ats(candidate)), 200
 
 
 @app.route("/api/admin/ats/candidates", methods=["POST"])
@@ -4859,9 +5201,9 @@ def ats_update_status(candidate_id):
     now = datetime.now(timezone.utc)
     history_entry = {"status": status, "at": now, "by": str(request.user["_id"])}
     set_fields    = {"status": status, "updated_at": now}
-    if status == "Hired":           set_fields["hired_at"]          = now
-    elif status == "Offer Released": set_fields["offer_released_at"] = now
-    elif status == "Offer Accepted": set_fields["offer_accepted_at"] = now
+    if status in ("Hired", "Joined"): set_fields["hired_at"]          = now
+    elif status == "Offer Released":  set_fields["offer_released_at"] = now
+    elif status == "Offer Accepted":  set_fields["offer_accepted_at"] = now
 
     result = ats_candidates_col.update_one(
         {"_id": obj},
@@ -4869,7 +5211,17 @@ def ats_update_status(candidate_id):
     )
     if result.matched_count == 0:
         return jsonify({"message": "Candidate not found"}), 404
-    return jsonify(_serialize_ats(ats_candidates_col.find_one({"_id": obj}))), 200
+
+    updated = ats_candidates_col.find_one({"_id": obj})
+
+    # Fire status-change notification email — async, never blocks the response
+    threading.Thread(
+        target=_send_ats_status_email,
+        args=(dict(updated), status),
+        daemon=True,
+    ).start()
+
+    return jsonify(_serialize_ats(updated)), 200
 
 
 @app.route("/api/admin/ats/candidates/<candidate_id>/recording", methods=["POST"])
