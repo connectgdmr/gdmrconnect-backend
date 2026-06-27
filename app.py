@@ -4553,6 +4553,11 @@ def upsert_my_work_plan():
     if not isinstance(tasks, list):
         return jsonify({"message": "tasks must be a list"}), 400
 
+    # Ensure every task has a stable string id so the PUT array-filter always resolves
+    for task in tasks:
+        if isinstance(task, dict) and not task.get("id"):
+            task["id"] = secrets.token_hex(8)
+
     now = datetime.now(timezone.utc)
     set_fields = {
         "employee_id":   uid,
@@ -4598,21 +4603,24 @@ def update_my_task(plan_id, task_id):
     now = datetime.now(timezone.utc)
     update_doc = {"$set": {"tasks.$[t].status": status, "updated_at": now}}
 
-    # Tasks may store their id as "id" or "_id" — try both
+    # Primary match: tasks store id as "id" (set at save time by upsert_my_work_plan)
     result = work_plans_col.update_one(
         {"_id": obj, "employee_id": uid},
         update_doc,
-        array_filters=[{"t.id": task_id}]
+        array_filters=[{"t.id": task_id}],
     )
     if result.matched_count == 0:
         return jsonify({"message": "Plan not found or not yours"}), 404
+
     if result.modified_count == 0:
-        # Plan exists but t.id didn't match — try t._id
-        work_plans_col.update_one(
+        # Fallback: legacy tasks stored with "_id" key instead
+        result2 = work_plans_col.update_one(
             {"_id": obj, "employee_id": uid},
             update_doc,
-            array_filters=[{"t._id": task_id}]
+            array_filters=[{"t._id": task_id}],
         )
+        if result2.modified_count == 0:
+            return jsonify({"message": "Task not found in plan"}), 404
 
     plan = work_plans_col.find_one({"_id": obj})
     return jsonify(_serialize_plan(plan)), 200
