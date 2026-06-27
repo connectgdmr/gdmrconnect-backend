@@ -4549,6 +4549,11 @@ def upsert_my_work_plan():
     if status not in ("draft", "submitted"):
         return jsonify({"message": "status must be 'draft' or 'submitted'"}), 400
 
+    # notify: false → caller is updating task statuses only; skip re-stamping
+    # submitted_at so the 11 AM manager-summary job doesn't treat this as a
+    # fresh submission and the manager doesn't see a duplicate notification.
+    notify = data.get("notify", True)
+
     tasks = data.get("tasks", [])
     if not isinstance(tasks, list):
         return jsonify({"message": "tasks must be a list"}), 400
@@ -4568,7 +4573,7 @@ def upsert_my_work_plan():
         "status":        status,
         "updated_at":    now,
     }
-    if status == "submitted":
+    if status == "submitted" and notify is not False:
         set_fields["submitted_at"] = now
 
     work_plans_col.update_one(
@@ -4577,8 +4582,6 @@ def upsert_my_work_plan():
         upsert=True
     )
 
-    # On submit the plan becomes eligible for the manager's 11 AM consolidated
-    # email — the scheduled job picks up all submitted plans for the day.
     plan = work_plans_col.find_one({"employee_id": uid, "date": date_str})
     return jsonify(_serialize_plan(plan)), 200
 
