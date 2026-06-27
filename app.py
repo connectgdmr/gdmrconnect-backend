@@ -1741,6 +1741,7 @@ def checkin_photo():
         return jsonify({"message": "No image data received from frontend."}), 400
 
     location = data.get("location") or None  # optional — never block on missing
+    print("CHECKIN LOCATION:", location)
 
     try:
         upload_result = cloudinary.uploader.upload(img_data, folder="attendance_photos")
@@ -1838,6 +1839,7 @@ def checkout_photo():
         return jsonify({"message": "No image data provided"}), 400
 
     location = data.get("location") or None  # optional — never block on missing
+    print("CHECKOUT LOCATION:", location)
 
     try:
         upload_result = cloudinary.uploader.upload(img_data, folder="attendance_photos")
