@@ -4275,12 +4275,71 @@ def upsert_salary(employee_id):
         return jsonify({"message": "Employee not found"}), 404
 
     data = request.json or {}
-    struct = {f: _to_money(data.get(f, 0)) for f in SALARY_EARNINGS + SALARY_DEDUCTIONS}
-    struct["employee_id"] = employee_id
-    struct["updated_at"]  = datetime.now(timezone.utc)
+    salary_fields = {f: _to_money(data.get(f, 0)) for f in SALARY_EARNINGS + SALARY_DEDUCTIONS}
 
-    salary_structures_col.update_one({"employee_id": employee_id}, {"$set": struct}, upsert=True)
-    return jsonify({"message": "Salary structure saved", "salary": {f: struct[f] for f in SALARY_EARNINGS + SALARY_DEDUCTIONS}}), 200
+    now = datetime.now(timezone.utc)
+
+    effective_date_raw = data.get("effective_date")
+    if effective_date_raw:
+        try:
+            effective_date = datetime.strptime(str(effective_date_raw)[:10], "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"message": "Invalid effective_date. Use YYYY-MM-DD."}), 400
+    else:
+        effective_date = now
+
+    history_entry = {
+        **salary_fields,
+        "effective_date":   effective_date,
+        "increment_type":   str(data.get("increment_type",   "")).strip(),
+        "increment_reason": str(data.get("increment_reason", "")).strip(),
+        "recorded_at":      now,
+    }
+
+    salary_structures_col.update_one(
+        {"employee_id": employee_id},
+        {
+            "$set":  {**salary_fields, "employee_id": employee_id, "updated_at": now},
+            "$push": {"salary_history": history_entry},
+        },
+        upsert=True,
+    )
+    return jsonify({"message": "Salary structure saved", "salary": salary_fields}), 200
+
+
+@app.route("/api/admin/payroll/salaries/<employee_id>/history", methods=["GET"])
+@token_required
+def get_salary_history(employee_id):
+    """Return the full salary increment history for an employee, oldest first."""
+    if not _payroll_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    try:
+        emp = users_col.find_one({"_id": ObjectId(employee_id)}, {"name": 1})
+    except Exception:
+        return jsonify({"message": "Invalid employee ID"}), 400
+    if not emp:
+        return jsonify({"message": "Employee not found"}), 404
+
+    struct = salary_structures_col.find_one({"employee_id": employee_id})
+    if not struct:
+        return jsonify([]), 200
+
+    history = struct.get("salary_history", [])
+    history.sort(key=lambda h: h.get("effective_date") or datetime.min)
+
+    result = []
+    for entry in history:
+        row = {f: entry.get(f, 0) for f in SALARY_EARNINGS + SALARY_DEDUCTIONS}
+        ed = entry.get("effective_date")
+        row["effective_date"]   = ed.isoformat() if isinstance(ed, datetime) else ed
+        row["increment_type"]   = entry.get("increment_type", "")
+        row["increment_reason"] = entry.get("increment_reason", "")
+        rec = entry.get("recorded_at")
+        row["recorded_at"]      = rec.isoformat() if isinstance(rec, datetime) else rec
+        result.append(row)
+
+    return jsonify(result), 200
 
 
 @app.route("/api/admin/payroll/run", methods=["POST"])
@@ -5061,7 +5120,21 @@ def ats_list_candidates():
         return jsonify({"message": "Unauthorized"}), 403
     query = _ats_scope_query(request.user)
     candidates = list(ats_candidates_col.find(query).sort("applied_at", -1))
-    return jsonify([_serialize_ats(c) for c in candidates]), 200
+    serialized = [_serialize_ats(c) for c in candidates]
+
+    sourced_ids = list({c["sourced_by"] for c in serialized if c.get("sourced_by")})
+    sourced_map = {}
+    if sourced_ids:
+        try:
+            obj_ids = [ObjectId(sid) for sid in sourced_ids]
+            for u in users_col.find({"_id": {"$in": obj_ids}}, {"name": 1}):
+                sourced_map[str(u["_id"])] = u["name"]
+        except Exception:
+            pass
+    for c in serialized:
+        c["sourced_by_name"] = sourced_map.get(c.get("sourced_by") or "")
+
+    return jsonify(serialized), 200
 
 
 @app.route("/api/admin/ats/candidates/<candidate_id>", methods=["GET"])
@@ -5085,7 +5158,17 @@ def ats_get_candidate(candidate_id):
     if scope and candidate.get("department") != request.user.get("department"):
         return jsonify({"message": "Access denied"}), 403
 
-    return jsonify(_serialize_ats(candidate)), 200
+    result = _serialize_ats(candidate)
+    sourced_by = result.get("sourced_by")
+    if sourced_by:
+        try:
+            sourcer = users_col.find_one({"_id": ObjectId(sourced_by)}, {"name": 1})
+            result["sourced_by_name"] = sourcer["name"] if sourcer else None
+        except Exception:
+            result["sourced_by_name"] = None
+    else:
+        result["sourced_by_name"] = None
+    return jsonify(result), 200
 
 
 @app.route("/api/admin/ats/candidates", methods=["POST"])
@@ -5103,6 +5186,13 @@ def ats_create_candidate():
     if isinstance(skills, str):
         skills = [s.strip() for s in skills.split(",") if s.strip()]
 
+    sourced_by = str(data.get("sourced_by", "")).strip() or None
+    if sourced_by:
+        try:
+            ObjectId(sourced_by)
+        except Exception:
+            return jsonify({"message": "Invalid sourced_by employee ID"}), 400
+
     now = datetime.now(timezone.utc)
     doc = {
         "name":             name,
@@ -5111,6 +5201,7 @@ def ats_create_candidate():
         "department":       str(data.get("department", "")).strip(),
         "role":             str(data.get("role", "")).strip(),
         "source":           str(data.get("source", "")).strip(),
+        "sourced_by":       sourced_by,
         "status":           "Applied",
         "skills":           skills,
         "experience_years": data.get("experience_years"),
@@ -5146,7 +5237,7 @@ def ats_update_candidate(candidate_id):
     editable = [
         "name", "email", "phone", "department", "role", "source",
         "skills", "experience_years", "current_company",
-        "resume_url", "notes", "joining_date",
+        "resume_url", "notes", "joining_date", "sourced_by",
     ]
     update = {"updated_at": datetime.now(timezone.utc)}
     for f in editable:
@@ -5154,6 +5245,14 @@ def ats_update_candidate(candidate_id):
             update[f] = data[f]
     if "skills" in update and isinstance(update["skills"], str):
         update["skills"] = [s.strip() for s in update["skills"].split(",") if s.strip()]
+    if "sourced_by" in update:
+        val = str(update["sourced_by"]).strip() if update["sourced_by"] else None
+        if val:
+            try:
+                ObjectId(val)
+            except Exception:
+                return jsonify({"message": "Invalid sourced_by employee ID"}), 400
+        update["sourced_by"] = val
 
     result = ats_candidates_col.update_one({"_id": obj}, {"$set": update})
     if result.matched_count == 0:
@@ -5226,15 +5325,38 @@ def ats_update_status(candidate_id):
         return jsonify({"message": "Candidate not found"}), 404
 
     updated = ats_candidates_col.find_one({"_id": obj})
+    return jsonify(_serialize_ats(updated)), 200
 
-    # Fire status-change notification email — async, never blocks the response
+
+@app.route("/api/admin/ats/candidates/<candidate_id>/send-status-email", methods=["POST"])
+@token_required
+def ats_send_status_email(candidate_id):
+    """Manually fire the status-update email for a candidate at a given status."""
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    status = str((request.json or {}).get("status", "")).strip()
+    if not status:
+        return jsonify({"message": "status is required"}), 400
+    if status not in STATUS_EMAIL_TEMPLATES:
+        available = ", ".join(sorted(STATUS_EMAIL_TEMPLATES))
+        return jsonify({"message": f"No email template for '{status}'. Available: {available}"}), 400
+
+    candidate = ats_candidates_col.find_one({"_id": obj})
+    if not candidate:
+        return jsonify({"message": "Candidate not found"}), 404
+
     threading.Thread(
         target=_send_ats_status_email,
-        args=(dict(updated), status),
+        args=(dict(candidate), status),
         daemon=True,
     ).start()
 
-    return jsonify(_serialize_ats(updated)), 200
+    return jsonify({"message": f"Status email for '{status}' queued"}), 200
 
 
 @app.route("/api/admin/ats/candidates/<candidate_id>/recording", methods=["POST"])
