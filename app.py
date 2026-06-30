@@ -4216,8 +4216,14 @@ def complete_lesson(lesson_id):
 # =============================================================================
 
 # Salary component field groups
-SALARY_EARNINGS   = ["basic", "hra", "conveyance", "medical", "special", "other_earnings"]
-SALARY_DEDUCTIONS = ["pf", "professional_tax", "tds", "other_deductions"]
+SALARY_EARNINGS   = ["basic", "da", "hra", "travel_allowance", "other_allowance"]
+SALARY_DEDUCTIONS = ["pf", "esi", "lop", "tds", "other_deductions"]
+# bonus is stored separately — added to gross for net but not part of SALARY_EARNINGS
+# Display/metadata fields stored on the salary structure and snapshotted into payslips
+SALARY_DISPLAY_FIELDS = [
+    "emp_code", "designation", "grade_profile",
+    "days_worked", "bank_detail", "transaction_detail", "transaction_date",
+]
 
 
 def _payroll_allowed(user):
@@ -4252,6 +4258,9 @@ def list_salaries():
         salary = None
         if s:
             salary = {f: s.get(f, 0) for f in SALARY_EARNINGS + SALARY_DEDUCTIONS}
+            salary["bonus"] = _to_money(s.get("bonus", 0))
+            for df in SALARY_DISPLAY_FIELDS:
+                salary[df] = s.get(df)
         rows.append({
             "employee_id":   eid,
             "employee_name": e.get("name", ""),
@@ -4276,6 +4285,16 @@ def upsert_salary(employee_id):
 
     data = request.json or {}
     salary_fields = {f: _to_money(data.get(f, 0)) for f in SALARY_EARNINGS + SALARY_DEDUCTIONS}
+    salary_fields["bonus"] = _to_money(data.get("bonus", 0))
+
+    # Optional display/metadata fields — stored as-is, no coercion
+    display_fields = {}
+    for df in SALARY_DISPLAY_FIELDS:
+        if df in data:
+            display_fields[df] = data[df]
+    # Ensure transaction_detail has a default when first set
+    if "transaction_detail" not in display_fields:
+        display_fields.setdefault("transaction_detail", "Complete")
 
     now = datetime.now(timezone.utc)
 
@@ -4299,12 +4318,12 @@ def upsert_salary(employee_id):
     salary_structures_col.update_one(
         {"employee_id": employee_id},
         {
-            "$set":  {**salary_fields, "employee_id": employee_id, "updated_at": now},
+            "$set":  {**salary_fields, **display_fields, "employee_id": employee_id, "updated_at": now},
             "$push": {"salary_history": history_entry},
         },
         upsert=True,
     )
-    return jsonify({"message": "Salary structure saved", "salary": salary_fields}), 200
+    return jsonify({"message": "Salary structure saved", "salary": {**salary_fields, **display_fields}}), 200
 
 
 @app.route("/api/admin/payroll/salaries/<employee_id>/history", methods=["GET"])
@@ -4331,6 +4350,7 @@ def get_salary_history(employee_id):
     result = []
     for entry in history:
         row = {f: entry.get(f, 0) for f in SALARY_EARNINGS + SALARY_DEDUCTIONS}
+        row["bonus"] = _to_money(entry.get("bonus", 0))
         ed = entry.get("effective_date")
         row["effective_date"]   = ed.isoformat() if isinstance(ed, datetime) else ed
         row["increment_type"]   = entry.get("increment_type", "")
@@ -4382,9 +4402,17 @@ def run_payroll():
         # Snapshot the numbers at generation time — never a live reference
         earnings   = {f: _to_money(s.get(f, 0)) for f in SALARY_EARNINGS}
         deductions = {f: _to_money(s.get(f, 0)) for f in SALARY_DEDUCTIONS}
+        bonus            = _to_money(s.get("bonus", 0))
         gross            = round(sum(earnings.values()), 2)
         total_deductions = round(sum(deductions.values()), 2)
-        net              = round(gross - total_deductions, 2)
+        net              = round(gross + bonus - total_deductions, 2)
+
+        # Snapshot optional display fields from the salary structure
+        display = {df: s.get(df) for df in SALARY_DISPLAY_FIELDS}
+        if not display.get("transaction_detail"):
+            display["transaction_detail"] = "Complete"
+        if not display.get("designation"):
+            display["designation"] = emp.get("position", "")
 
         payslip = {
             "employee_id":      eid,
@@ -4395,9 +4423,11 @@ def run_payroll():
             "period":           period,
             **earnings,
             **deductions,
+            "bonus":            bonus,
             "gross":            gross,
             "total_deductions": total_deductions,
             "net":              net,
+            **display,
             "status":           "Pending",
             "created_at":       now,
         }
