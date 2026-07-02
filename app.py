@@ -2642,16 +2642,19 @@ def request_correction():
     if usage_count >= 3:
         return jsonify({"message": "Monthly limit of 3 corrections reached"}), 400
 
-    data = request.json
+    data = request.json or {}
+    # Prefer body-supplied name (frontend knows it); fall back to JWT user name
+    employee_name = str(data.get("employee_name") or request.user.get("name") or "").strip() or None
     correction = {
-        "user_id": uid,
-        "manager_id": request.user.get("manager_id"),
+        "user_id":       uid,
+        "employee_name": employee_name,
+        "manager_id":    request.user.get("manager_id"),
         "attendance_id": data.get("attendance_id"),
-        "new_time": data.get("new_time"),
-        "reason": data.get("reason"),
-        "status": "Pending",
-        "month": month_str,
-        "created_at": datetime.now(timezone.utc)
+        "new_time":      data.get("new_time"),
+        "reason":        data.get("reason"),
+        "status":        "Pending",
+        "month":         month_str,
+        "created_at":    datetime.now(timezone.utc),
     }
     corrections_col.insert_one(correction)
     return jsonify({"message": "Correction request dispatched"}), 201
@@ -2673,7 +2676,10 @@ def manager_corrections():
     rows = []
     for c in corrections_col.find(query).sort("created_at", -1):
         c["_id"] = str(c["_id"])
-        c["employee_name"] = emp_map.get(c.get("user_id"), "Unknown")
+        uid = c.get("user_id")
+        # Live lookup wins; fall back to name stored on the record, then "Unknown"
+        c["employee_name"] = emp_map.get(uid) or c.get("employee_name") or "Unknown"
+        c["user_id"] = uid  # always present for frontend cross-reference
         rows.append(c)
     return jsonify(rows), 200
 
