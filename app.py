@@ -3532,16 +3532,20 @@ def create_course():
         return jsonify({"message": "title is required"}), 400
     expiry_raw = data.get("expiry_date")
     doc = {
-        "title":         title,
-        "description":   str(data.get("description", "")).strip(),
-        "category":      str(data.get("category", "Technical")).strip(),
-        "thumbnail_url": str(data.get("thumbnail_url", "")).strip(),
-        "content_url":   str(data.get("content_url", "")).strip(),
-        "tags":          data.get("tags", []),
-        "modules":       _normalize_modules(data.get("modules", [])),
-        "expiry_date":   str(expiry_raw)[:10] if expiry_raw else None,
-        "created_by":    str(request.user["_id"]),
-        "created_at":    datetime.now(timezone.utc),
+        "title":            title,
+        "description":      str(data.get("description", "")).strip(),
+        "category":         str(data.get("category", "Technical")).strip(),
+        "thumbnail_url":    str(data.get("thumbnail_url", "")).strip(),
+        "content_url":      str(data.get("content_url", "")).strip(),
+        "tags":             data.get("tags", []),
+        "modules":          _normalize_modules(data.get("modules", [])),
+        "expiry_date":      str(expiry_raw)[:10] if expiry_raw else None,
+        "course_code":      str(data.get("course_code", "")).strip(),
+        "created_by_name":  str(data.get("created_by_name", request.user.get("name", ""))).strip(),
+        "created_by_role":  "admin",
+        "department":       str(data.get("department", "")).strip(),
+        "created_by":       str(request.user["_id"]),
+        "created_at":       datetime.now(timezone.utc),
     }
     res = lms_courses_col.insert_one(doc)
     doc["_id"] = str(res.inserted_id)
@@ -3559,7 +3563,8 @@ def update_course(course_id):
         return jsonify({"message": "Invalid ID"}), 400
     data = request.json or {}
     update = {"updated_at": datetime.now(timezone.utc)}
-    for k in ["title", "description", "category", "thumbnail_url", "content_url", "tags"]:
+    for k in ["title", "description", "category", "thumbnail_url", "content_url",
+              "tags", "course_code", "created_by_name", "department"]:
         if k in data:
             update[k] = data[k]
     if "modules" in data:
@@ -3704,6 +3709,251 @@ def lms_progress():
 
         # Count using the SAME dual-key matching as the employee endpoint so the
         # admin view and the employee view always report identical progress
+        completed_set = set(r.get("completed_lessons", []))
+        total = 0
+        done  = 0
+        if course:
+            for m_idx, mod in enumerate(course.get("modules", [])):
+                for l_idx, ls in enumerate(mod.get("lessons", [])):
+                    total += 1
+                    ls_id     = str(ls.get("_id", ls.get("id", "")))
+                    key_byidx = f"{m_idx}_{l_idx}"
+                    if (ls_id and ls_id in completed_set) or (key_byidx in completed_set):
+                        done += 1
+        pct = round(done / total * 100) if total else 0
+
+        result.append({
+            "_id":               str(r["_id"]),
+            "employee_name":     emp.get("name") if emp else "Unknown",
+            "department":        emp.get("department") if emp else None,
+            "course_id":         r.get("course_id"),
+            "course_title":      course.get("title") if course else "Unknown",
+            "total_lessons":     total,
+            "completed_lessons": done,
+            "percent_complete":  pct,
+            "status":            r.get("status", "Assigned"),
+            "last_activity":     r.get("last_activity"),
+            "assigned_at":       r.get("assigned_at"),
+            "completed_at":      r.get("completed_at"),
+        })
+    return jsonify(result), 200
+
+
+# =============================================================================
+# LMS — MANAGER ENDPOINTS
+# =============================================================================
+
+@app.route("/api/manager/lms/courses", methods=["GET"])
+@token_required
+def manager_list_courses():
+    """All admin-created courses plus courses this manager created."""
+    if request.user.get("role") != "manager":
+        return jsonify({"message": "Unauthorized"}), 403
+    manager_uid = str(request.user["_id"])
+    query = {"$or": [{"created_by_role": "admin"}, {"created_by": manager_uid}]}
+    rows = []
+    for c in lms_courses_col.find(query).sort("created_at", -1):
+        c["_id"] = str(c["_id"])
+        rows.append(c)
+    return jsonify(rows), 200
+
+
+@app.route("/api/manager/lms/courses", methods=["POST"])
+@token_required
+def manager_create_course():
+    """Create a new course owned by this manager. Visible to admins via GET /api/admin/lms/courses."""
+    if request.user.get("role") != "manager":
+        return jsonify({"message": "Unauthorized"}), 403
+    data = request.json or {}
+    title = str(data.get("title", "")).strip()
+    if not title:
+        return jsonify({"message": "title is required"}), 400
+    expiry_raw = data.get("expiry_date")
+    doc = {
+        "title":           title,
+        "description":     str(data.get("description", "")).strip(),
+        "category":        str(data.get("category", "Technical")).strip(),
+        "thumbnail_url":   str(data.get("thumbnail_url", "")).strip(),
+        "modules":         _normalize_modules(data.get("modules", [])),
+        "expiry_date":     str(expiry_raw)[:10] if expiry_raw else None,
+        "course_code":     str(data.get("course_code", "")).strip(),
+        "created_by_name": str(data.get("created_by_name", request.user.get("name", ""))).strip(),
+        "created_by_role": "manager",
+        "department":      str(data.get("department", request.user.get("department", ""))).strip(),
+        "created_by":      str(request.user["_id"]),
+        "created_at":      datetime.now(timezone.utc),
+    }
+    res = lms_courses_col.insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    return jsonify(doc), 201
+
+
+@app.route("/api/manager/lms/courses/<course_id>", methods=["PUT"])
+@token_required
+def manager_update_course(course_id):
+    """Update a course. Only the manager who created it may edit."""
+    if request.user.get("role") != "manager":
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(course_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    course = lms_courses_col.find_one({"_id": obj})
+    if not course:
+        return jsonify({"message": "Course not found"}), 404
+    if course.get("created_by") != str(request.user["_id"]):
+        return jsonify({"message": "You can only edit courses you created"}), 403
+
+    data = request.json or {}
+    update = {"updated_at": datetime.now(timezone.utc)}
+    for k in ["title", "description", "category", "thumbnail_url",
+              "course_code", "created_by_name", "department"]:
+        if k in data:
+            update[k] = data[k]
+    if "modules" in data:
+        update["modules"] = _normalize_modules(data.get("modules", []))
+    if "expiry_date" in data:
+        expiry_raw = data["expiry_date"]
+        update["expiry_date"] = str(expiry_raw)[:10] if expiry_raw else None
+
+    lms_courses_col.update_one({"_id": obj}, {"$set": update})
+    return jsonify({"message": "Course updated"}), 200
+
+
+@app.route("/api/manager/lms/courses/<course_id>", methods=["DELETE"])
+@token_required
+def manager_delete_course(course_id):
+    """Delete a course. Only the manager who created it may delete."""
+    if request.user.get("role") != "manager":
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(course_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    course = lms_courses_col.find_one({"_id": obj})
+    if not course:
+        return jsonify({"message": "Course not found"}), 404
+    if course.get("created_by") != str(request.user["_id"]):
+        return jsonify({"message": "You can only delete courses you created"}), 403
+
+    lms_courses_col.delete_one({"_id": obj})
+    lms_progress_col.delete_many({"course_id": course_id})
+    return jsonify({"message": "Course deleted"}), 200
+
+
+@app.route("/api/manager/lms/courses/<course_id>/assign", methods=["POST"])
+@token_required
+def manager_assign_course(course_id):
+    """Assign a course to employees in the manager's department."""
+    if request.user.get("role") != "manager":
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        course_obj = ObjectId(course_id)
+    except Exception:
+        return jsonify({"message": "Invalid course ID"}), 400
+
+    course = lms_courses_col.find_one({"_id": course_obj})
+    if not course:
+        return jsonify({"message": "Course not found"}), 404
+
+    manager_uid = str(request.user["_id"])
+    if course.get("created_by_role") != "admin" and course.get("created_by") != manager_uid:
+        return jsonify({"message": "Access denied"}), 403
+
+    manager_dept = request.user.get("department")
+    data = request.json or {}
+    employee_ids = list(data.get("employee_ids") or [])
+    if not employee_ids:
+        return jsonify({"message": "employee_ids is required"}), 400
+
+    dept_emp_ids = {
+        str(e["_id"])
+        for e in users_col.find({"department": manager_dept, "role": "employee"}, {"_id": 1})
+    }
+    invalid = [eid for eid in employee_ids if eid not in dept_emp_ids]
+    if invalid:
+        return jsonify({"message": f"Employees not in your department: {', '.join(invalid)}"}), 400
+
+    scheduled_at_raw = data.get("scheduled_at")
+    scheduled_at = None
+    if scheduled_at_raw:
+        try:
+            scheduled_at = IST.localize(
+                datetime.strptime(scheduled_at_raw[:16], "%Y-%m-%dT%H:%M")
+            ).astimezone(timezone.utc)
+        except Exception:
+            pass
+
+    now = datetime.now(timezone.utc)
+    assigned = skipped = 0
+    for uid in employee_ids:
+        try:
+            result = lms_progress_col.update_one(
+                {"course_id": course_id, "user_id": uid},
+                {"$setOnInsert": {
+                    "course_id":    course_id,
+                    "user_id":      uid,
+                    "status":       "Assigned",
+                    "progress_pct": 0,
+                    "assigned_at":  now,
+                    "scheduled_at": scheduled_at,
+                    "completed_at": None,
+                }},
+                upsert=True
+            )
+            if result.upserted_id:
+                assigned += 1
+            else:
+                skipped += 1
+        except Exception:
+            pass
+
+    msg = f"Course assigned to {assigned} employee(s)"
+    if skipped:
+        msg += f" ({skipped} already assigned, skipped)"
+    return jsonify({"message": msg, "assigned": assigned, "skipped": skipped}), 200
+
+
+@app.route("/api/manager/lms/progress", methods=["GET"])
+@token_required
+def manager_lms_progress():
+    """Progress records scoped to employees in this manager's department."""
+    if request.user.get("role") != "manager":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    manager_dept = request.user.get("department")
+    dept_emp_ids = [
+        str(e["_id"])
+        for e in users_col.find({"department": manager_dept, "role": "employee"}, {"_id": 1})
+    ]
+
+    course_id = request.args.get("course_id")
+    query = {"user_id": {"$in": dept_emp_ids}}
+    if course_id:
+        query["course_id"] = course_id
+
+    rows = list(lms_progress_col.find(query))
+
+    uids = []
+    for r in rows:
+        try: uids.append(ObjectId(r["user_id"]))
+        except Exception: pass
+    emp_map = {str(e["_id"]): e for e in users_col.find({"_id": {"$in": uids}}, {"name": 1, "department": 1})}
+
+    cids = list({r["course_id"] for r in rows})
+    course_objs = []
+    for c in cids:
+        try: course_objs.append(ObjectId(c))
+        except Exception: pass
+    course_map = {str(c["_id"]): c for c in lms_courses_col.find({"_id": {"$in": course_objs}})}
+
+    result = []
+    for r in rows:
+        course = course_map.get(r.get("course_id"))
+        emp    = emp_map.get(r.get("user_id"))
+
         completed_set = set(r.get("completed_lessons", []))
         total = 0
         done  = 0
