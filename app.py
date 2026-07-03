@@ -1822,12 +1822,15 @@ def checkout_photo():
         else:
             status_indicator = "On Time"
 
-    elif employee_shift == "general":  # general shift checkout: 5:00 PM – 8:00 PM
-        if not (time(17, 0) <= current_time < time(20, 0)):
+    elif employee_shift == "general":  # general shift checkout: opens 5:00 PM; late after 8:00 PM
+        if current_time < time(17, 0):
             return jsonify({
-                "message": "Check-out is allowed 5:00 PM – 8:00 PM for General Shift."
+                "message": "Check-out opens at 5:00 PM for General Shift."
             }), 400
-        status_indicator = "On Time"
+        if current_time >= time(20, 0):
+            status_indicator = "Late Checkout"
+        else:
+            status_indicator = "On Time"
 
     else:  # night shift checkout: 7 PM – 7 AM
         hour = now_ist.hour
