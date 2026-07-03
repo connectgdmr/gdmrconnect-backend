@@ -1803,7 +1803,7 @@ def checkout_photo():
         HALF_DAY_OUT_START = time(13, 0)
         HALF_DAY_OUT_END = time(14, 0)
         FULL_DAY_OUT_START = time(18, 0)
-        LATE_CHECKOUT_START = time(19, 30)
+        LATE_CHECKOUT_START = time(20, 0)
 
         checkin_dt = utc_to_ist(checkin["time"])
         checkin_time = checkin_dt.time()
@@ -1822,10 +1822,10 @@ def checkout_photo():
         else:
             status_indicator = "On Time"
 
-    elif employee_shift == "general":  # general shift checkout: 5:00 PM – 7:00 PM
-        if not (time(17, 0) <= current_time < time(19, 0)):
+    elif employee_shift == "general":  # general shift checkout: 5:00 PM – 8:00 PM
+        if not (time(17, 0) <= current_time < time(20, 0)):
             return jsonify({
-                "message": "Check-out is allowed 5:00 PM – 7:00 PM for General Shift."
+                "message": "Check-out is allowed 5:00 PM – 8:00 PM for General Shift."
             }), 400
         status_indicator = "On Time"
 
