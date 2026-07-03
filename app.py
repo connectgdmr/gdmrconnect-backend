@@ -1720,14 +1720,14 @@ def checkin_photo():
             status_indicator = "Present (Late)"
         day_type = "full"
 
-    else:  # night shift check-in: 5:30 PM – 7:15 PM (late from 7:00 PM)
-        TIME_1730 = time(17, 30)
+    else:  # night shift check-in: 4:30 PM – 7:15 PM (late from 7:00 PM)
+        TIME_1630 = time(16, 30)
         TIME_1900 = time(19, 0)
         TIME_1915 = time(19, 15)
 
-        if current_time < TIME_1730:
+        if current_time < TIME_1630:
             return jsonify({
-                "message": "Check-in opens at 5:30 PM for Night Shift."
+                "message": "Check-in opens at 4:30 PM for Night Shift."
             }), 400
         elif current_time < TIME_1900:
             status_indicator = "Present (On-Time)"
