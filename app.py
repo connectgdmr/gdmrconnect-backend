@@ -1706,14 +1706,18 @@ def checkin_photo():
                 "message": "Check-in closed for the day. Marked as Absent (Full Day)."
             }), 400
 
-    elif employee_shift == "general":  # general shift check-in: 8:00 AM – 10:00 AM
+    elif employee_shift == "general":  # general shift check-in: 8:00 AM – 9:15 AM
         TIME_0800 = time(8, 0)
-        TIME_1000 = time(10, 0)
-        if not (TIME_0800 <= current_time < TIME_1000):
+        TIME_0900 = time(9, 0)
+        TIME_0915 = time(9, 15)
+        if current_time < TIME_0800 or current_time >= TIME_0915:
             return jsonify({
-                "message": "Check-in is allowed 8:00 AM – 10:00 AM for General Shift."
+                "message": "Check-in is allowed 8:00 AM – 9:15 AM for General Shift."
             }), 400
-        status_indicator = "Present (On-Time)"
+        if current_time < TIME_0900:
+            status_indicator = "Present (On-Time)"
+        else:
+            status_indicator = "Present (Late)"
         day_type = "full"
 
     else:  # night shift check-in: 5:30 PM – 7:15 PM (late from 7:00 PM)
