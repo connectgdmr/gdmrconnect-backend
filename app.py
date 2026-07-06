@@ -2652,16 +2652,23 @@ def request_correction():
     data = request.json or {}
     # Prefer body-supplied name (frontend knows it); fall back to JWT user name
     employee_name = str(data.get("employee_name") or request.user.get("name") or "").strip() or None
+
+    submitted_by_role = str(data.get("submitted_by_role", "")).strip()
+    # Manager-submitted corrections skip the manager queue and go straight to admin
+    approval_target = "admin" if submitted_by_role == "manager" else "manager"
+
     correction = {
-        "user_id":       uid,
-        "employee_name": employee_name,
-        "manager_id":    request.user.get("manager_id"),
-        "attendance_id": data.get("attendance_id"),
-        "new_time":      data.get("new_time"),
-        "reason":        data.get("reason"),
-        "status":        "Pending",
-        "month":         month_str,
-        "created_at":    datetime.now(timezone.utc),
+        "user_id":           uid,
+        "employee_name":     employee_name,
+        "manager_id":        request.user.get("manager_id"),
+        "attendance_id":     data.get("attendance_id"),
+        "new_time":          data.get("new_time"),
+        "reason":            data.get("reason"),
+        "status":            "Pending",
+        "month":             month_str,
+        "submitted_by_role": submitted_by_role or "employee",
+        "approval_target":   approval_target,
+        "created_at":        datetime.now(timezone.utc),
     }
     corrections_col.insert_one(correction)
     return jsonify({"message": "Correction request dispatched"}), 201
@@ -2678,7 +2685,10 @@ def manager_corrections():
     dept_users = [str(u["_id"]) for u in dept_emp_list]
     emp_map = {str(u["_id"]): u["name"] for u in dept_emp_list}
 
-    query = {"$or": [{"manager_id": str(request.user["_id"])}, {"user_id": {"$in": dept_users}}]}
+    query = {
+        "$or":             [{"manager_id": str(request.user["_id"])}, {"user_id": {"$in": dept_users}}],
+        "approval_target": {"$ne": "admin"},   # manager-submitted corrections go to admin, not here
+    }
 
     rows = []
     for c in corrections_col.find(query).sort("created_at", -1):
@@ -2791,6 +2801,80 @@ def approve_correction():
         except Exception as e:
             print("Error updating attendance log:", e)
     
+    return jsonify({"message": f"Correction {action}"}), 200
+
+
+@app.route("/api/admin/corrections", methods=["GET"])
+@token_required
+def admin_corrections():
+    """Correction requests routed to admin — i.e. submitted by managers."""
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    rows = []
+    for c in corrections_col.find({"approval_target": "admin"}).sort("created_at", -1):
+        c["_id"] = str(c["_id"])
+        uid = c.get("user_id")
+        try:
+            emp = users_col.find_one({"_id": ObjectId(uid)}, {"name": 1}) if uid else None
+        except Exception:
+            emp = None
+        c["employee_name"] = (emp.get("name") if emp else None) or c.get("employee_name") or "Unknown"
+        c["user_id"] = uid
+        rows.append(c)
+    return jsonify(rows), 200
+
+
+@app.route("/api/admin/approve-correction", methods=["POST"])
+@token_required
+def admin_approve_correction():
+    """Admin approves or rejects a correction request targeted at admin."""
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data = request.json or {}
+    cid    = data.get("id")
+    action = data.get("action")
+
+    if not cid or not action:
+        return jsonify({"message": "id and action are required"}), 400
+
+    try:
+        correction = corrections_col.find_one({"_id": ObjectId(cid)})
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    if not correction:
+        return jsonify({"message": "Not found"}), 404
+
+    corrections_col.update_one({"_id": ObjectId(cid)}, {"$set": {"status": action}})
+
+    if action == "Approved":
+        try:
+            new_time_str = correction["new_time"]
+            if "T" in new_time_str and not new_time_str.endswith("Z") and "+" not in new_time_str:
+                new_dt = datetime.fromisoformat(new_time_str)
+            else:
+                new_dt = datetime.fromisoformat(new_time_str.replace("Z", "+00:00"))
+
+            original_record = (
+                attendance_col.find_one({"_id": ObjectId(correction["attendance_id"])})
+                if correction.get("attendance_id") else None
+            )
+            record_type = original_record.get("type", "checkin") if original_record else "checkin"
+
+            attendance_col.insert_one({
+                "user_id":          correction["user_id"],
+                "type":             record_type,
+                "date":             str(new_dt.date()),
+                "time":             new_dt,
+                "photo_url":        None,
+                "status_indicator": "Corrected",
+                "correction_ref":   cid,
+            })
+        except Exception as e:
+            print("Error updating attendance log:", e)
+
     return jsonify({"message": f"Correction {action}"}), 200
 
 
