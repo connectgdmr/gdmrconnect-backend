@@ -891,7 +891,7 @@ def manager_my_employees():
         return jsonify({"message": "Unauthorized"}), 403
 
     rows = []
-    for u in users_col.find({"department": request.user.get("department"), "role": "employee"}, {"password": 0}):
+    for u in users_col.find({"department": {"$in": _mgr_depts(request.user)}, "role": "employee"}, {"password": 0}):
         u["_id"] = str(u["_id"])
         rows.append(u)
 
@@ -1308,33 +1308,29 @@ def save_pms_template():
     if request.user.get("role") not in ["admin", "manager"]: 
         return jsonify({"message": "Unauthorized"}), 403
     
-    data = request.json 
-    dept_to_update = data.get("department", "All")
-    
-    if request.user.get("role") == "manager":
-        dept_to_update = request.user.get("department")
+    data = request.json
+    mgr_id = str(request.user["_id"])
+    is_manager = request.user.get("role") == "manager"
+
+    dept_to_store = _mgr_depts(request.user) if is_manager else data.get("department", "All")
 
     assigned_to_list = data.get("assigned_to", [])
     if not assigned_to_list:
         return jsonify({"message": "You must assign the template to at least one employee."}), 400
 
     template_record = {
-        "department": dept_to_update,
+        "department": dept_to_store,
         "sessions": data.get("sessions", []),
         "assigned_to": assigned_to_list,
         "cycle_name": data.get("cycle_name", ""),
         "due_date": data.get("due_date", ""),
-        "created_by": str(request.user["_id"]),
+        "created_by": mgr_id,
         "updated_at": datetime.now(timezone.utc)
     }
 
-    # We update based on the department to maintain departmental templates, 
-    # but the assigned_to list dictates who actually SEES it.
-    pms_templates_col.update_one(
-        {"department": dept_to_update},
-        {"$set": template_record},
-        upsert=True
-    )
+    # Managers own one template (keyed by creator); admins key by department.
+    upsert_key = {"created_by": mgr_id} if is_manager else {"department": dept_to_store}
+    pms_templates_col.update_one(upsert_key, {"$set": template_record}, upsert=True)
     
     return jsonify({"message": f"PMS Form Assigned to {len(assigned_to_list)} employees successfully!"}), 200
 
@@ -1403,9 +1399,9 @@ def get_manager_pms():
     """ Fetches all pending and completed PMS reviews for a manager's department. """
     if request.user.get("role") not in ["manager", "admin"]: return jsonify({"message": "Unauthorized"}), 403
     
-    my_dept = request.user.get("department")
-    query = {"department": my_dept} if request.user.get("role") == "manager" else {}
-    
+    depts = _mgr_depts(request.user)
+    query = {"department": {"$in": depts}} if request.user.get("role") == "manager" else {}
+
     reviews = list(pms_reviews_col.find(query).sort("self_assessment_date", -1))
     uids = []
     for r in reviews:
@@ -1434,7 +1430,7 @@ def pms_calibration():
     month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
 
     if request.user.get("role") == "manager":
-        query = {"month": month, "department": request.user.get("department")}
+        query = {"month": month, "department": {"$in": _mgr_depts(request.user)}}
     else:
         query = {"month": month}
 
@@ -1563,7 +1559,7 @@ def pms_dashboard():
     dashboard_data = {}
     
     if request.user.get("role") == "manager":
-        departments = [request.user.get("department")]
+        departments = _mgr_depts(request.user)
     else:
         departments = users_col.distinct("department")
         
@@ -1611,7 +1607,7 @@ def export_pms():
     
     query = {"month": month}
     if request.user.get("role") == "manager":
-        query["department"] = request.user.get("department")
+        query["department"] = {"$in": _mgr_depts(request.user)}
     
     si = io.StringIO()
     cw = csv.writer(si)
@@ -2372,9 +2368,9 @@ def manager_get_assets():
     if request.user.get("role") not in ["manager", "admin"]:
         return jsonify({"message": "Unauthorized access to team assets."}), 403
         
-    my_dept = request.user.get("department")
+    depts = _mgr_depts(request.user)
     # If the user is an admin acting as a manager, they can see all, otherwise restrict to dept
-    query = {"department": my_dept} if request.user.get("role") == "manager" else {}
+    query = {"department": {"$in": depts}} if request.user.get("role") == "manager" else {}
     
     rows = []
     for asset in assets_col.find(query).sort("created_at", -1):
@@ -2521,11 +2517,11 @@ def manager_assign_asset(asset_id):
     if not emails:
         return jsonify({"message": "At least one recipient email is required"}), 400
 
-    # Managers may only assign assets that belong to their own department
+    # Managers may only assign assets that belong to one of their departments
     if role == "manager":
-        mgr_dept   = (request.user.get("department") or "").strip().lower()
+        mgr_depts  = [d.strip().lower() for d in _mgr_depts(request.user)]
         asset_dept = (asset.get("department") or "").strip().lower()
-        if mgr_dept and asset_dept and mgr_dept != asset_dept:
+        if mgr_depts and asset_dept and asset_dept not in mgr_depts:
             return jsonify({"message": "You can only assign assets for your own department"}), 403
 
     subject = f"Asset Request Approved — {asset.get('asset_name', 'Asset')}"
@@ -2893,27 +2889,28 @@ def get_notification_counts():
     }
 
     if role == "manager":
-        my_dept = request.user.get("department")
-        dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept}, {"_id": 1})]
+        mgr_id = str(request.user["_id"])
+        mgr_users = [str(u["_id"]) for u in users_col.find({"manager_id": mgr_id}, {"_id": 1})]
+        mgr_depts = _mgr_depts(request.user)
 
         counts["leaves"] = leaves_col.count_documents({
-            "user_id": {"$in": dept_users},
+            "user_id": {"$in": mgr_users},
             "status": "Pending",
             "manager_status": "Pending"
         })
 
         counts["pms"] = pms_reviews_col.count_documents({
-            "user_id": {"$in": dept_users},
+            "user_id": {"$in": mgr_users},
             "status": "Pending Review"
         })
 
         counts["corrections"] = corrections_col.count_documents({
-            "user_id": {"$in": dept_users},
+            "user_id": {"$in": mgr_users},
             "status": "Pending"
         })
 
         counts["assets"] = assets_col.count_documents({
-            "department": my_dept,
+            "department": {"$in": mgr_depts},
             "manager_status": "Pending"
         })
 
@@ -2960,8 +2957,10 @@ def birthday_notifications():
             }
         }
 
-        if role in ("employee", "manager"):
+        if role == "employee":
             base_filter["department"] = dept
+        elif role == "manager":
+            base_filter["department"] = {"$in": _mgr_depts(request.user)}
 
         celebrants = list(users_col.find(base_filter, {"name": 1}))
 
@@ -3959,7 +3958,7 @@ def manager_assign_course(course_id):
     if course.get("created_by_role") != "admin" and course.get("created_by") != manager_uid:
         return jsonify({"message": "Access denied"}), 403
 
-    manager_dept = request.user.get("department")
+    manager_depts = _mgr_depts(request.user)
     data = request.json or {}
     employee_ids = list(data.get("employee_ids") or [])
     if not employee_ids:
@@ -3967,7 +3966,7 @@ def manager_assign_course(course_id):
 
     dept_emp_ids = {
         str(e["_id"])
-        for e in users_col.find({"department": manager_dept, "role": "employee"}, {"_id": 1})
+        for e in users_col.find({"department": {"$in": manager_depts}, "role": "employee"}, {"_id": 1})
     }
     invalid = [eid for eid in employee_ids if eid not in dept_emp_ids]
     if invalid:
@@ -4020,10 +4019,10 @@ def manager_lms_progress():
     if request.user.get("role") != "manager":
         return jsonify({"message": "Unauthorized"}), 403
 
-    manager_dept = request.user.get("department")
+    manager_depts = _mgr_depts(request.user)
     dept_emp_ids = [
         str(e["_id"])
-        for e in users_col.find({"department": manager_dept, "role": "employee"}, {"_id": 1})
+        for e in users_col.find({"department": {"$in": manager_depts}, "role": "employee"}, {"_id": 1})
     ]
 
     course_id = request.args.get("course_id")
@@ -4862,6 +4861,14 @@ def _today_ist():
     return datetime.now(IST).date()
 
 
+def _mgr_depts(user):
+    """Return a manager's departments as a flat non-empty list (handles both string and array values)."""
+    d = user.get("department")
+    if isinstance(d, list):
+        return [x for x in d if x]
+    return [d] if d else []
+
+
 def _is_task_done(t):
     return str(t.get("status", "")).strip().lower() in ("completed", "done")
 
@@ -5174,10 +5181,11 @@ def _ats_allowed(user):
 def _ats_scope_query(user):
     """Return base MongoDB filter scoped to what this user may see."""
     role = user.get("role")
-    dept = (user.get("department") or "").strip().lower()
-    if role == "admin" or "hr" in dept or "human resource" in dept:
+    depts = _mgr_depts(user)
+    dept_lower = " ".join(d.lower() for d in depts)
+    if role == "admin" or "hr" in dept_lower or "human resource" in dept_lower:
         return {}
-    return {"department": user.get("department")}  # manager → their dept only
+    return {"department": {"$in": depts}}  # manager → their depts only
 
 
 def _serialize_ats(c):
@@ -5532,7 +5540,7 @@ def ats_get_candidate(candidate_id):
 
     # Scope check for managers
     scope = _ats_scope_query(request.user)
-    if scope and candidate.get("department") != request.user.get("department"):
+    if scope and candidate.get("department") not in _mgr_depts(request.user):
         return jsonify({"message": "Access denied"}), 403
 
     result = _serialize_ats(candidate)
@@ -6140,9 +6148,9 @@ def admin_work_plans():
 
     date_str = request.args.get("date") or _today_ist().isoformat()
     query = {"date": date_str}
-    # Managers (without delegated admin) see only their department
+    # Managers (without delegated admin) see only their departments
     if role == "manager" and not has_delegated:
-        query["department"] = request.user.get("department")
+        query["department"] = {"$in": _mgr_depts(request.user)}
 
     plans = list(work_plans_col.find(query).sort("employee_name", 1))
     checkins = _checkin_map([p["employee_id"] for p in plans], date_str)
@@ -6164,7 +6172,7 @@ def admin_work_analytics():
 
     query = {"date": {"$gte": start_date.isoformat(), "$lte": today_date.isoformat()}}
     if role == "manager" and not has_delegated:
-        query["department"] = request.user.get("department")
+        query["department"] = {"$in": _mgr_depts(request.user)}
 
     plans = list(work_plans_col.find(query))
     return jsonify(_build_analytics(plans, start_date, today_date)), 200
@@ -6186,8 +6194,8 @@ def comment_work_plan(plan_id):
     plan = work_plans_col.find_one({"_id": obj})
     if not plan:
         return jsonify({"message": "Plan not found"}), 404
-    # Managers may only comment on their own department's plans
-    if role == "manager" and not has_delegated and plan.get("department") != request.user.get("department"):
+    # Managers may only comment on their own departments' plans
+    if role == "manager" and not has_delegated and plan.get("department") not in _mgr_depts(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     comment = str((request.json or {}).get("comment", "")).strip()
