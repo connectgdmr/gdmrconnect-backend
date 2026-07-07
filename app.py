@@ -2216,9 +2216,9 @@ def admin_view_leaves():
     query = {}
     
     if role == "manager" and not has_delegated:
-        my_dept = request.user.get("department")
-        dept_users = [str(u["_id"]) for u in users_col.find({"department": my_dept}, {"_id": 1})]
-        query = {"user_id": {"$in": dept_users}}
+        mgr_id = str(request.user["_id"])
+        managed_users = [str(u["_id"]) for u in users_col.find({"manager_id": mgr_id}, {"_id": 1})]
+        query = {"user_id": {"$in": managed_users}}
 
     rows = []
     # Only name + department are needed for enrichment — avoid pulling full docs
@@ -2680,13 +2680,13 @@ def manager_corrections():
     """ Fetches pending attendance correction requests for the manager's team. """
     if request.user.get("role") != "manager": return jsonify({"message": "Unauthorized"}), 403
     
-    my_dept = request.user.get("department")
-    dept_emp_list = list(users_col.find({"department": my_dept}, {"name": 1}))
-    dept_users = [str(u["_id"]) for u in dept_emp_list]
-    emp_map = {str(u["_id"]): u["name"] for u in dept_emp_list}
+    mgr_id = str(request.user["_id"])
+    managed_emp_list = list(users_col.find({"manager_id": mgr_id}, {"name": 1}))
+    managed_users = [str(u["_id"]) for u in managed_emp_list]
+    emp_map = {str(u["_id"]): u["name"] for u in managed_emp_list}
 
     query = {
-        "$or":             [{"manager_id": str(request.user["_id"])}, {"user_id": {"$in": dept_users}}],
+        "user_id":         {"$in": managed_users},
         "approval_target": {"$ne": "admin"},   # manager-submitted corrections go to admin, not here
     }
 
