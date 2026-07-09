@@ -6812,12 +6812,10 @@ def chat_delete_message(conv_id, msg_id):
 @app.route("/api/chat/conversations/<conv_id>/messages", methods=["DELETE"])
 @token_required
 def chat_clear_messages(conv_id):
-    """Clear all messages in a conversation. Admin only."""
+    """Clear all messages in a conversation. Any member may do this."""
     uid = str(request.user["_id"])
     if not _member_check(conv_id, uid):
         return jsonify({"message": "Conversation not found or access denied"}), 404
-    if request.user.get("role") != "admin":
-        return jsonify({"message": "Admin only"}), 403
 
     messages_col.delete_many({"conversation_id": conv_id})
     conversations_col.update_one(
