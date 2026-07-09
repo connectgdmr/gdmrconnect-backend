@@ -6764,8 +6764,11 @@ def chat_edit_message(conv_id, msg_id):
 @token_required
 def chat_delete_message(conv_id, msg_id):
     """Delete a single message. Sender may delete their own; admin may delete any."""
-    uid = str(request.user["_id"])
-    if not _member_check(conv_id, uid):
+    uid      = str(request.user["_id"])
+    is_admin = request.user.get("role") == "admin"
+
+    # Admins can delete messages anywhere; regular users must be a member
+    if not is_admin and not _member_check(conv_id, uid):
         return jsonify({"message": "Conversation not found or access denied"}), 404
 
     try:
@@ -6777,7 +6780,7 @@ def chat_delete_message(conv_id, msg_id):
     if not msg:
         return jsonify({"message": "Message not found"}), 404
 
-    if msg.get("sender_id") != uid and request.user.get("role") != "admin":
+    if msg.get("sender_id") != uid and not is_admin:
         return jsonify({"message": "You can only delete your own messages"}), 403
 
     messages_col.delete_one({"_id": msg_obj})
@@ -6807,19 +6810,33 @@ def chat_clear_messages(conv_id):
 @token_required
 def chat_delete_conversation(conv_id):
     """Delete a channel and all its messages. Allowed for admin or the channel's creator."""
-    uid  = str(request.user["_id"])
-    conv = _member_check(conv_id, uid)
+    uid = str(request.user["_id"])
+    try:
+        obj = ObjectId(conv_id)
+    except Exception:
+        return jsonify({"message": "Invalid conversation ID"}), 400
+
+    # Direct lookup — do not use _member_check because creator/admin may have already left
+    conv = conversations_col.find_one({"_id": obj})
     if not conv:
-        return jsonify({"message": "Conversation not found or access denied"}), 404
-    if conv.get("type") != "channel":
-        return jsonify({"message": "Only channels can be deleted. DMs cannot be removed."}), 400
+        return jsonify({"message": "Conversation not found"}), 404
+
     is_admin   = request.user.get("role") == "admin"
     is_creator = conv.get("created_by") == uid
+    is_member  = uid in conv.get("members", [])
+
+    # Non-members who are neither admin nor creator have no visibility into this conversation
+    if not is_member and not is_admin and not is_creator:
+        return jsonify({"message": "Conversation not found"}), 404
+
+    if conv.get("type") != "channel":
+        return jsonify({"message": "Only channels can be deleted. DMs cannot be removed."}), 400
+
     if not is_admin and not is_creator:
         return jsonify({"message": "Only the channel creator or an admin may delete this channel"}), 403
 
     messages_col.delete_many({"conversation_id": conv_id})
-    conversations_col.delete_one({"_id": ObjectId(conv_id)})
+    conversations_col.delete_one({"_id": obj})
     return jsonify({"message": "deleted"}), 200
 
 
