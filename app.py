@@ -485,8 +485,10 @@ def login():
         "role": user.get("role", "employee"),
         "password_changed": user.get("password_changed", False),
         "user": {
-            "name": user.get("name"),
-            "email": user.get("email"),
+            "_id":        str(user["_id"]),
+            "name":       user.get("name"),
+            "email":      user.get("email"),
+            "role":       user.get("role", "employee"),
             "department": user.get("department", "")
         }
     }), 200
@@ -6553,11 +6555,25 @@ def chat_conversations():
             last_at_iso = last_at
         else:
             last_at_iso = None
+        members_out = [{"_id": m, "name": member_name_map.get(m, "")} for m in c.get("members", [])]
+
+        # For DMs, surface the peer's id/name directly so the frontend doesn't have to filter
+        peer_id_out   = None
+        peer_name_out = None
+        if c.get("type") == "dm":
+            for m in c.get("members", []):
+                if m != uid:
+                    peer_id_out   = m
+                    peer_name_out = member_name_map.get(m, "")
+                    break
+
         result.append({
             "_id":          cid,
             "type":         c.get("type"),
             "name":         c.get("name"),
-            "members":      [{"_id": m, "name": member_name_map.get(m, "")} for m in c.get("members", [])],
+            "members":      members_out,
+            "peer_id":      peer_id_out,
+            "peer_name":    peer_name_out,
             "last_message": c.get("last_message"),
             "last_at":      last_at_iso,
             "unread":       unread_map.get(cid, 0),
@@ -6584,11 +6600,13 @@ def chat_create_dm():
     if not peer:
         return jsonify({"message": "User not found"}), 404
 
-    # Idempotent: find existing DM with exactly these two members
-    existing = conversations_col.find_one({
-        "type":    "dm",
-        "members": {"$all": [uid, peer_id], "$size": 2},
-    })
+    # Idempotent: find existing DM with exactly these two members.
+    # Sort by created_at ASC so we always return the canonical (oldest) conversation
+    # even if historical duplicates exist in the database.
+    existing = conversations_col.find_one(
+        {"type": "dm", "members": {"$all": [uid, peer_id], "$size": 2}},
+        sort=[("created_at", 1)],
+    )
     if existing:
         existing["_id"] = str(existing["_id"])
         for f in ("last_at", "created_at"):
