@@ -6501,11 +6501,14 @@ def chat_users():
         {"_id": {"$ne": ObjectId(uid)}},
         {"name": 1, "role": 1, "department": 1}
     ):
+        dept = u.get("department") or ""
+        if isinstance(dept, list):
+            dept = ", ".join(d for d in dept if d)
         rows.append({
             "_id":        str(u["_id"]),
-            "name":       u.get("name", ""),
-            "role":       u.get("role", ""),
-            "department": u.get("department", ""),
+            "name":       u.get("name") or "",
+            "role":       u.get("role") or "",
+            "department": dept,
         })
     return jsonify({"users": rows}), 200
 
@@ -6532,7 +6535,7 @@ def chat_conversations():
 
     # Batch-fetch member names so DM peer names are available client-side
     all_member_ids = {m for c in convs for m in c.get("members", [])}
-    member_name_map = {uid: request.user.get("name", "")}
+    member_name_map = {uid: request.user.get("name") or ""}
     oids = []
     for m in all_member_ids:
         if m != uid:
@@ -6541,7 +6544,7 @@ def chat_conversations():
             except Exception:
                 pass
     for u in users_col.find({"_id": {"$in": oids}}, {"name": 1}):
-        member_name_map[str(u["_id"])] = u.get("name", "")
+        member_name_map[str(u["_id"])] = u.get("name") or ""
 
     result = []
     for c in convs:
@@ -6708,7 +6711,7 @@ def chat_send_message(conv_id):
     msg = {
         "conversation_id": conv_id,
         "sender_id":       uid,
-        "sender_name":     request.user.get("name", ""),
+        "sender_name":     request.user.get("name") or "",
         "text":            text,
         "created_at":      now,
         "read_by":         [uid],   # sender has implicitly read their own message
