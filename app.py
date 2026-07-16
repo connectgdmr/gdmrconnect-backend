@@ -629,7 +629,7 @@ def register_admin():
 @token_required
 def register_manager():
     """ Registers a new manager profile. Requires Admin privileges. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized access."}), 403
 
     data = request.get_json()
@@ -667,7 +667,7 @@ def register_manager():
 @token_required
 def add_employee():
     """ Registers a new employee profile. Requires Admin privileges. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized access."}), 403
 
     data = request.json
@@ -743,7 +743,7 @@ def list_employees():
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
     
-    if role != "admin" and not has_delegated:
+    if role not in ("admin", "owner") and not has_delegated:
         return jsonify({"message": "Unauthorized access."}), 403
 
     # Single query — projection drops password on the DB side
@@ -766,15 +766,42 @@ def list_employees():
 @token_required
 def list_managers():
     """ Fetches a list of all registered managers in the system. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     managers = []
-    for m in users_col.find({"role": "manager"}, {"password": 0}):
+    for m in users_col.find({"role": {"$in": ["manager", "owner"]}}, {"password": 0}):
         m["_id"] = str(m["_id"])
         managers.append(m)
 
     return jsonify(managers), 200
+
+
+@app.route("/api/admin/managers/<man_id>/role", methods=["PUT"])
+@token_required
+def update_manager_role(man_id):
+    """Allow admin/owner to promote a manager to owner or demote an owner to manager."""
+    if not _is_admin(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    new_role = (data.get("role") or "").strip().lower()
+    if new_role not in ("manager", "owner"):
+        return jsonify({"message": "role must be 'manager' or 'owner'"}), 400
+
+    try:
+        obj = ObjectId(man_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    target = users_col.find_one({"_id": obj})
+    if not target:
+        return jsonify({"message": "User not found"}), 404
+    if target.get("role") not in ("manager", "owner"):
+        return jsonify({"message": "User is not a manager or owner"}), 400
+
+    users_col.update_one({"_id": obj}, {"$set": {"role": new_role}})
+    return jsonify({"message": f"Role updated to '{new_role}'"}), 200
 
 
 # =============================================================================
@@ -785,7 +812,7 @@ def list_managers():
 @token_required
 def list_departments():
     """ Returns all departments. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     depts = []
@@ -802,7 +829,7 @@ def list_departments():
 @token_required
 def create_department():
     """ Creates a new department. Name must be non-empty and unique. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     data = request.json or {}
@@ -835,7 +862,7 @@ def create_department():
 @token_required
 def update_department(dept_id):
     """ Updates name, description, and/or head_id of a department. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     try:
@@ -891,7 +918,7 @@ def update_department(dept_id):
 @token_required
 def delete_department(dept_id):
     """ Deletes a department and clears it from all assigned employees. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     try:
@@ -930,7 +957,7 @@ def manager_my_employees():
 @token_required
 def edit_employee(emp_id):
     """ Modifies an existing employee record. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     data = request.json
@@ -959,7 +986,7 @@ def promote_to_manager(emp_id):
     Promotes an employee to a manager role and automatically assigns them 
     as the manager for all other employees in their respective department.
     """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized. Only admins can promote employees."}), 403
 
     emp = users_col.find_one({"_id": ObjectId(emp_id)})
@@ -991,7 +1018,7 @@ def promote_to_manager(emp_id):
 @token_required
 def edit_manager(man_id):
     """ Modifies an existing manager record. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     data = request.json
@@ -1010,7 +1037,7 @@ def edit_manager(man_id):
 @token_required
 def delete_employee(emp_id):
     """ Hard deletes an employee and wipes all associated tracking data. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     # Clean up user and all associated records to prevent orphaned documents
@@ -1028,7 +1055,7 @@ def delete_employee(emp_id):
 @token_required
 def delete_manager(man_id):
     """ Deletes a manager and unassigns them from their subordinates. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     users_col.delete_one({"_id": ObjectId(man_id)})
@@ -1064,7 +1091,7 @@ def _status_payload(emp_id):
 @token_required
 def get_employee_status(emp_id):
     """ Returns extended_leaves and resignation for a single employee. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     emp, err = _get_emp_or_404(emp_id)
@@ -1079,7 +1106,7 @@ def get_employee_status(emp_id):
 @token_required
 def add_extended_leave(emp_id):
     """ Appends an extended-leave entry to the employee's extended_leaves array. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     emp, err = _get_emp_or_404(emp_id)
@@ -1120,7 +1147,7 @@ def add_extended_leave(emp_id):
 @token_required
 def delete_extended_leave(emp_id, leave_id):
     """ Removes a specific extended-leave entry by its _id. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     emp, err = _get_emp_or_404(emp_id)
@@ -1142,7 +1169,7 @@ def delete_extended_leave(emp_id, leave_id):
 @token_required
 def set_resignation(emp_id):
     """ Sets or replaces the resignation record on an employee. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     emp, err = _get_emp_or_404(emp_id)
@@ -1180,7 +1207,7 @@ def set_resignation(emp_id):
 @token_required
 def clear_resignation(emp_id):
     """ Clears the resignation record from an employee. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     emp, err = _get_emp_or_404(emp_id)
@@ -1202,7 +1229,7 @@ def grant_access():
     Allows an Admin to grant temporary admin capabilities to a standard employee.
     Used for vacation coverages or temporary assignments.
     """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     
     data = request.json
@@ -1217,7 +1244,7 @@ def grant_access():
         return jsonify({"message": "Employee ID is required"}), 400
 
     emp = users_col.find_one({"_id": ObjectId(emp_id)})
-    if not emp or emp.get("role") == "admin":
+    if not emp or _is_admin(emp):
         return jsonify({"message": "Invalid employee or employee is already an admin."}), 400
 
     module = data.get("module", "attendance")
@@ -1245,7 +1272,7 @@ def grant_access():
 @token_required
 def get_active_grants():
     """ Returns a list of all currently active delegated access grants. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     
     raw_grants = list(access_grants_col.find({"is_active": True}).sort("granted_at", -1))
@@ -1268,7 +1295,7 @@ def get_active_grants():
 @token_required
 def revoke_access(grant_id):
     """ Manually revokes an active delegated access grant immediately. """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     
     result = access_grants_col.update_one({"_id": ObjectId(grant_id)}, {"$set": {"is_active": False}})
@@ -1329,7 +1356,7 @@ def save_pms_template():
     SAVES OR UPDATES A PMS TEMPLATE.
     Managers assign a template of questions to SPECIFIC EMPLOYEES using the 'assigned_to' array.
     """
-    if request.user.get("role") not in ["admin", "manager"]: 
+    if request.user.get("role") not in ["admin", "owner", "manager"]: 
         return jsonify({"message": "Unauthorized"}), 403
     
     data = request.json
@@ -1421,7 +1448,7 @@ def submit_pms_review():
 @token_required
 def get_manager_pms():
     """ Fetches all pending and completed PMS reviews for a manager's department. """
-    if request.user.get("role") not in ["manager", "admin"]: return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") not in ["manager", "admin", "owner"]: return jsonify({"message": "Unauthorized"}), 403
     
     depts = _mgr_depts(request.user)
     query = {"department": {"$in": depts}} if request.user.get("role") == "manager" else {}
@@ -1448,7 +1475,7 @@ def pms_calibration():
     Returns a side-by-side self-avg vs manager-avg comparison for every team member
     for a given month. Used by the Calibration view in the manager dashboard.
     """
-    if request.user.get("role") not in ["manager", "admin"]:
+    if request.user.get("role") not in ["manager", "admin", "owner"]:
         return jsonify({"message": "Unauthorized"}), 403
 
     month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
@@ -1492,7 +1519,7 @@ def finalize_pms_review():
     MANAGER SUBMITS THEIR GRADING.
     Locks the review and adds manager scores and summary feedback.
     """
-    if request.user.get("role") not in ["manager", "admin"]: return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") not in ["manager", "admin", "owner"]: return jsonify({"message": "Unauthorized"}), 403
     data = request.json
 
     review_id = data.get("review_id")
@@ -1577,7 +1604,7 @@ def acknowledge_pms_review():
 @token_required
 def pms_dashboard():
     """ Dashboard analytics for PMS completion and scoring. """
-    if request.user.get("role") not in ["admin", "manager"]: return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") not in ["admin", "owner", "manager"]: return jsonify({"message": "Unauthorized"}), 403
     
     month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
     dashboard_data = {}
@@ -1625,7 +1652,7 @@ def pms_dashboard():
 @token_required
 def export_pms():
     """ Generates a downloadable CSV report of the PMS data. """
-    if request.user.get("role") not in ["admin", "manager"]: return jsonify({"message": "Unauthorized"}), 403
+    if request.user.get("role") not in ["admin", "owner", "manager"]: return jsonify({"message": "Unauthorized"}), 403
     
     month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
     
@@ -1914,7 +1941,7 @@ def admin_employee_attendance(emp_id):
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
     
-    if role != "admin" and not has_delegated:
+    if role not in ("admin", "owner") and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     emp = users_col.find_one({"_id": ObjectId(emp_id)})
@@ -2141,6 +2168,24 @@ def _send_leave_notification(leave_doc: dict, employee: dict):
         )
         print(f"[leave-notify] send_email returned {ok}")
 
+        # Also notify all Business Owners
+        try:
+            owners = list(users_col.find({"role": "owner"}, {"email": 1, "name": 1}))
+            for owner in owners:
+                owner_email = owner.get("email")
+                if not owner_email or owner_email.lower() == to_email.lower():
+                    continue  # skip if already notified as the manager
+                ok_o = send_email(
+                    to_email  = owner_email,
+                    subject   = subject,
+                    body      = plain,
+                    html_body = html_body,
+                    reply_to  = reply_to,
+                )
+                print(f"[leave-notify] owner notified {owner_email!r}: {ok_o}")
+        except Exception as owner_exc:
+            print(f"[leave-notify] owner notify error: {owner_exc}")
+
     except Exception as exc:
         print(f"[leave-notify] EXCEPTION: {exc}\n{traceback.format_exc()}")
 
@@ -2230,7 +2275,7 @@ def admin_view_leaves():
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
     
-    if role not in ["admin", "manager"] and not has_delegated:
+    if role not in ["admin", "owner", "manager"] and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     query = {}
@@ -2272,7 +2317,7 @@ def update_leave(leave_id):
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
     
-    if role not in ["admin", "manager"] and not has_delegated:
+    if role not in ["admin", "owner", "manager"] and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     data = request.json
@@ -2283,7 +2328,7 @@ def update_leave(leave_id):
 
     update_fields = {}
 
-    if role == "admin":
+    if role in ("admin", "owner"):
         update_fields["admin_status"] = action
     elif has_delegated:
         if has_delegated.get("access_level") == "view_only":
@@ -2389,7 +2434,7 @@ def manager_get_assets():
     """
     MANAGER ROUTE: Retrieves all asset requests strictly for employees within their specific department.
     """
-    if request.user.get("role") not in ["manager", "admin"]:
+    if request.user.get("role") not in ["manager", "admin", "owner"]:
         return jsonify({"message": "Unauthorized access to team assets."}), 403
         
     depts = _mgr_depts(request.user)
@@ -2411,7 +2456,7 @@ def manager_update_asset(asset_id):
     MANAGER ROUTE: Approves or rejects an asset request.
     This acts as the first gatekeeper. If rejected here, the final status is immediately marked Rejected.
     """
-    if request.user.get("role") not in ["manager", "admin"]:
+    if request.user.get("role") not in ["manager", "admin", "owner"]:
         return jsonify({"message": "Unauthorized action."}), 403
         
     data = request.json
@@ -2441,7 +2486,7 @@ def admin_get_assets():
     """
     ADMIN ROUTE: Retrieves all organizational asset requests for final review and provisioning.
     """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized access. Admins only."}), 403
         
     rows = []
@@ -2459,7 +2504,7 @@ def admin_update_asset(asset_id):
     ADMIN ROUTE: Provides final approval or rejection for an asset request.
     This triggers the final 'status' change in the database.
     """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized action. Admins only."}), 403
         
     data = request.json
@@ -2493,7 +2538,7 @@ def admin_update_asset(asset_id):
 @token_required
 def assign_asset_to_office_admin(asset_id):
     """Send assignment notification emails to one or more office admins."""
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     data   = request.json or {}
@@ -2526,7 +2571,7 @@ def assign_asset_to_office_admin(asset_id):
 def manager_assign_asset(asset_id):
     """Manager or admin sends the asset-provisioning email and records the assignment."""
     role = request.user.get("role")
-    if role not in ("admin", "manager"):
+    if role not in ("admin", "owner", "manager"):
         return jsonify({"message": "Unauthorized"}), 403
 
     try:
@@ -2583,7 +2628,7 @@ def manager_assign_asset(asset_id):
 @token_required
 def create_announcement():
     """ Creates a new system-wide announcement. (Admin Only) """
-    if request.user.get("role") != "admin": 
+    if not _is_admin(request.user): 
         return jsonify({"message": "Unauthorized"}), 403
     
     data = request.json
@@ -2613,7 +2658,7 @@ def update_announcement(ann_id):
     Updates an existing announcement's title and message. (Admin Only) 
     Provides the backend logic for the frontend "Edit" feature.
     """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized access. Admins only."}), 403
         
     data = request.json
@@ -2645,7 +2690,7 @@ def delete_announcement(ann_id):
     Deletes (recalls) an announcement from the system. (Admin Only) 
     Provides the backend logic for the frontend "Recall" feature.
     """
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized access. Admins only."}), 403
         
     result = announcements_col.delete_one({"_id": ObjectId(ann_id)})
@@ -2828,7 +2873,7 @@ def approve_correction():
 @token_required
 def admin_corrections():
     """Correction requests routed to admin — i.e. submitted by managers."""
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     rows = []
@@ -2849,7 +2894,7 @@ def admin_corrections():
 @token_required
 def admin_approve_correction():
     """Admin approves or rejects a correction request targeted at admin."""
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     data = request.json or {}
@@ -2938,7 +2983,7 @@ def get_notification_counts():
             "manager_status": "Pending"
         })
 
-    elif role == "admin" or has_delegated:
+    elif role in ("admin", "owner") or has_delegated:
         # Leaves still awaiting the admin's approval (not yet finalised/rejected)
         counts["leaves"] = leaves_col.count_documents({
             "status": "Pending",
@@ -3009,7 +3054,7 @@ def today_stats():
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
     
-    if role != "admin" and not has_delegated:
+    if role not in ("admin", "owner") and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     today = str(datetime.now(IST).date())
@@ -3075,7 +3120,7 @@ def attendance_summary():
     bucket per day: present | leave | not_checked_in (today only) | absent."""
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
-    if role != "admin" and not has_delegated:
+    if role not in ("admin", "owner") and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     month_param = request.args.get("month")
@@ -3313,7 +3358,7 @@ def auto_expire_grants():
 @app.route("/api/admin/assessments", methods=["GET"])
 @token_required
 def list_assessments():
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     rows = []
     for a in assessments_col.find().sort("created_at", -1):
@@ -3325,7 +3370,7 @@ def list_assessments():
 @app.route("/api/admin/assessments", methods=["POST"])
 @token_required
 def create_assessment():
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     data = request.json or {}
     title = str(data.get("title", "")).strip()
@@ -3347,7 +3392,7 @@ def create_assessment():
 @app.route("/api/admin/assessments/<assessment_id>", methods=["PUT"])
 @token_required
 def update_assessment(assessment_id):
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(assessment_id)
@@ -3367,7 +3412,7 @@ def update_assessment(assessment_id):
 @app.route("/api/admin/assessments/<assessment_id>", methods=["DELETE"])
 @token_required
 def delete_assessment(assessment_id):
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(assessment_id)
@@ -3383,7 +3428,7 @@ def delete_assessment(assessment_id):
 @app.route("/api/admin/assessments/invite", methods=["POST"])
 @token_required
 def invite_candidate():
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     data = request.json or {}
     name          = str(data.get("name", "")).strip()
@@ -3428,7 +3473,7 @@ def invite_candidate():
 @app.route("/api/admin/assessments/candidates", methods=["GET"])
 @token_required
 def list_candidates():
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     assessment_id = request.args.get("assessmentId")
     query = {"assessment_id": assessment_id} if assessment_id else {}
@@ -3442,7 +3487,7 @@ def list_candidates():
 @app.route("/api/admin/assessments/candidates/<candidate_id>/result", methods=["GET"])
 @token_required
 def candidate_result(candidate_id):
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         invite = candidates_col.find_one({"_id": ObjectId(candidate_id)})
@@ -3605,7 +3650,7 @@ def _require_lms(user, write=False):
     Returns (grant, error_response) — error_response is None if access is allowed.
     write=True requires access_level="view_edit"; write=False allows view_only too.
     """
-    if user.get("role") == "admin":
+    if _is_admin(user):
         return None, None
     grant = _get_lms_grant(user)
     if not grant:
@@ -4123,7 +4168,7 @@ def _normalize_requirements(raw):
 @app.route("/api/admin/career/jobs", methods=["GET"])
 @token_required
 def list_jobs():
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     rows = []
     for j in career_jobs_col.find().sort("created_at", -1):
@@ -4136,7 +4181,7 @@ def list_jobs():
 @app.route("/api/admin/career/jobs", methods=["POST"])
 @token_required
 def create_job():
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     data = request.json or {}
     title = str(data.get("title", "")).strip()
@@ -4160,7 +4205,7 @@ def create_job():
 @app.route("/api/admin/career/jobs/<job_id>", methods=["PUT"])
 @token_required
 def update_job(job_id):
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(job_id)
@@ -4184,7 +4229,7 @@ def update_job(job_id):
 @app.route("/api/admin/career/jobs/<job_id>", methods=["DELETE"])
 @token_required
 def delete_job(job_id):
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(job_id)
@@ -4199,7 +4244,7 @@ def delete_job(job_id):
 @app.route("/api/admin/career/referrals", methods=["GET"])
 @token_required
 def admin_list_referrals():
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     job_id = request.args.get("job_id")
     query = {"job_id": job_id} if job_id else {}
@@ -4213,7 +4258,7 @@ def admin_list_referrals():
 @app.route("/api/admin/career/referrals/<referral_id>", methods=["PUT"])
 @token_required
 def update_referral(referral_id):
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(referral_id)
@@ -4597,8 +4642,8 @@ SALARY_DISPLAY_FIELDS = [
 
 
 def _payroll_allowed(user):
-    """Payroll access: admins, or anyone in the Accounts department."""
-    if user.get("role") == "admin":
+    """Payroll access: admins/owners, or anyone in the Accounts department."""
+    if _is_admin(user):
         return True
     dept = (user.get("department") or "").strip().lower()
     return dept.startswith("accounts")
@@ -4893,6 +4938,11 @@ def _mgr_depts(user):
     return [d] if d else []
 
 
+def _is_admin(user):
+    """Return True for both 'admin' and 'owner' roles — owners have full admin privileges."""
+    return user.get("role") in ("admin", "owner")
+
+
 def _is_task_done(t):
     return str(t.get("status", "")).strip().lower() in ("completed", "done")
 
@@ -5122,7 +5172,7 @@ def list_clients():
 @token_required
 def create_client():
     role = request.user.get("role")
-    if role not in ("admin", "manager"):
+    if role not in ("admin", "owner", "manager"):
         return jsonify({"message": "Unauthorized"}), 403
     data = request.json or {}
     name = str(data.get("name", "")).strip()
@@ -5144,7 +5194,7 @@ def create_client():
 @token_required
 def delete_client(client_id):
     role = request.user.get("role")
-    if role not in ("admin", "manager"):
+    if role not in ("admin", "owner", "manager"):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(client_id)
@@ -5192,7 +5242,7 @@ DOC_CHECKLIST_DEFAULT = [
 
 def _ats_allowed(user):
     role = user.get("role")
-    if role == "admin":
+    if role in ("admin", "owner"):
         return True
     dept = (user.get("department") or "").strip().lower()
     if "hr" in dept or "human resource" in dept:
@@ -5207,7 +5257,7 @@ def _ats_scope_query(user):
     role = user.get("role")
     depts = _mgr_depts(user)
     dept_lower = " ".join(d.lower() for d in depts)
-    if role == "admin" or "hr" in dept_lower or "human resource" in dept_lower:
+    if role in ("admin", "owner") or "hr" in dept_lower or "human resource" in dept_lower:
         return {}
     return {"department": {"$in": depts}}  # manager → their depts only
 
@@ -6167,7 +6217,7 @@ def my_work_analytics():
 def admin_work_plans():
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
-    if role not in ("admin", "manager") and not has_delegated:
+    if role not in ("admin", "owner", "manager") and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     date_str = request.args.get("date") or _today_ist().isoformat()
@@ -6187,7 +6237,7 @@ def admin_work_plans():
 def admin_work_analytics():
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
-    if role not in ("admin", "manager") and not has_delegated:
+    if role not in ("admin", "owner", "manager") and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     range_key = request.args.get("range", "week")
@@ -6207,7 +6257,7 @@ def admin_work_analytics():
 def comment_work_plan(plan_id):
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
-    if role not in ("admin", "manager") and not has_delegated:
+    if role not in ("admin", "owner", "manager") and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
     try:
@@ -6484,7 +6534,7 @@ def send_weekly_work_reports():
 @token_required
 def get_achievements():
     """Return all achievements, optionally filtered by employee_id."""
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     employee_id = request.args.get("employee_id", "").strip()
@@ -6501,7 +6551,7 @@ def get_achievements():
 @token_required
 def create_achievement():
     """Create a new achievement record for an employee."""
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     data = request.json or {}
@@ -6530,7 +6580,7 @@ def create_achievement():
 @token_required
 def delete_achievement(achievement_id):
     """Delete an achievement by ID."""
-    if request.user.get("role") != "admin":
+    if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
     try:
@@ -6876,7 +6926,7 @@ def chat_edit_message(conv_id, msg_id):
 def chat_delete_message(conv_id, msg_id):
     """Delete a single message. Sender may delete their own; admin may delete any."""
     uid      = str(request.user["_id"])
-    is_admin = request.user.get("role") == "admin"
+    is_admin = _is_admin(request.user)
 
     # Admins can delete messages anywhere; regular users must be a member
     if not is_admin and not _member_check(conv_id, uid):
@@ -6930,7 +6980,7 @@ def chat_delete_conversation(conv_id):
     if not conv:
         return jsonify({"message": "Conversation not found"}), 404
 
-    is_admin   = request.user.get("role") == "admin"
+    is_admin   = _is_admin(request.user)
     is_creator = conv.get("created_by") == uid
     is_member  = uid in conv.get("members", [])
 
