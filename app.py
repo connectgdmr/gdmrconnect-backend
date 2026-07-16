@@ -88,17 +88,16 @@ except Exception as e:
 # =============================================================================
 CORS(app, resources={
     r"/*": {
-        "origins": [
-            "https://gdmrconnect.com",
-            "https://www.gdmrconnect.com",
-            "https://*.netlify.app",
-            "http://localhost:5173",
-            "http://127.0.0.1:5173"
-        ],
-        "supports_credentials": True,
+        # Wildcard origin required here. Auth is JWT-only (Authorization header) — no cookies.
+        # supports_credentials=True would force a specific origin echo and break on Jio mobile
+        # data, where the network proxy strips or modifies the Origin request header so it
+        # no longer matches the allow-list. With credentials=False we can use * and the
+        # response is always accepted regardless of what the proxy does to the Origin header.
+        "origins": "*",
+        "supports_credentials": False,
         "allow_headers": ["Content-Type", "Authorization"],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "max_age": 600,   # cache preflight for 10 min — reduces round-trips on Jio
+        "max_age": 3600,
     }
 })
 
