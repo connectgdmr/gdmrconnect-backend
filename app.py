@@ -64,6 +64,12 @@ limiter = Limiter(
     storage_uri=os.getenv("REDIS_URL", "memory://"),
 )
 
+@limiter.request_filter
+def _exempt_options():
+    """OPTIONS preflight requests must never be rate-limited.
+    They carry no credentials and must reach CORS headers without being blocked."""
+    return request.method == "OPTIONS"
+
 # =============================================================================
 # 2. CLOUDINARY CONFIGURATION (For Image Uploads & Assets)
 # =============================================================================
