@@ -437,8 +437,15 @@ def token_required(f):
 # 8. ACCOUNT MANAGEMENT & LOGIN ROUTES
 # =============================================================================
 
+def _login_rate_key():
+    """Key login rate limiting by email so CGNAT users (Jio etc.) don't share a bucket."""
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    return email if email else get_remote_address()
+
+
 @app.route("/api/login", methods=["POST"])
-@limiter.limit("10 per minute")
+@limiter.limit("10 per minute", key_func=_login_rate_key)
 def login():
     data     = request.get_json(silent=True) or {}
     email    = _sanitize(data.get("email") or "", max_len=254).lower()
