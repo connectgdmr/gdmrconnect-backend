@@ -23,6 +23,7 @@ from flask_cors import CORS
 import base64, os, re, csv, io, secrets, gzip, time as _time
 from dotenv import load_dotenv
 from pymongo import MongoClient
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 from functools import wraps
@@ -44,6 +45,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 load_dotenv()
 
 app = Flask(__name__)
+# Railway (and most PaaS) sits behind 1-2 reverse-proxy hops.
+# ProxyFix trusts the X-Forwarded-For/Proto headers so Flask sees the
+# real client IP — critical for rate limiting and logging.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.config['BCRYPT_LOG_ROUNDS'] = 12   # explicit cost; Flask-Bcrypt default is already 12
 bcrypt = Bcrypt(app)
 
@@ -86,7 +91,8 @@ CORS(app, resources={
         ],
         "supports_credentials": True,
         "allow_headers": ["Content-Type", "Authorization"],
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "max_age": 600,   # cache preflight for 10 min — reduces round-trips on Jio
     }
 })
 
@@ -438,8 +444,9 @@ def token_required(f):
 # =============================================================================
 
 def _login_rate_key():
-    """Key login rate limiting by email so CGNAT users (Jio etc.) don't share a bucket."""
-    data = request.get_json(silent=True) or {}
+    """Key login rate limiting by email so CGNAT users (Jio etc.) don't share a bucket.
+    Uses force=True so the body is parsed even if the proxy stripped Content-Type."""
+    data = request.get_json(silent=True, force=True) or {}
     email = (data.get("email") or "").strip().lower()
     return email if email else get_remote_address()
 
