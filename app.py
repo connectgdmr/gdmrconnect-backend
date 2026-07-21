@@ -160,6 +160,7 @@ referrals_col     = db["career_referrals"]
 # --- Payroll Module ---
 salary_structures_col = db["salary_structures"]
 payslips_col          = db["payslips"]
+payroll_loans_col     = db["payroll_loans"]
 
 # --- Work Plans Module ---
 work_plans_col        = db["work_plans"]
@@ -228,6 +229,8 @@ try:
     ats_candidates_col.create_index("department", background=True)
     ats_candidates_col.create_index("doc_token", background=True)
     ats_candidates_col.create_index([("applied_at", -1)], background=True)
+    payroll_loans_col.create_index([("employee_id", 1), ("status", 1)], background=True)
+    payroll_loans_col.create_index([("status", 1), ("created_at", -1)], background=True)
     conversations_col.create_index("members", background=True)
     conversations_col.create_index([("last_at", -1)], background=True)
     conversations_col.create_index([("type", 1), ("members", 1)], background=True)
@@ -4829,22 +4832,50 @@ def run_payroll():
         if not display.get("designation"):
             display["designation"] = emp.get("position", "")
 
+        # Apply active loans and advances for this employee
+        loan_emi           = 0.0
+        advance_recovery   = 0.0
+        active_loans = list(payroll_loans_col.find({"employee_id": eid, "status": "active"}))
+        for loan in active_loans:
+            lid          = loan["_id"]
+            outstanding  = _to_money(loan.get("outstanding", 0))
+            emi          = _to_money(loan.get("emi_per_month", 0))
+            loan_type    = loan.get("type", "loan")
+            if outstanding <= 0:
+                payroll_loans_col.update_one({"_id": lid}, {"$set": {"status": "closed", "outstanding": 0}})
+                continue
+            if loan_type == "advance":
+                deduct = min(outstanding, emi or outstanding)
+                advance_recovery = round(advance_recovery + deduct, 2)
+            else:
+                deduct = min(outstanding, emi)
+                loan_emi = round(loan_emi + deduct, 2)
+            new_outstanding = round(outstanding - deduct, 2)
+            loan_update = {"outstanding": new_outstanding}
+            if new_outstanding <= 0:
+                loan_update["status"] = "closed"
+            payroll_loans_col.update_one({"_id": lid}, {"$set": loan_update})
+
+        net = round(gross + bonus - total_deductions - loan_emi - advance_recovery, 2)
+
         payslip = {
-            "employee_id":      eid,
-            "employee_name":    emp.get("name", ""),
-            "department":       emp.get("department", ""),
-            "month":            month,
-            "year":             year,
-            "period":           period,
+            "employee_id":       eid,
+            "employee_name":     emp.get("name", ""),
+            "department":        emp.get("department", ""),
+            "month":             month,
+            "year":              year,
+            "period":            period,
             **earnings,
             **deductions,
-            "bonus":            bonus,
-            "gross":            gross,
-            "total_deductions": total_deductions,
-            "net":              net,
+            "bonus":             bonus,
+            "gross":             gross,
+            "total_deductions":  total_deductions,
+            "loan_emi":          loan_emi,
+            "advance_recovery":  advance_recovery,
+            "net":               net,
             **display,
-            "status":           "Pending",
-            "created_at":       now,
+            "status":            "Pending",
+            "created_at":        now,
         }
         try:
             payslips_col.insert_one(payslip)
@@ -4919,6 +4950,118 @@ def my_payslips():
     for p in payslips_col.find({"employee_id": uid}).sort([("year", -1), ("month", -1)]):
         p["_id"] = str(p["_id"])
         rows.append(p)
+    return jsonify(rows), 200
+
+
+# =============================================================================
+# PAYROLL LOANS & ADVANCES
+# =============================================================================
+
+@app.route("/api/admin/payroll/loans", methods=["GET"])
+@token_required
+def list_payroll_loans():
+    if not _payroll_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    status_filter = request.args.get("status")
+    query = {}
+    if status_filter in ("active", "closed"):
+        query["status"] = status_filter
+
+    rows = []
+    for loan in payroll_loans_col.find(query).sort([("created_at", -1)]):
+        loan["_id"] = str(loan["_id"])
+        rows.append(loan)
+    return jsonify(rows), 200
+
+
+@app.route("/api/admin/payroll/loans", methods=["POST"])
+@token_required
+def create_payroll_loan():
+    if not _payroll_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    employee_id = (data.get("employee_id") or "").strip()
+    loan_type   = (data.get("type") or "loan").strip().lower()
+    if not employee_id:
+        return jsonify({"message": "employee_id is required"}), 400
+    if loan_type not in ("loan", "advance"):
+        return jsonify({"message": "type must be 'loan' or 'advance'"}), 400
+
+    try:
+        emp = users_col.find_one({"_id": ObjectId(employee_id)})
+    except Exception:
+        emp = None
+    if not emp:
+        return jsonify({"message": "Employee not found"}), 404
+
+    amount = _to_money(data.get("amount", 0))
+    if amount <= 0:
+        return jsonify({"message": "amount must be greater than 0"}), 400
+
+    emi = _to_money(data.get("emi_per_month", 0))
+    repayment_months = data.get("repayment_months")
+    try:
+        repayment_months = int(repayment_months) if repayment_months else None
+    except (ValueError, TypeError):
+        repayment_months = None
+
+    loan_doc = {
+        "employee_id":      employee_id,
+        "employee_name":    emp.get("name", ""),
+        "department":       emp.get("department", ""),
+        "type":             loan_type,
+        "amount":           amount,
+        "emi_per_month":    emi,
+        "outstanding":      amount,
+        "repayment_months": repayment_months,
+        "disbursed_date":   data.get("disbursed_date", ""),
+        "reason":           data.get("reason", ""),
+        "notes":            data.get("notes", ""),
+        "status":           "active",
+        "created_at":       datetime.now(timezone.utc),
+    }
+    result = payroll_loans_col.insert_one(loan_doc)
+    loan_doc["_id"] = str(result.inserted_id)
+    return jsonify(loan_doc), 201
+
+
+@app.route("/api/admin/payroll/loans/<loan_id>/status", methods=["PUT"])
+@token_required
+def update_payroll_loan_status(loan_id):
+    if not _payroll_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    try:
+        obj = ObjectId(loan_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    data   = request.get_json(silent=True) or {}
+    status = (data.get("status") or "").strip().lower()
+    if status not in ("active", "closed"):
+        return jsonify({"message": "status must be 'active' or 'closed'"}), 400
+
+    update = {"status": status}
+    if status == "closed":
+        update["outstanding"] = 0
+
+    result = payroll_loans_col.update_one({"_id": obj}, {"$set": update})
+    if result.matched_count == 0:
+        return jsonify({"message": "Loan not found"}), 404
+    return jsonify({"message": f"Loan marked {status}"}), 200
+
+
+@app.route("/api/my/loans", methods=["GET"])
+@token_required
+def my_loans():
+    """Active and closed loans/advances for the logged-in employee."""
+    uid  = str(request.user["_id"])
+    rows = []
+    for loan in payroll_loans_col.find({"employee_id": uid}).sort([("created_at", -1)]):
+        loan["_id"] = str(loan["_id"])
+        rows.append(loan)
     return jsonify(rows), 200
 
 
