@@ -20,7 +20,7 @@ Key Modules Included:
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
-import base64, os, re, csv, io, secrets, gzip, time as _time
+import base64, os, re, csv, io, secrets, gzip, time as _time, html as _html
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -104,7 +104,13 @@ CORS(app, resources={
 # =============================================================================
 # 4. DATABASE CONNECTION (MongoDB)
 # =============================================================================
-app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "replace-this-secret-with-a-secure-key-in-production")
+_secret_key = os.getenv("SECRET_KEY")
+if not _secret_key or _secret_key == "replace-this-secret-with-a-secure-key-in-production":
+    raise RuntimeError(
+        "SECRET_KEY environment variable is not set or is using the insecure default. "
+        "Set a strong random value (32+ chars) in your Railway environment variables."
+    )
+app.config['SECRET_KEY'] = _secret_key
 MONGO_URI = os.getenv("MONGO_URI")
 
 try:
@@ -597,7 +603,11 @@ def forgot_password():
 
 @app.route("/api/register-admin", methods=["POST"])
 def register_admin():
-    """ Initial system setup route to create the master administrator. """
+    """ One-time bootstrap route — only works when zero admins/owners exist in the DB. """
+    # Block if any admin or owner already exists (prevents rogue admin creation)
+    if users_col.find_one({"role": {"$in": ["admin", "owner"]}}):
+        return jsonify({"message": "Setup already complete. Use admin panel to manage users."}), 403
+
     data = request.json
     email = data.get("email")
     name = data.get("name", "Admin")
@@ -1535,8 +1545,21 @@ def finalize_pms_review():
         return jsonify({"message": f"Invalid overall_rating. Allowed: {', '.join(sorted(VALID_RATINGS))}"}), 400
 
     try:
+        obj = ObjectId(review_id)
+    except Exception:
+        return jsonify({"message": "Invalid review ID"}), 400
+
+    # Managers may only finalize reviews for employees in their own departments
+    if request.user.get("role") == "manager":
+        review_doc = pms_reviews_col.find_one({"_id": obj}, {"department": 1})
+        if not review_doc:
+            return jsonify({"message": "Review not found"}), 404
+        if review_doc.get("department") not in _mgr_depts(request.user):
+            return jsonify({"message": "Unauthorized: review belongs to a different department"}), 403
+
+    try:
         pms_reviews_col.update_one(
-            {"_id": ObjectId(review_id)},
+            {"_id": obj},
             {"$set": {
                 "manager_scores": data.get("manager_scores", []),
                 "manager_feedback": data.get("manager_feedback", ""),
@@ -1966,8 +1989,6 @@ def admin_employee_attendance(emp_id):
 # 15. LEAVE MANAGEMENT
 # =============================================================================
 
-import html as _html
-
 HR_EMAIL = "hr@gdmrfoundation.com"
 DASHBOARD_URL = "https://www.gdmrconnect.com"
 
@@ -2338,6 +2359,13 @@ def update_leave(leave_id):
             return jsonify({"message": "Unauthorized: Your delegated access is View Only."}), 403
         update_fields["admin_status"] = action
     elif role == "manager":
+        # Verify the leave belongs to one of this manager's direct reports
+        leave_doc = leaves_col.find_one({"_id": ObjectId(leave_id)}, {"user_id": 1})
+        if not leave_doc:
+            return jsonify({"message": "Leave not found"}), 404
+        leave_owner = users_col.find_one({"_id": ObjectId(leave_doc["user_id"])}, {"manager_id": 1})
+        if not leave_owner or str(leave_owner.get("manager_id")) != str(request.user["_id"]):
+            return jsonify({"message": "Unauthorized: employee is not in your team"}), 403
         update_fields["manager_status"] = action
 
     leaves_col.update_one({"_id": ObjectId(leave_id)}, {"$set": update_fields})
@@ -2471,7 +2499,14 @@ def manager_update_asset(asset_id):
     asset = assets_col.find_one({"_id": ObjectId(asset_id)})
     if not asset:
         return jsonify({"message": "Asset request not found in database."}), 404
-        
+
+    # Managers may only act on assets belonging to their own departments
+    if request.user.get("role") == "manager":
+        asset_dept = (asset.get("department") or "").strip().lower()
+        mgr_depts  = [d.strip().lower() for d in _mgr_depts(request.user)]
+        if mgr_depts and asset_dept and asset_dept not in mgr_depts:
+            return jsonify({"message": "Unauthorized: asset belongs to a different department"}), 403
+
     update_data = {"manager_status": manager_status}
     
     # Immediate kill switch if the manager rejects the request
@@ -2584,10 +2619,14 @@ def manager_assign_asset(asset_id):
 
     data   = request.json or {}
     emails = data.get("emails") or []
-    asset  = data.get("asset") or {}
 
     if not emails:
         return jsonify({"message": "At least one recipient email is required"}), 400
+
+    # Always load asset from DB — never trust client-supplied asset data for scope checks
+    asset = assets_col.find_one({"_id": obj})
+    if not asset:
+        return jsonify({"message": "Asset not found"}), 404
 
     # Managers may only assign assets that belong to one of their departments
     if role == "manager":
@@ -2721,9 +2760,10 @@ def request_correction():
     # Prefer body-supplied name (frontend knows it); fall back to JWT user name
     employee_name = str(data.get("employee_name") or request.user.get("name") or "").strip() or None
 
-    submitted_by_role = str(data.get("submitted_by_role", "")).strip()
+    # Always derive role from the JWT — never trust the client-supplied value
+    submitted_by_role = request.user.get("role", "employee")
     # Manager-submitted corrections skip the manager queue and go straight to admin
-    approval_target = "admin" if submitted_by_role == "manager" else "manager"
+    approval_target = "admin" if submitted_by_role in ("manager", "admin", "owner") else "manager"
 
     correction = {
         "user_id":           uid,
@@ -2734,7 +2774,7 @@ def request_correction():
         "reason":            data.get("reason"),
         "status":            "Pending",
         "month":             month_str,
-        "submitted_by_role": submitted_by_role or "employee",
+        "submitted_by_role": submitted_by_role,
         "approval_target":   approval_target,
         "created_at":        datetime.now(timezone.utc),
     }
@@ -2839,10 +2879,18 @@ def approve_correction():
     data = request.json
     cid = data.get("id")
     action = data.get("action")
-    
+
+    if action not in ("Approved", "Rejected"):
+        return jsonify({"message": "action must be 'Approved' or 'Rejected'"}), 400
+
     correction = corrections_col.find_one({"_id": ObjectId(cid)})
     if not correction: return jsonify({"message": "Not found"}), 404
-    
+
+    # Verify the correction belongs to one of this manager's direct reports
+    corr_owner = users_col.find_one({"_id": ObjectId(correction["user_id"])}, {"manager_id": 1})
+    if not corr_owner or str(corr_owner.get("manager_id")) != str(request.user["_id"]):
+        return jsonify({"message": "Unauthorized: employee is not in your team"}), 403
+
     corrections_col.update_one({"_id": ObjectId(cid)}, {"$set": {"status": action}})
     
     if action == "Approved":
@@ -3250,10 +3298,9 @@ def auto_mark_absent():
     Requires CRON_SECRET header to prevent unauthorized invocation.
     """
     cron_secret = os.getenv("CRON_SECRET")
-    if cron_secret:
-        provided = request.headers.get("X-Cron-Secret", "")
-        if provided != cron_secret:
-            return jsonify({"message": "Unauthorized"}), 401
+    provided = request.headers.get("X-Cron-Secret", "")
+    if not cron_secret or provided != cron_secret:
+        return jsonify({"message": "Unauthorized"}), 401
 
     today = datetime.now(IST).date()
     today_str = str(today)
@@ -6528,23 +6575,31 @@ def send_owner_daily_digest():
                 done = _is_task_done(t)
                 pri = (t.get("priority") or "").strip()
                 color = PRIORITY_COLOR.get(pri, "#6b7280")
-                badge = f'<span style="background:{color};color:#fff;font-size:10px;padding:1px 6px;border-radius:10px;margin-left:6px;">{pri}</span>' if pri else ""
+                e_pri  = _html.escape(pri)
+                badge = f'<span style="background:{color};color:#fff;font-size:10px;padding:1px 6px;border-radius:10px;margin-left:6px;">{e_pri}</span>' if pri else ""
                 check = "✓" if done else "○"
                 style = "color:#16a34a;font-weight:600;" if done else "color:#374151;"
-                est = f'<span style="color:#9ca3af;font-size:11px;"> · {t["est_time"]}</span>' if t.get("est_time") else ""
-                proj = f'<span style="color:#9ca3af;font-size:11px;"> · {t["project"]}</span>' if t.get("project") else ""
+                e_est  = _html.escape(str(t["est_time"])) if t.get("est_time") else ""
+                e_proj = _html.escape(str(t["project"])) if t.get("project") else ""
+                e_title = _html.escape(t.get("title", ""))
+                est = f'<span style="color:#9ca3af;font-size:11px;"> · {e_est}</span>' if e_est else ""
+                proj = f'<span style="color:#9ca3af;font-size:11px;"> · {e_proj}</span>' if e_proj else ""
                 task_items.append(
-                    f'<li style="margin:3px 0;{style}">{check} {t.get("title","")}{badge}{est}{proj}</li>'
+                    f'<li style="margin:3px 0;{style}">{check} {e_title}{badge}{est}{proj}</li>'
                 )
             tasks_html = f'<ul style="margin:6px 0 6px 16px;padding:0;list-style:none;">{"".join(task_items)}</ul>' if task_items else ""
+            e_comment = _html.escape(str(p["manager_comment"])) if p.get("manager_comment") else ""
             comment_html = (
-                f'<div style="margin:4px 0 0 16px;color:#6b7280;font-size:12px;font-style:italic;">↳ {p["manager_comment"]}</div>'
-                if p.get("manager_comment") else ""
+                f'<div style="margin:4px 0 0 16px;color:#6b7280;font-size:12px;font-style:italic;">↳ {e_comment}</div>'
+                if e_comment else ""
             )
+            e_emp_name = _html.escape(p.get("employee_name", ""))
+            e_role     = _html.escape(role)
+            e_ci       = _html.escape(str(ci))
             rows.append(f"""
             <div style="border:1px solid #e5e7eb;border-radius:8px;padding:12px 16px;margin-bottom:10px;background:#fff;">
-              <div style="font-weight:600;color:#111827;">{p.get("employee_name","")}</div>
-              <div style="font-size:12px;color:#6b7280;margin-bottom:6px;">{role} · checked in: {ci}</div>
+              <div style="font-weight:600;color:#111827;">{e_emp_name}</div>
+              <div style="font-size:12px;color:#6b7280;margin-bottom:6px;">{e_role} · checked in: {e_ci}</div>
               {tasks_html}{comment_html}
             </div>""")
 
