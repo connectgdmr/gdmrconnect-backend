@@ -601,12 +601,30 @@ def forgot_password():
 # 9. USER REGISTRATION ROUTES (ADMIN ONLY)
 # =============================================================================
 
+@app.route("/api/admin/admins", methods=["GET"])
+@token_required
+def list_admins():
+    """Returns all admin accounts. Admin/owner auth required."""
+    if not _is_admin(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    admins = []
+    for u in users_col.find({"role": "admin"}, {"name": 1, "email": 1, "created_at": 1}):
+        admins.append({
+            "_id":       str(u["_id"]),
+            "name":      u.get("name", ""),
+            "email":     u.get("email", ""),
+            "createdAt": u["created_at"].isoformat() if u.get("created_at") else None,
+        })
+    return jsonify(admins), 200
+
+
 @app.route("/api/register-admin", methods=["POST"])
 def register_admin():
-    """ One-time bootstrap route — only works when zero admins/owners exist in the DB. """
-    # Block if any admin or owner already exists (prevents rogue admin creation)
-    if users_col.find_one({"role": {"$in": ["admin", "owner"]}}):
-        return jsonify({"message": "Setup already complete. Use admin panel to manage users."}), 403
+    """Bootstrap + capped admin registration — max 3 admin accounts allowed."""
+    admin_count = users_col.count_documents({"role": "admin"})
+    if admin_count >= 3:
+        return jsonify({"message": "Maximum of 3 admin accounts allowed."}), 403
 
     data = request.json
     email = data.get("email")
