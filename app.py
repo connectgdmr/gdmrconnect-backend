@@ -619,6 +619,31 @@ def list_admins():
     return jsonify(admins), 200
 
 
+@app.route("/api/admin/admins/<admin_id>", methods=["DELETE"])
+@token_required
+def delete_admin(admin_id):
+    """Delete an admin account. Cannot delete your own account."""
+    if not _is_admin(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    if admin_id == str(request.user["_id"]):
+        return jsonify({"message": "You cannot delete your own admin account"}), 403
+
+    try:
+        obj = ObjectId(admin_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    target = users_col.find_one({"_id": obj}, {"role": 1})
+    if not target:
+        return jsonify({"message": "Admin not found"}), 404
+    if target.get("role") != "admin":
+        return jsonify({"message": "User is not an admin"}), 400
+
+    users_col.delete_one({"_id": obj})
+    return jsonify({"message": "Admin account deleted"}), 200
+
+
 @app.route("/api/register-admin", methods=["POST"])
 def register_admin():
     """Bootstrap + capped admin registration — max 3 admin accounts allowed."""
