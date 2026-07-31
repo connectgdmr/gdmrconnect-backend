@@ -802,10 +802,14 @@ def list_employees():
     if role not in ("admin", "owner") and not has_delegated:
         return jsonify({"message": "Unauthorized access."}), 403
 
-    # ?active_only=true excludes resigned employees (for workforce stats)
+    # ?active_only=true excludes staff whose last_working_day has already passed
     emp_query: dict = {"role": {"$in": ["employee", "manager"]}}
     if request.args.get("active_only", "").lower() == "true":
-        emp_query["resignation.notice_date"] = None
+        emp_query["$or"] = [
+            {"resignation.last_working_day": None},
+            {"resignation.last_working_day": {"$gte": str(datetime.now(IST).date())}},
+            {"resignation": None},
+        ]
 
     all_users = list(users_col.find(emp_query, {"password": 0}))
     managers = {str(u["_id"]): u["name"] for u in all_users if u.get("role") == "manager"}
@@ -3158,12 +3162,21 @@ def today_stats():
     today = str(datetime.now(IST).date())
     today_dt = datetime.strptime(today, "%Y-%m-%d")
 
-    # Active employees — exclude anyone who has tendered resignation
-    # resignation.notice_date: None matches null, missing field, or parent null
-    active_users = list(users_col.find(
-        {"role": {"$in": ["employee", "manager"]}, "resignation.notice_date": None},
-        {"_id": 1, "role": 1, "department": 1}
+    # Active employees — exclude anyone whose last_working_day has already passed.
+    # Employees still serving their notice period are counted as active.
+    all_staff = list(users_col.find(
+        {"role": {"$in": ["employee", "manager"]}},
+        {"_id": 1, "role": 1, "department": 1, "resignation": 1}
     ))
+    active_users = []
+    for u in all_staff:
+        lwd = (u.get("resignation") or {}).get("last_working_day")
+        if lwd:
+            # Normalise to a date string for comparison
+            lwd_str = lwd.date().isoformat() if hasattr(lwd, "date") else str(lwd)[:10]
+            if lwd_str < today:
+                continue  # last working day has passed — offboarded
+        active_users.append(u)
     active_ids = {str(e["_id"]) for e in active_users}
 
     # Employees who checked in today
@@ -3203,18 +3216,14 @@ def today_stats():
     leave_count     = len((all_leave_ids - present_ids) & active_ids)
     not_in_count    = len(active_ids - present_ids - all_leave_ids)
 
-    # Workforce composition — computed from the same resigned-filtered active_users
+    # Workforce composition — computed from the same offboard-filtered active_users
     employee_count = sum(1 for u in active_users if u.get("role") == "employee")
     manager_count  = sum(1 for u in active_users if u.get("role") == "manager")
-    dept_counts: dict = {}
+    by_department: dict = {}
     for u in active_users:
         dept = (u.get("department") or "").strip()
         if dept:
-            dept_counts[dept] = dept_counts.get(dept, 0) + 1
-    by_department = sorted(
-        [{"department": d, "count": c} for d, c in dept_counts.items()],
-        key=lambda x: x["count"], reverse=True
-    )
+            by_department[dept] = by_department.get(dept, 0) + 1
 
     return jsonify({
         "present":         present_count,
