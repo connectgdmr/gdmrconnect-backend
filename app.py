@@ -4917,6 +4917,14 @@ def run_payroll():
     period = datetime(year, month, 1).strftime("%B %Y")
     now = datetime.now(timezone.utc)
 
+    # Build per-employee adjustment lookup — keyed by employee_id string
+    # These override the matching deduction fields from the salary structure.
+    adj_map: dict = {}
+    for adj in (data.get("adjustments") or []):
+        eid_adj = str(adj.get("employee_id") or "").strip()
+        if eid_adj:
+            adj_map[eid_adj] = adj
+
     created = 0
     skipped = 0
     for s in salary_structures_col.find():
@@ -4936,12 +4944,21 @@ def run_payroll():
         if not emp:
             continue  # salary structure left behind by a deleted employee
 
-        # Snapshot the numbers at generation time — never a live reference
-        earnings   = {f: _to_money(s.get(f, 0)) for f in SALARY_EARNINGS}
-        deductions = {f: _to_money(s.get(f, 0)) for f in SALARY_DEDUCTIONS}
-        bonus            = _to_money(s.get("bonus", 0))
-        gross            = round(sum(earnings.values()), 2)
-        total_deductions = round(sum(deductions.values()), 2)
+        # Earnings — always from the salary structure, unmodified
+        earnings = {f: _to_money(s.get(f, 0)) for f in SALARY_EARNINGS}
+        bonus    = _to_money(s.get("bonus", 0))
+        gross    = round(sum(earnings.values()), 2)
+
+        # Deductions — PF from structure; ESI/LOP/TDS/other_deductions from
+        # the per-run adjustments entry (defaults to 0 when no entry supplied).
+        # The structure record is never written to here.
+        adj = adj_map.get(eid, {})
+        pf               = _to_money(s.get("pf", 0))
+        esi              = _to_money(adj.get("esi", 0))
+        lop              = _to_money(adj.get("lop", 0))
+        tds              = _to_money(adj.get("tds", 0))
+        other_deductions = _to_money(adj.get("other_deductions", 0))
+        total_deductions = round(pf + esi + lop + tds + other_deductions, 2)
         net              = round(gross + bonus - total_deductions, 2)
 
         # Snapshot optional display fields from the salary structure
@@ -4984,10 +5001,16 @@ def run_payroll():
             "month":             month,
             "year":              year,
             "period":            period,
+            # Earnings — snapshotted from salary structure
             **earnings,
-            **deductions,
             "bonus":             bonus,
             "gross":             gross,
+            # Deductions — PF from structure, rest from per-run adjustments
+            "pf":                pf,
+            "esi":               esi,
+            "lop":               lop,
+            "tds":               tds,
+            "other_deductions":  other_deductions,
             "total_deductions":  total_deductions,
             "loan_emi":          loan_emi,
             "advance_recovery":  advance_recovery,
