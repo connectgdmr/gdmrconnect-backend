@@ -802,8 +802,12 @@ def list_employees():
     if role not in ("admin", "owner") and not has_delegated:
         return jsonify({"message": "Unauthorized access."}), 403
 
-    # Single query — projection drops password on the DB side
-    all_users = list(users_col.find({"role": {"$in": ["employee", "manager"]}}, {"password": 0}))
+    # ?active_only=true excludes resigned employees (for workforce stats)
+    emp_query: dict = {"role": {"$in": ["employee", "manager"]}}
+    if request.args.get("active_only", "").lower() == "true":
+        emp_query["resignation.notice_date"] = None
+
+    all_users = list(users_col.find(emp_query, {"password": 0}))
     managers = {str(u["_id"]): u["name"] for u in all_users if u.get("role") == "manager"}
 
     rows = []
@@ -3156,12 +3160,11 @@ def today_stats():
 
     # Active employees — exclude anyone who has tendered resignation
     # resignation.notice_date: None matches null, missing field, or parent null
-    active_ids = {
-        str(e["_id"]) for e in users_col.find(
-            {"role": {"$in": ["employee", "manager"]}, "resignation.notice_date": None},
-            {"_id": 1}
-        )
-    }
+    active_users = list(users_col.find(
+        {"role": {"$in": ["employee", "manager"]}, "resignation.notice_date": None},
+        {"_id": 1, "role": 1, "department": 1}
+    ))
+    active_ids = {str(e["_id"]) for e in active_users}
 
     # Employees who checked in today
     present_ids = {
@@ -3200,10 +3203,27 @@ def today_stats():
     leave_count     = len((all_leave_ids - present_ids) & active_ids)
     not_in_count    = len(active_ids - present_ids - all_leave_ids)
 
+    # Workforce composition — computed from the same resigned-filtered active_users
+    employee_count = sum(1 for u in active_users if u.get("role") == "employee")
+    manager_count  = sum(1 for u in active_users if u.get("role") == "manager")
+    dept_counts: dict = {}
+    for u in active_users:
+        dept = (u.get("department") or "").strip()
+        if dept:
+            dept_counts[dept] = dept_counts.get(dept, 0) + 1
+    by_department = sorted(
+        [{"department": d, "count": c} for d, c in dept_counts.items()],
+        key=lambda x: x["count"], reverse=True
+    )
+
     return jsonify({
-        "present":       present_count,
-        "leave":         leave_count,
-        "not_checked_in": not_in_count
+        "present":         present_count,
+        "leave":           leave_count,
+        "not_checked_in":  not_in_count,
+        "total_workforce": len(active_ids),
+        "employee_count":  employee_count,
+        "manager_count":   manager_count,
+        "by_department":   by_department,
     }), 200
 
 
