@@ -20,8 +20,11 @@ Key Modules Included:
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
-import base64, os, re, csv, io, secrets, gzip, time as _time, html as _html
+import base64, os, re, csv, io, secrets, gzip, time as _time, html as _html, calendar
 import requests
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -739,6 +742,7 @@ def add_employee():
     department = data.get("department", "")
     position = data.get("position", "")
     manager_id = data.get("manager_id")
+    doj = data.get("doj", "")
 
     if not name or not email:
         return jsonify({"message": "Name and Email are required."}), 400
@@ -762,6 +766,7 @@ def add_employee():
         "role": "employee",
         "department": department,
         "position": position,
+        "doj": doj,
         "created_at": datetime.now(timezone.utc),
         "manager_id": manager_id,
         "shift": shift,
@@ -1034,7 +1039,7 @@ def edit_employee(emp_id):
     data = request.json
     update = {}
 
-    for k in ["name", "department", "position", "email", "manager_id", "shift"]:
+    for k in ["name", "department", "position", "email", "manager_id", "shift", "doj"]:
         if k in data:
             update[k] = data[k]
 
@@ -4835,11 +4840,13 @@ def complete_lesson(lesson_id):
 
 # Salary component field groups
 SALARY_EARNINGS   = ["basic", "da", "hra", "travel_allowance", "other_allowance"]
-SALARY_DEDUCTIONS = ["pf", "esi", "lop", "tds", "other_deductions"]
+# professional_tax and gratuity are fixed monthly amounts like PF — set once on the
+# structure, not per payroll run (unlike esi/lop/tds/other_deductions, see run_payroll).
+SALARY_DEDUCTIONS = ["pf", "esi", "lop", "tds", "other_deductions", "professional_tax", "gratuity"]
 # bonus is stored separately — added to gross for net but not part of SALARY_EARNINGS
 # Display/metadata fields stored on the salary structure and snapshotted into payslips
 SALARY_DISPLAY_FIELDS = [
-    "emp_code", "designation", "grade_profile",
+    "employee_code", "designation", "grade_profile",
     "days_worked", "bank_detail", "transaction_detail", "transaction_date",
 ]
 
@@ -5030,17 +5037,20 @@ def run_payroll():
         bonus    = _to_money(s.get("bonus", 0))
         gross    = round(sum(earnings.values()), 2)
 
-        # Deductions — PF from structure; ESI/LOP/TDS/other_deductions from
-        # the per-run adjustments entry (defaults to 0 when no entry supplied).
-        # The structure record is never written to here.
+        # Deductions — PF/Professional Tax/Gratuity from structure (fixed monthly,
+        # like PF); ESI/LOP/TDS/other_deductions from the per-run adjustments entry
+        # (defaults to 0 when no entry supplied). The structure record is never
+        # written to here.
         adj = adj_map.get(eid, {})
-        pf               = _to_money(s.get("pf", 0))
-        esi              = _to_money(adj.get("esi", 0))
-        lop              = _to_money(adj.get("lop", 0))
-        tds              = _to_money(adj.get("tds", 0))
-        other_deductions = _to_money(adj.get("other_deductions", 0))
-        total_deductions = round(pf + esi + lop + tds + other_deductions, 2)
-        net              = round(gross + bonus - total_deductions, 2)
+        pf                = _to_money(s.get("pf", 0))
+        professional_tax  = _to_money(s.get("professional_tax", 0))
+        gratuity          = _to_money(s.get("gratuity", 0))
+        esi               = _to_money(adj.get("esi", 0))
+        lop               = _to_money(adj.get("lop", 0))
+        tds               = _to_money(adj.get("tds", 0))
+        other_deductions  = _to_money(adj.get("other_deductions", 0))
+        total_deductions  = round(pf + esi + lop + tds + other_deductions + professional_tax + gratuity, 2)
+        net               = round(gross + bonus - total_deductions, 2)
 
         # Snapshot optional display fields from the salary structure
         display = {df: s.get(df) for df in SALARY_DISPLAY_FIELDS}
@@ -5086,12 +5096,14 @@ def run_payroll():
             **earnings,
             "bonus":             bonus,
             "gross":             gross,
-            # Deductions — PF from structure, rest from per-run adjustments
+            # Deductions — PF/Professional Tax/Gratuity from structure, rest from per-run adjustments
             "pf":                pf,
             "esi":               esi,
             "lop":               lop,
             "tds":               tds,
             "other_deductions":  other_deductions,
+            "professional_tax":  professional_tax,
+            "gratuity":          gratuity,
             "total_deductions":  total_deductions,
             "loan_emi":          loan_emi,
             "advance_recovery":  advance_recovery,
@@ -5136,6 +5148,145 @@ def list_payslips():
         p["_id"] = str(p["_id"])
         rows.append(p)
     return jsonify(rows), 200
+
+
+# Column order and header color group must match the company's external payroll
+# export template exactly — column headers, order, and roughly the color banding.
+PAYROLL_EXPORT_COLUMNS = [
+    ("SL No", "dark"), ("Employee ID", "dark"), ("DOJ", "dark"), ("Employee Name", "dark"),
+    ("Designation", "dark"), ("Grade", "dark"), ("Department", "dark"),
+    ("Current Salary", "salmon"), ("Annual Salary", "salmon"), ("Per day", "salmon"),
+    ("LOP", "cyan"),
+    ("Total Working Days", "salmon"),
+    ("Salary as per days worked", "yellow"),
+    ("Basic", "salmon"), ("DA", "salmon"), ("HRA", "salmon"), ("Travel Allowance", "salmon"),
+    ("Other Allowance", "salmon"), ("Bonus", "salmon"),
+    ("Gross Salary", "yellow"),
+    ("LOP", "salmon"), ("PF", "salmon"), ("Esi", "salmon"), ("Professional Tax", "salmon"),
+    ("Gratuity", "salmon"), ("TDS", "salmon"), ("Loan/Deduction", "salmon"),
+    ("TOTAL DEDUCTIONS", "yellow"),
+    ("Net Salary", "green"), ("Bank", "green"), ("Payment Status", "green"),
+]
+PAYROLL_EXPORT_FILL = {
+    "dark":   "1C2B39",
+    "salmon": "F4CCCC",
+    "cyan":   "9FE2EA",
+    "yellow": "FFF2CC",
+    "green":  "D9EAD3",
+}
+
+
+@app.route("/api/admin/payroll/export", methods=["GET"])
+@token_required
+def export_payroll():
+    """
+    Exports a month's payslips as an .xlsx matching the company's external
+    payroll template (see PAYROLL_EXPORT_COLUMNS for the exact column contract).
+    Several columns are derived here rather than stored, since the payslip
+    itself only tracks the raw structure/adjustment values:
+      - Current Salary  = Basic+DA+HRA+Travel+Other (this payslip's fixed monthly earnings)
+      - Annual Salary    = Current Salary x 12
+      - Per day          = Current Salary / calendar days in the month
+      - LOP (days)       = LOP amount / Per day  (LOP is entered in rupees at run time)
+      - Total Working Days = calendar days in month - LOP days
+      - Salary as per days worked = Current Salary - LOP amount
+      - Gross Salary     = Current Salary + Bonus
+      - Loan/Deduction   = Other Deductions + Loan EMI + Advance Recovery
+    """
+    if not _payroll_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    try:
+        month = int(request.args.get("month"))
+        year  = int(request.args.get("year"))
+    except (TypeError, ValueError):
+        return jsonify({"message": "month (1-12) and year are required"}), 400
+    if not (1 <= month <= 12) or year < 2000:
+        return jsonify({"message": "Invalid month or year"}), 400
+
+    slips = list(payslips_col.find({"month": month, "year": year}).sort("employee_name", 1))
+    days_in_month = calendar.monthrange(year, month)[1]
+
+    doj_map = {}
+    emp_object_ids = []
+    for p in slips:
+        try:
+            emp_object_ids.append(ObjectId(p.get("employee_id")))
+        except Exception:
+            pass
+    if emp_object_ids:
+        for u in users_col.find({"_id": {"$in": emp_object_ids}}, {"doj": 1}):
+            doj_map[str(u["_id"])] = u.get("doj") or ""
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"{calendar.month_name[month]} {year}"[:31]
+
+    center_wrap = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for col_idx, (label, color_key) in enumerate(PAYROLL_EXPORT_COLUMNS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=label)
+        cell.fill = PatternFill("solid", fgColor=PAYROLL_EXPORT_FILL[color_key])
+        cell.font = Font(bold=True, size=9, color="FFFFFF" if color_key == "dark" else "1C2B39")
+        cell.alignment = center_wrap
+        ws.column_dimensions[get_column_letter(col_idx)].width = 15
+    ws.row_dimensions[1].height = 34
+    ws.freeze_panes = "A2"
+
+    for i, p in enumerate(slips, start=1):
+        current_salary = round(
+            _to_money(p.get("basic")) + _to_money(p.get("da")) + _to_money(p.get("hra"))
+            + _to_money(p.get("travel_allowance")) + _to_money(p.get("other_allowance")), 2
+        )
+        annual_salary = round(current_salary * 12, 2)
+        per_day = round(current_salary / days_in_month, 2) if days_in_month else 0
+        lop_amount = _to_money(p.get("lop"))
+        lop_days = round(lop_amount / per_day, 2) if per_day else 0
+        total_working_days = round(days_in_month - lop_days, 2)
+        salary_as_per_days_worked = round(current_salary - lop_amount, 2)
+        bonus = _to_money(p.get("bonus"))
+        gross_salary = round(current_salary + bonus, 2)
+        loan_deduction = round(
+            _to_money(p.get("other_deductions")) + _to_money(p.get("loan_emi")) + _to_money(p.get("advance_recovery")), 2
+        )
+        total_deductions = round(
+            lop_amount + _to_money(p.get("pf")) + _to_money(p.get("esi")) + _to_money(p.get("professional_tax"))
+            + _to_money(p.get("gratuity")) + _to_money(p.get("tds")) + loan_deduction, 2
+        )
+        net_salary = round(gross_salary - total_deductions, 2)
+
+        row = [
+            i,
+            p.get("employee_code") or p.get("employee_id", ""),
+            doj_map.get(p.get("employee_id"), ""),
+            p.get("employee_name", ""),
+            p.get("designation", ""),
+            p.get("grade_profile", ""),
+            p.get("department", ""),
+            current_salary, annual_salary, per_day,
+            lop_days,
+            total_working_days,
+            salary_as_per_days_worked,
+            _to_money(p.get("basic")), _to_money(p.get("da")), _to_money(p.get("hra")),
+            _to_money(p.get("travel_allowance")), _to_money(p.get("other_allowance")), bonus,
+            gross_salary,
+            lop_amount, _to_money(p.get("pf")), _to_money(p.get("esi")), _to_money(p.get("professional_tax")),
+            _to_money(p.get("gratuity")), _to_money(p.get("tds")), loan_deduction,
+            total_deductions,
+            net_salary, p.get("bank_detail", ""), p.get("status", "Pending"),
+        ]
+        for col_idx, val in enumerate(row, start=1):
+            ws.cell(row=i + 1, column=col_idx, value=val).font = Font(size=10)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"Payroll_Export_{calendar.month_name[month]}_{year}.xlsx"
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=filename,
+    )
 
 
 @app.route("/api/admin/payroll/payslips/<payslip_id>/status", methods=["PUT"])

@@ -11,3 +11,4 @@ Flask-Limiter
 Flask-Talisman
 cloudinary
 apscheduler
+openpyxl
