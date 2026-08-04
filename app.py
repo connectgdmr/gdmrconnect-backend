@@ -743,6 +743,7 @@ def add_employee():
     position = data.get("position", "")
     manager_id = data.get("manager_id")
     doj = data.get("doj", "")
+    employee_code = (data.get("employee_code") or "").strip()
 
     if not name or not email:
         return jsonify({"message": "Name and Email are required."}), 400
@@ -767,6 +768,7 @@ def add_employee():
         "department": department,
         "position": position,
         "doj": doj,
+        "employee_code": employee_code,
         "created_at": datetime.now(timezone.utc),
         "manager_id": manager_id,
         "shift": shift,
@@ -1039,7 +1041,7 @@ def edit_employee(emp_id):
     data = request.json
     update = {}
 
-    for k in ["name", "department", "position", "email", "manager_id", "shift", "doj"]:
+    for k in ["name", "department", "position", "email", "manager_id", "shift", "doj", "employee_code"]:
         if k in data:
             update[k] = data[k]
 
@@ -5058,6 +5060,10 @@ def run_payroll():
             display["transaction_detail"] = "Complete"
         if not display.get("designation"):
             display["designation"] = emp.get("position", "")
+        # Employee ID is set on the employee profile now (Add/Edit Employee) — that's
+        # authoritative. The Salary Setup field still works as a payroll-only override
+        # for anyone who set it there before this existed.
+        display["employee_code"] = emp.get("employee_code") or display.get("employee_code") or ""
 
         # Apply active loans and advances for this employee
         loan_emi           = 0.0
