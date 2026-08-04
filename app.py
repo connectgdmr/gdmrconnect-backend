@@ -807,17 +807,17 @@ def add_employee():
 @token_required
 def list_employees():
     """
-    Returns a list of all employees and managers.
+    Returns a list of all employees, managers and owners.
     Accessible by Admins or users with active delegated admin access.
     """
     role = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
-    
+
     if role not in ("admin", "owner") and not has_delegated:
         return jsonify({"message": "Unauthorized access."}), 403
 
     # ?active_only=true excludes staff whose last_working_day has already passed
-    emp_query: dict = {"role": {"$in": ["employee", "manager"]}}
+    emp_query: dict = {"role": {"$in": ["employee", "manager", "owner"]}}
     if request.args.get("active_only", "").lower() == "true":
         emp_query["$or"] = [
             {"resignation.last_working_day": None},
@@ -4875,7 +4875,7 @@ def list_salaries():
     if not _payroll_allowed(request.user):
         return jsonify({"message": "Unauthorized"}), 403
 
-    employees = list(users_col.find({"role": {"$in": ["employee", "manager"]}}, {"name": 1, "department": 1}))
+    employees = list(users_col.find({"role": {"$in": ["employee", "manager", "owner"]}}, {"name": 1, "department": 1}))
     struct_map = {s["employee_id"]: s for s in salary_structures_col.find()}
 
     rows = []
@@ -5373,7 +5373,7 @@ def export_payroll():
     if fmt not in ("xlsx", "pdf"):
         return jsonify({"message": "format must be 'xlsx' or 'pdf'"}), 400
 
-    slips = list(payslips_col.find({"month": month, "year": year}).sort("employee_name", 1))
+    slips = list(payslips_col.find({"month": month, "year": year}).sort([("department", 1), ("employee_name", 1)]))
     days_in_month = calendar.monthrange(year, month)[1]
 
     doj_map = {}
