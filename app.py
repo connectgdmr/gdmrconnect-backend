@@ -5176,14 +5176,24 @@ PAYROLL_EXPORT_FILL = {
 }
 
 
-@app.route("/api/admin/payroll/export", methods=["GET"])
-@token_required
-def export_payroll():
+def _color_group_ranges(columns):
+    """Collapses PAYROLL_EXPORT_COLUMNS into (start_idx, end_idx, color_key) runs
+    of consecutive same-colored columns — used to paint contiguous header bands
+    without hardcoding column indices in two places."""
+    ranges = []
+    start = 0
+    for i in range(1, len(columns) + 1):
+        if i == len(columns) or columns[i][1] != columns[start][1]:
+            ranges.append((start, i - 1, columns[start][1]))
+            start = i
+    return ranges
+
+
+def _build_payroll_export_rows(slips, days_in_month, doj_map):
     """
-    Exports a month's payslips as an .xlsx matching the company's external
-    payroll template (see PAYROLL_EXPORT_COLUMNS for the exact column contract).
-    Several columns are derived here rather than stored, since the payslip
-    itself only tracks the raw structure/adjustment values:
+    Builds one row (list of typed values, matching PAYROLL_EXPORT_COLUMNS order)
+    per payslip. Several columns are derived here rather than stored, since the
+    payslip itself only tracks the raw structure/adjustment values:
       - Current Salary  = Basic+DA+HRA+Travel+Other (this payslip's fixed monthly earnings)
       - Annual Salary    = Current Salary x 12
       - Per day          = Current Salary / calendar days in the month
@@ -5193,45 +5203,7 @@ def export_payroll():
       - Gross Salary     = Current Salary + Bonus
       - Loan/Deduction   = Other Deductions + Loan EMI + Advance Recovery
     """
-    if not _payroll_allowed(request.user):
-        return jsonify({"message": "Unauthorized"}), 403
-
-    try:
-        month = int(request.args.get("month"))
-        year  = int(request.args.get("year"))
-    except (TypeError, ValueError):
-        return jsonify({"message": "month (1-12) and year are required"}), 400
-    if not (1 <= month <= 12) or year < 2000:
-        return jsonify({"message": "Invalid month or year"}), 400
-
-    slips = list(payslips_col.find({"month": month, "year": year}).sort("employee_name", 1))
-    days_in_month = calendar.monthrange(year, month)[1]
-
-    doj_map = {}
-    emp_object_ids = []
-    for p in slips:
-        try:
-            emp_object_ids.append(ObjectId(p.get("employee_id")))
-        except Exception:
-            pass
-    if emp_object_ids:
-        for u in users_col.find({"_id": {"$in": emp_object_ids}}, {"doj": 1}):
-            doj_map[str(u["_id"])] = u.get("doj") or ""
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = f"{calendar.month_name[month]} {year}"[:31]
-
-    center_wrap = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    for col_idx, (label, color_key) in enumerate(PAYROLL_EXPORT_COLUMNS, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=label)
-        cell.fill = PatternFill("solid", fgColor=PAYROLL_EXPORT_FILL[color_key])
-        cell.font = Font(bold=True, size=9, color="FFFFFF" if color_key == "dark" else "1C2B39")
-        cell.alignment = center_wrap
-        ws.column_dimensions[get_column_letter(col_idx)].width = 15
-    ws.row_dimensions[1].height = 34
-    ws.freeze_panes = "A2"
-
+    rows = []
     for i, p in enumerate(slips, start=1):
         current_salary = round(
             _to_money(p.get("basic")) + _to_money(p.get("da")) + _to_money(p.get("hra"))
@@ -5254,7 +5226,7 @@ def export_payroll():
         )
         net_salary = round(gross_salary - total_deductions, 2)
 
-        row = [
+        rows.append([
             i,
             p.get("employee_code") or p.get("employee_id", ""),
             doj_map.get(p.get("employee_id"), ""),
@@ -5273,19 +5245,130 @@ def export_payroll():
             _to_money(p.get("gratuity")), _to_money(p.get("tds")), loan_deduction,
             total_deductions,
             net_salary, p.get("bank_detail", ""), p.get("status", "Pending"),
-        ]
+        ])
+    return rows
+
+
+def _render_payroll_xlsx(month, year, rows):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"{calendar.month_name[month]} {year}"[:31]
+
+    center_wrap = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for col_idx, (label, color_key) in enumerate(PAYROLL_EXPORT_COLUMNS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=label)
+        cell.fill = PatternFill("solid", fgColor=PAYROLL_EXPORT_FILL[color_key])
+        cell.font = Font(bold=True, size=9, color="FFFFFF" if color_key == "dark" else "1C2B39")
+        cell.alignment = center_wrap
+        ws.column_dimensions[get_column_letter(col_idx)].width = 15
+    ws.row_dimensions[1].height = 34
+    ws.freeze_panes = "A2"
+
+    for r, row in enumerate(rows, start=2):
         for col_idx, val in enumerate(row, start=1):
-            ws.cell(row=i + 1, column=col_idx, value=val).font = Font(size=10)
+            ws.cell(row=r, column=col_idx, value=val).font = Font(size=10)
 
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
-    filename = f"Payroll_Export_{calendar.month_name[month]}_{year}.xlsx"
+    return buf
+
+
+def _render_payroll_pdf(month, year, rows):
+    from reportlab.lib.pagesizes import A3, landscape
+    from reportlab.lib import colors as rl_colors
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+    from reportlab.lib.styles import getSampleStyleSheet
+
+    def fmt_cell(v):
+        if isinstance(v, float):
+            return f"{v:,.2f}"
+        return "" if v is None else str(v)
+
+    header = [label for label, _ in PAYROLL_EXPORT_COLUMNS]
+    body = [[fmt_cell(v) for v in row] for row in rows]
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=landscape(A3),
+        leftMargin=10 * mm, rightMargin=10 * mm, topMargin=10 * mm, bottomMargin=10 * mm,
+    )
+    styles = getSampleStyleSheet()
+    title = Paragraph(f"<b>Payroll Export — {calendar.month_name[month]} {year}</b>", styles["Heading3"])
+
+    table = Table([header] + body, repeatRows=1)
+    style = [
+        ("FONTSIZE", (0, 0), (-1, -1), 6.5),
+        ("FONTSIZE", (0, 0), (-1, 0), 7),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#94A3B8")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F8FAFC")]),
+    ]
+    for start, end, color_key in _color_group_ranges(PAYROLL_EXPORT_COLUMNS):
+        style.append(("BACKGROUND", (start, 0), (end, 0), rl_colors.HexColor("#" + PAYROLL_EXPORT_FILL[color_key])))
+        if color_key == "dark":
+            style.append(("TEXTCOLOR", (start, 0), (end, 0), rl_colors.white))
+    table.setStyle(TableStyle(style))
+
+    doc.build([title, table])
+    buf.seek(0)
+    return buf
+
+
+@app.route("/api/admin/payroll/export", methods=["GET"])
+@token_required
+def export_payroll():
+    """
+    Exports a month's payslips matching the company's external payroll
+    template (see PAYROLL_EXPORT_COLUMNS for the exact column contract).
+    ?format=xlsx (default) or ?format=pdf.
+    """
+    if not _payroll_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    try:
+        month = int(request.args.get("month"))
+        year  = int(request.args.get("year"))
+    except (TypeError, ValueError):
+        return jsonify({"message": "month (1-12) and year are required"}), 400
+    if not (1 <= month <= 12) or year < 2000:
+        return jsonify({"message": "Invalid month or year"}), 400
+
+    fmt = (request.args.get("format") or "xlsx").lower()
+    if fmt not in ("xlsx", "pdf"):
+        return jsonify({"message": "format must be 'xlsx' or 'pdf'"}), 400
+
+    slips = list(payslips_col.find({"month": month, "year": year}).sort("employee_name", 1))
+    days_in_month = calendar.monthrange(year, month)[1]
+
+    doj_map = {}
+    emp_object_ids = []
+    for p in slips:
+        try:
+            emp_object_ids.append(ObjectId(p.get("employee_id")))
+        except Exception:
+            pass
+    if emp_object_ids:
+        for u in users_col.find({"_id": {"$in": emp_object_ids}}, {"doj": 1}):
+            doj_map[str(u["_id"])] = u.get("doj") or ""
+
+    rows = _build_payroll_export_rows(slips, days_in_month, doj_map)
+    period_label = f"{calendar.month_name[month]}_{year}"
+
+    if fmt == "pdf":
+        buf = _render_payroll_pdf(month, year, rows)
+        return send_file(buf, mimetype="application/pdf", as_attachment=True,
+                          download_name=f"Payroll_Export_{period_label}.pdf")
+
+    buf = _render_payroll_xlsx(month, year, rows)
     return send_file(
         buf,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         as_attachment=True,
-        download_name=filename,
+        download_name=f"Payroll_Export_{period_label}.xlsx",
     )
 
 

@@ -12,3 +12,4 @@ Flask-Talisman
 cloudinary
 apscheduler
 openpyxl
+reportlab
