@@ -5274,43 +5274,69 @@ def _render_payroll_xlsx(month, year, rows):
     return buf
 
 
+PAYROLL_EXPORT_WIDE_COLS   = {"Employee Name", "Designation", "Department", "Bank"}
+PAYROLL_EXPORT_NARROW_COLS = {"SL No", "Grade", "LOP"}
+
+
 def _render_payroll_pdf(month, year, rows):
     from reportlab.lib.pagesizes import A3, landscape
     from reportlab.lib import colors as rl_colors
     from reportlab.lib.units import mm
     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
-    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
     def fmt_cell(v):
         if isinstance(v, float):
             return f"{v:,.2f}"
         return "" if v is None else str(v)
 
-    header = [label for label, _ in PAYROLL_EXPORT_COLUMNS]
-    body = [[fmt_cell(v) for v in row] for row in rows]
-
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=landscape(A3),
-        leftMargin=10 * mm, rightMargin=10 * mm, topMargin=10 * mm, bottomMargin=10 * mm,
+        leftMargin=8 * mm, rightMargin=8 * mm, topMargin=10 * mm, bottomMargin=10 * mm,
     )
-    styles = getSampleStyleSheet()
-    title = Paragraph(f"<b>Payroll Export — {calendar.month_name[month]} {year}</b>", styles["Heading3"])
 
-    table = Table([header] + body, repeatRows=1)
+    # Columns must sum to exactly the frame's available width — reportlab's Table
+    # does NOT auto-shrink columns wider than the page, it silently overflows the
+    # frame instead, which was cutting off columns on export. Weighted, not equal,
+    # so long text fields (name/designation/department/bank) get more room while
+    # short numeric ones (SL No, Grade, LOP) get less. Cell text is wrapped via
+    # Paragraph rather than plain strings, so long values wrap instead of
+    # overflowing into the neighboring cell.
+    weights = [
+        1.5 if label in PAYROLL_EXPORT_WIDE_COLS else (0.7 if label in PAYROLL_EXPORT_NARROW_COLS else 1.0)
+        for label, _ in PAYROLL_EXPORT_COLUMNS
+    ]
+    total_weight = sum(weights)
+    col_widths = [doc.width * (w / total_weight) for w in weights]
+
+    cell_style = ParagraphStyle("cell", fontSize=6, leading=7, alignment=1)
+
+    def header_row():
+        out = []
+        for label, color_key in PAYROLL_EXPORT_COLUMNS:
+            style = ParagraphStyle(
+                "hdr", fontSize=6.5, leading=7.5, alignment=1, fontName="Helvetica-Bold",
+                textColor=rl_colors.white if color_key == "dark" else rl_colors.HexColor("#1C2B39"),
+            )
+            out.append(Paragraph(label, style))
+        return out
+
+    body_rows = [[Paragraph(fmt_cell(v), cell_style) for v in row] for row in rows]
+
+    title = Paragraph(f"<b>Payroll Export — {calendar.month_name[month]} {year}</b>", getSampleStyleSheet()["Heading3"])
+
+    table = Table([header_row()] + body_rows, colWidths=col_widths, repeatRows=1)
     style = [
-        ("FONTSIZE", (0, 0), (-1, -1), 6.5),
-        ("FONTSIZE", (0, 0), (-1, 0), 7),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("GRID", (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#94A3B8")),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#F8FAFC")]),
+        ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2),
     ]
     for start, end, color_key in _color_group_ranges(PAYROLL_EXPORT_COLUMNS):
         style.append(("BACKGROUND", (start, 0), (end, 0), rl_colors.HexColor("#" + PAYROLL_EXPORT_FILL[color_key])))
-        if color_key == "dark":
-            style.append(("TEXTCOLOR", (start, 0), (end, 0), rl_colors.white))
     table.setStyle(TableStyle(style))
 
     doc.build([title, table])
