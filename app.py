@@ -1012,6 +1012,45 @@ def delete_department(dept_id):
     return jsonify({"message": f"Department '{dept['name']}' metadata deleted."}), 200
 
 
+@app.route("/api/departments/<dept_name>/work-types", methods=["GET"])
+@token_required
+def get_dept_work_types(dept_name):
+    """Return the configured work-type list for a department. Open to any authenticated role."""
+    dept = departments_col.find_one({"name": {"$regex": f"^{re.escape(dept_name)}$", "$options": "i"}})
+    if not dept:
+        return jsonify({"types": []}), 200
+    return jsonify({"types": dept.get("work_types") or []}), 200
+
+
+@app.route("/api/admin/departments/<dept_name>/work-types", methods=["PUT"])
+@token_required
+def set_dept_work_types(dept_name):
+    """Set the work-type list for a department. Admin/owner for any dept; manager for their own dept only."""
+    user = request.user
+    role = user.get("role")
+    if not _is_admin(user) and role != "manager":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    if role == "manager":
+        mgr_depts = [d.strip().lower() for d in _mgr_depts(user)]
+        if dept_name.strip().lower() not in mgr_depts:
+            return jsonify({"message": "Unauthorized: not your department"}), 403
+
+    data  = request.get_json(silent=True) or {}
+    types = data.get("types")
+    if not isinstance(types, list):
+        return jsonify({"message": "types must be a list"}), 400
+    types = [str(t).strip() for t in types if str(t).strip()]
+
+    result = departments_col.update_one(
+        {"name": {"$regex": f"^{re.escape(dept_name)}$", "$options": "i"}},
+        {"$set": {"work_types": types, "updated_at": datetime.now(timezone.utc)}},
+    )
+    if result.matched_count == 0:
+        return jsonify({"message": "Department not found"}), 404
+    return jsonify({"types": types}), 200
+
+
 @app.route("/api/manager/my-employees", methods=["GET"])
 @token_required
 def manager_my_employees():
@@ -6813,18 +6852,82 @@ def my_work_plans_history():
             "status": p.get("status"),
             "tasks":  [
                 {
-                    "id":       t.get("id") or t.get("_id", ""),
-                    "title":    t.get("title", ""),
-                    "priority": t.get("priority", ""),
-                    "project":  t.get("project", ""),
-                    "client":   t.get("client", ""),
-                    "est_time": t.get("est_time", ""),
-                    "status":   t.get("status", "Pending"),
+                    "id":        t.get("id") or t.get("_id", ""),
+                    "title":     t.get("title", ""),
+                    "priority":  t.get("priority", ""),
+                    "project":   t.get("project", ""),
+                    "client":    t.get("client", ""),
+                    "est_time":  t.get("est_time", ""),
+                    "status":    t.get("status", "Pending"),
+                    "work_type": t.get("work_type", ""),
                 }
                 for t in (p.get("tasks") or [])
             ],
         })
     return jsonify(result), 200
+
+
+@app.route("/api/my/work-plan/share", methods=["POST"])
+@token_required
+def share_work_plan():
+    """Send the caller's work plan for a given date to their manager(s) and all owners right now."""
+    uid      = str(request.user["_id"])
+    data     = request.get_json(silent=True) or {}
+    date_str = str(data.get("date") or _today_ist().isoformat())[:10]
+
+    plan = work_plans_col.find_one({"employee_id": uid, "date": date_str})
+    if not plan or not plan.get("tasks"):
+        return jsonify({"message": "No work plan found for that date"}), 404
+
+    dept = (request.user.get("department") or "").strip()
+
+    def _build_body(plan_doc, date_s):
+        lines = [
+            f"Work Plan — {request.user.get('name', '')}",
+            f"Date: {date_s}",
+            f"Department: {dept}",
+            "",
+        ]
+        ci_map = _checkin_map([uid], date_s)
+        ci = ci_map.get(uid) or "—"
+        lines.append(f"Check-in: {ci}")
+        lines.append("")
+        for t in plan_doc.get("tasks", []):
+            done = "✓" if _is_task_done(t) else " "
+            lines.append(
+                f"  [{done}] {t.get('title', '')}"
+                f"  | type: {t.get('work_type', '-')}"
+                f"  | priority: {t.get('priority', '-')}"
+                f"  | est: {t.get('est_time', '-')}"
+                f"  | project: {t.get('project', '-')}"
+            )
+        if plan_doc.get("manager_comment"):
+            lines.append(f"\nManager comment: {plan_doc['manager_comment']}")
+        return "\n".join(lines)
+
+    def _send_share():
+        subject = f"Work Plan — {request.user.get('name', '')} ({date_str})"
+        body    = _build_body(plan, date_str)
+
+        # Manager(s) for this department
+        recipients = set(OWNER_EMAILS)
+        if dept:
+            for mgr in users_col.find({"role": "manager", "department": dept}, {"email": 1}):
+                if mgr.get("email"):
+                    recipients.add(mgr["email"])
+            # Also check array-style department field
+            for mgr in users_col.find({"role": "manager", "department": {"$in": [dept]}}, {"email": 1}):
+                if mgr.get("email"):
+                    recipients.add(mgr["email"])
+
+        for email in recipients:
+            try:
+                send_email(email, subject, body)
+            except Exception as e:
+                print(f"[share-plan] email to {email} failed: {e}")
+
+    threading.Thread(target=_send_share, daemon=True).start()
+    return jsonify({"message": "Work plan shared successfully"}), 200
 
 
 @app.route("/api/my/work-analytics", methods=["GET"])
@@ -6840,6 +6943,82 @@ def my_work_analytics():
         "date": {"$gte": start_date.isoformat(), "$lte": today_date.isoformat()}
     }))
     return jsonify(_build_analytics(plans, start_date, today_date)), 200
+
+
+@app.route("/api/my/work-analytics-ai", methods=["GET"])
+@token_required
+def my_work_analytics_ai():
+    """AI-generated plain-language summary of the caller's work for the requested range."""
+    if not GROQ_API_KEY:
+        return jsonify({"message": "AI analytics not configured."}), 503
+
+    uid       = str(request.user["_id"])
+    range_key = request.args.get("range", "week")
+    today     = _today_ist()
+    start     = _range_start(range_key, today)
+
+    plans = list(work_plans_col.find({
+        "employee_id": uid,
+        "date": {"$gte": start.isoformat(), "$lte": today.isoformat()},
+    }))
+
+    # Compute compact stats
+    total_tasks = completed_tasks = 0
+    work_type_counts: dict = {}
+    client_counts:    dict = {}
+    active_days = set()
+
+    for p in plans:
+        if p.get("tasks"):
+            active_days.add(p.get("date"))
+        for t in (p.get("tasks") or []):
+            total_tasks += 1
+            if _is_task_done(t):
+                completed_tasks += 1
+            wt = (t.get("work_type") or "").strip()
+            if wt:
+                work_type_counts[wt] = work_type_counts.get(wt, 0) + 1
+            cl = (t.get("client") or "").strip()
+            if cl:
+                client_counts[cl] = client_counts.get(cl, 0) + 1
+
+    completion_rate  = round(completed_tasks / total_tasks * 100) if total_tasks else 0
+    top_work_type    = max(work_type_counts, key=work_type_counts.get) if work_type_counts else "N/A"
+    top_client       = max(client_counts,    key=client_counts.get)    if client_counts    else "N/A"
+
+    facts = (
+        f"Period: {start.isoformat()} to {today.isoformat()} ({range_key})\n"
+        f"Active days with tasks: {len(active_days)}\n"
+        f"Total tasks: {total_tasks}\n"
+        f"Completed tasks: {completed_tasks} ({completion_rate}%)\n"
+        f"Most common work type: {top_work_type}\n"
+        f"Most common client: {top_client}\n"
+    )
+
+    system_prompt = (
+        "You are a helpful productivity coach. Based on the employee's work-plan stats below, "
+        "write a 3–5 sentence plain-English summary. Cover: overall productivity, completion rate, "
+        "focus areas, and one concrete observation or encouragement. Be specific and friendly.\n\n"
+        f"Stats:\n{facts}"
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": system_prompt}],
+                "temperature": 0.5,
+                "max_tokens": 250,
+            },
+            timeout=12,
+        )
+        resp.raise_for_status()
+        summary = resp.json()["choices"][0]["message"]["content"].strip()
+        return jsonify({"summary": summary}), 200
+    except Exception as e:
+        return jsonify({"message": "AI analytics temporarily unavailable.", "error": str(e)}), 502
 
 
 # ── Admin / Manager routes ───────────────────────────────────────────────────
