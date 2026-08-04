@@ -21,6 +21,7 @@ Key Modules Included:
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 import base64, os, re, csv, io, secrets, gzip, time as _time, html as _html
+import requests
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -112,6 +113,12 @@ if not _secret_key or _secret_key == "replace-this-secret-with-a-secure-key-in-p
     )
 app.config['SECRET_KEY'] = _secret_key
 MONGO_URI = os.getenv("MONGO_URI")
+
+# Optional — powers the Rexor LLM fallback (/api/assistant/chat). Free key from
+# console.groq.com/keys. If unset, that route returns 503 and the frontend
+# silently falls back to its built-in keyword knowledge base.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 try:
     client = MongoClient(
@@ -2454,6 +2461,80 @@ def my_leaves():
         l["_id"] = str(l["_id"])
         rows.append(l)
     return jsonify(rows), 200
+
+
+@app.route("/api/assistant/chat", methods=["POST"])
+@token_required
+@limiter.limit("15 per minute")
+def assistant_chat():
+    """
+    LLM-backed fallback for the Rexor in-app assistant, used only when the
+    client-side keyword knowledge base has no match for the user's question.
+    Grounds the model in a few real facts (name, role, leave counts, and any
+    client-supplied context like the next holiday) so it doesn't hallucinate
+    company-specific data. Returns 503 if no GROQ_API_KEY is configured, so
+    the frontend can silently fall back to its canned KB response.
+    """
+    if not GROQ_API_KEY:
+        return jsonify({"message": "Assistant not configured."}), 503
+
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    if not message:
+        return jsonify({"message": "message is required."}), 400
+    if len(message) > 500:
+        return jsonify({"message": "Message is too long."}), 400
+
+    client_context = data.get("context") if isinstance(data.get("context"), dict) else {}
+    next_holiday = client_context.get("next_holiday") if isinstance(client_context.get("next_holiday"), dict) else None
+
+    user = request.user
+    uid = str(user["_id"])
+    pending_leaves = leaves_col.count_documents({"user_id": uid, "status": "Pending"})
+    approved_leaves = leaves_col.count_documents({"user_id": uid, "status": "Approved"})
+
+    facts = [
+        f"Employee first name: {(user.get('name') or 'there').split(' ')[0]}",
+        f"Role: {user.get('role', 'employee')}",
+        f"Department: {user.get('department') or 'not set'}",
+        f"Pending leave requests: {pending_leaves}",
+        f"Approved leave requests: {approved_leaves}",
+    ]
+    if next_holiday and next_holiday.get("name"):
+        facts.append(
+            f"Next upcoming company holiday: {next_holiday.get('name')} on {next_holiday.get('date')} "
+            f"({next_holiday.get('days_away')} day(s) away)"
+        )
+
+    system_prompt = (
+        "You are Rexor, the friendly in-app assistant for GDMR Connect, an internal employee ERP. "
+        "Answer the employee's question in 2-4 short sentences using ONLY the facts listed below plus "
+        "general HR/workplace knowledge. Never invent company-specific data you weren't given (exact "
+        "policies, leave balances, dates). If the question needs data you don't have, say so and point "
+        "them to HR at info@gdmrfoundation.com or the relevant section of the app.\n\nKnown facts:\n"
+        + "\n".join(f"- {f}" for f in facts)
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": message},
+                ],
+                "temperature": 0.4,
+                "max_tokens": 300,
+            },
+            timeout=12,
+        )
+        resp.raise_for_status()
+        reply_text = resp.json()["choices"][0]["message"]["content"].strip()
+        return jsonify({"reply": reply_text}), 200
+    except Exception as e:
+        return jsonify({"message": "Assistant is temporarily unavailable.", "error": str(e)}), 502
 
 
 # =============================================================================
