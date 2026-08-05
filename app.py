@@ -1533,9 +1533,10 @@ def submit_pms_review():
     data = request.json
     month = datetime.now(IST).strftime("%Y-%m")
 
-    if pms_reviews_col.find_one({"user_id": uid, "month": month}):
-        return jsonify({"message": "You have already submitted your Self Assessment for this month."}), 400
-
+    # No longer limited to one submission per user per month — an employee can
+    # now have multiple active PMS assignments in the same month (e.g. one from
+    # their manager and a separate one built directly by admin), and each needs
+    # its own submission.
     template = pms_templates_col.find_one({"assigned_to": uid})
     cycle_name = template.get("cycle_name", "") if template else ""
 
