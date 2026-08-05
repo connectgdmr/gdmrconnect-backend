@@ -1536,8 +1536,23 @@ def submit_pms_review():
     if pms_reviews_col.find_one({"user_id": uid, "month": month}):
         return jsonify({"message": "You have already submitted your Self Assessment for this month."}), 400
 
-    template = pms_templates_col.find_one({"assigned_to": uid}, {"cycle_name": 1})
+    template = pms_templates_col.find_one({"assigned_to": uid})
     cycle_name = template.get("cycle_name", "") if template else ""
+
+    # Ownership: whoever built the assigned template "owns" the resulting review.
+    # Admin/owner-built templates are auto-shared to admin (dual visibility — the
+    # employee's department-matched manager still sees it via get_manager_pms's
+    # unchanged department query). Manager-built templates start private to that
+    # manager; see POST /api/manager/pms/<id>/share.
+    owner_id = template.get("created_by") if template else None
+    owner_role = None
+    if owner_id:
+        try:
+            owner_user = users_col.find_one({"_id": ObjectId(owner_id)}, {"role": 1})
+            owner_role = owner_user.get("role") if owner_user else None
+        except Exception:
+            owner_role = None
+    shared_with_admin = owner_role in ("admin", "owner")
 
     submission = {
         "user_id": uid,
@@ -1545,6 +1560,10 @@ def submit_pms_review():
         "manager_id": request.user.get("manager_id"),
         "month": month,
         "cycle_name": cycle_name,
+        "template_id": str(template["_id"]) if template else None,
+        "owner_id": owner_id,
+        "owner_role": owner_role,
+        "shared_with_admin": shared_with_admin,
         "responses": data.get("responses", []),
         "status": "Pending Review",
         "self_assessment_date": datetime.now(timezone.utc),
@@ -1585,6 +1604,61 @@ def get_manager_pms():
     return jsonify(rows), 200
 
 
+@app.route("/api/manager/pms/<review_id>/share", methods=["POST"])
+@token_required
+def share_pms_with_admin(review_id):
+    """
+    Marks a review as visible on Admin's PMS page. Managers may only share
+    reviews in their own department; admin/owner can share (or re-share) any
+    review. Sharing is idempotent and one-way from this endpoint (no unshare) —
+    admin-owned reviews are already auto-shared at submission time, so this
+    mainly matters for manager-owned reviews.
+    """
+    if request.user.get("role") not in ["manager", "admin", "owner"]:
+        return jsonify({"message": "Unauthorized"}), 403
+
+    try:
+        review = pms_reviews_col.find_one({"_id": ObjectId(review_id)})
+    except Exception:
+        return jsonify({"message": "Invalid review ID"}), 400
+    if not review:
+        return jsonify({"message": "Review not found"}), 404
+
+    if request.user.get("role") == "manager" and review.get("department") not in _mgr_depts(request.user):
+        return jsonify({"message": "Unauthorized — this review isn't in your department."}), 403
+
+    pms_reviews_col.update_one({"_id": ObjectId(review_id)}, {"$set": {"shared_with_admin": True}})
+    return jsonify({"message": "Shared with Admin."}), 200
+
+
+@app.route("/api/admin/pms", methods=["GET"])
+@token_required
+def get_admin_pms():
+    """
+    Admin's PMS page: every review that's been shared (manager clicked "Share
+    with Admin") or that admin/owner built themselves (auto-shared at
+    submission — see submit_pms_review). NOT department-scoped like
+    /api/manager/pms — deliberately org-wide, since Admin's page groups by
+    department on the client instead.
+    """
+    if request.user.get("role") not in ["admin", "owner"]:
+        return jsonify({"message": "Unauthorized"}), 403
+
+    reviews = list(pms_reviews_col.find({"shared_with_admin": True}).sort("self_assessment_date", -1))
+    uids = []
+    for r in reviews:
+        try: uids.append(ObjectId(r["user_id"]))
+        except Exception: pass
+    emp_map = {str(e["_id"]): e["name"] for e in users_col.find({"_id": {"$in": uids}}, {"name": 1})}
+
+    rows = []
+    for r in reviews:
+        r["_id"] = str(r["_id"])
+        r["employee_name"] = emp_map.get(r.get("user_id"), "Unknown")
+        rows.append(r)
+    return jsonify(rows), 200
+
+
 @app.route("/api/manager/pms-calibration", methods=["GET"])
 @token_required
 def pms_calibration():
@@ -1600,7 +1674,9 @@ def pms_calibration():
     if request.user.get("role") == "manager":
         query = {"month": month, "department": {"$in": _mgr_depts(request.user)}}
     else:
-        query = {"month": month}
+        # Admin/owner calibration is scoped to what's actually visible on their
+        # PMS page (shared or admin-owned), same rule as GET /api/admin/pms.
+        query = {"month": month, "shared_with_admin": True}
 
     reviews = list(pms_reviews_col.find(query))
 
@@ -1749,8 +1825,12 @@ def pms_dashboard():
             total_emps = users_col.count_documents({"department": d, "role": "employee"})
             dashboard_data[d] = {"total_employees": total_emps, "completed_pms": 0, "total_score": 0, "avg_score": 0}
             
-    reviews = pms_reviews_col.find({"month": month, "status": "Manager Review Completed", "department": {"$in": departments}})
-    
+    review_query = {"month": month, "status": "Manager Review Completed", "department": {"$in": departments}}
+    if request.user.get("role") != "manager":
+        # Admin/owner dashboard is scoped to what's visible on their PMS page.
+        review_query["shared_with_admin"] = True
+    reviews = pms_reviews_col.find(review_query)
+
     for r in reviews:
         dept = r.get("department")
         if dept and dept in dashboard_data:
@@ -1789,7 +1869,10 @@ def export_pms():
     query = {"month": month}
     if request.user.get("role") == "manager":
         query["department"] = {"$in": _mgr_depts(request.user)}
-    
+    else:
+        # Admin/owner export is scoped to what's visible on their PMS page.
+        query["shared_with_admin"] = True
+
     si = io.StringIO()
     cw = csv.writer(si)
     cw.writerow(["Employee Name", "Department", "Month", "Status", "Self Score Total", "Manager Score Total", "Manager Feedback"])
