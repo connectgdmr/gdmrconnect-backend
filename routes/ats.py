@@ -1,0 +1,942 @@
+"""
+routes/ats.py — GDMR Connect
+================================
+Applicant Tracking System: candidate CRUD, status pipeline, recordings, portfolio,
+document request/upload (public token), stats, resume upload, admin doc review.
+"""
+import re
+import html as _html
+import secrets
+import threading
+import cloudinary.uploader
+from datetime import datetime, timezone
+from flask import Blueprint, request, jsonify
+from bson import ObjectId
+
+from database import ats_candidates_col, users_col
+from decorators import token_required
+from helpers import _is_admin, _mgr_depts
+from utils import send_email
+
+bp = Blueprint("ats", __name__)
+
+
+# ── Status constants ──────────────────────────────────────────────────────────
+
+ATS_STATUSES = (
+    "Applied",
+    "Screening Call Scheduled",
+    "Technical Assessment",
+    "Technical Interview",
+    "HR Interview",
+    "Management Interview",
+    "Shortlisted",
+    "Documentation Pending",
+    "Offer Released",
+    "Offer Accepted",
+    "Joined",
+    "Rejected",
+    "On Hold",
+    "Withdrawn",
+    # Legacy values kept so existing records remain valid
+    "Screening",
+    "Interview",
+    "Hired",
+)
+
+DOC_CHECKLIST_DEFAULT = [
+    "Resume / CV",
+    "Government ID Proof",
+    "Address Proof",
+    "Educational Certificates",
+    "Experience / Relieving Letters",
+]
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _ats_allowed(user):
+    role = user.get("role")
+    if role in ("admin", "owner"):
+        return True
+    dept = (user.get("department") or "").strip().lower()
+    if "hr" in dept or "human resource" in dept:
+        return True
+    if role == "manager":
+        return True
+    return False
+
+
+def _ats_scope_query(user):
+    role      = user.get("role")
+    depts     = _mgr_depts(user)
+    dept_lower = " ".join(d.lower() for d in depts)
+    if role in ("admin", "owner") or "hr" in dept_lower or "human resource" in dept_lower:
+        return {}
+    return {"department": {"$in": depts}}
+
+
+def _serialize_ats(c):
+    c["_id"] = str(c["_id"])
+    for f in ("applied_at", "created_at", "updated_at",
+              "hired_at", "offer_released_at", "offer_accepted_at"):
+        if isinstance(c.get(f), datetime):
+            c[f] = c[f].isoformat()
+    for entry in c.get("status_history", []):
+        if isinstance(entry.get("at"), datetime):
+            entry["at"] = entry["at"].isoformat()
+    for rec in c.get("recordings", []):
+        if isinstance(rec.get("added_at"), datetime):
+            rec["added_at"] = rec["added_at"].isoformat()
+    for doc in c.get("documents", []):
+        if isinstance(doc.get("uploaded_at"), datetime):
+            doc["uploaded_at"] = doc["uploaded_at"].isoformat()
+        if isinstance(doc.get("reviewed_at"), datetime):
+            doc["reviewed_at"] = doc["reviewed_at"].isoformat()
+    return c
+
+
+# ── Email templates ───────────────────────────────────────────────────────────
+
+_ATS_BRAND = "#34a06a"
+_ATS_DASH  = "https://www.gdmrconnect.com"
+
+
+def _ats_email_wrapper(inner_html, cta_label, cta_url):
+    cta = (
+        f'<a href="{cta_url}" style="display:inline-block;margin-top:22px;'
+        f'background:{_ATS_BRAND};color:#fff;text-decoration:none;padding:11px 22px;'
+        f'border-radius:8px;font-weight:600;font-size:14px">{cta_label}</a>'
+        if cta_url else ""
+    )
+    return (
+        f'<div style="font-family:\'Segoe UI\',Arial,sans-serif;max-width:600px;'
+        f'margin:auto;border:1px solid #e6eaef;border-radius:12px;overflow:hidden">'
+        f'<div style="background:{_ATS_BRAND};color:#fff;padding:18px 24px">'
+        f'<h2 style="margin:0;font-size:18px">GDMR Foundation — Recruitment Update</h2></div>'
+        f'<div style="padding:24px;color:#0f172a;font-size:14px;line-height:1.6">'
+        f'{inner_html}{cta}</div>'
+        f'<div style="background:#f8fafc;padding:14px 24px;font-size:12px;color:#94a3b8;text-align:center">'
+        f'This is an automated message from GDMR Foundation. Do not reply directly.</div></div>'
+    )
+
+
+STATUS_EMAIL_TEMPLATES = {
+    "Screening Call Scheduled": {
+        "subject": "Next Step: Screening Call — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "Thank you for applying for the {job_role} position at GDMR Foundation.\n"
+            "We have reviewed your application and would like to schedule a brief screening call "
+            "to learn more about your background and experience.\n\n"
+            "Our HR team will reach out shortly to confirm the date and time.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>Thank you for applying for the <strong>{job_role}</strong> role at GDMR Foundation.</p>"
+            "<p>We have reviewed your application and would like to schedule a brief <strong>Screening Call</strong> "
+            "to learn more about your background. Our HR team will reach out shortly to confirm the date and time.</p>"
+            "<p>We look forward to speaking with you!</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Technical Assessment": {
+        "subject": "Technical Assessment — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "Congratulations on clearing the initial screening for the {job_role} role.\n"
+            "The next step in your application is a Technical Assessment. "
+            "Our team will share the assessment details and timeline with you shortly.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>Congratulations on clearing the initial screening for the <strong>{job_role}</strong> role!</p>"
+            "<p>The next step is a <strong>Technical Assessment</strong>. "
+            "Our team will share the assessment link and instructions with you shortly.</p>"
+            "<p>Please keep an eye on your inbox.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Technical Interview": {
+        "subject": "Interview Invitation: Technical Round — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "We are pleased to invite you for a Technical Interview for the {job_role} position.\n"
+            "Our HR team will be in touch soon with the schedule and joining details.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>We are pleased to invite you for a <strong>Technical Interview</strong> "
+            "for the <strong>{job_role}</strong> position at GDMR Foundation.</p>"
+            "<p>Our HR team will share the schedule and joining link shortly. "
+            "Please confirm your availability when contacted.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "HR Interview": {
+        "subject": "Interview Invitation: HR Round — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "We are pleased to invite you for an HR Interview for the {job_role} position.\n"
+            "Our team will be in touch soon with the schedule and details.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>We are pleased to invite you for an <strong>HR Interview</strong> "
+            "for the <strong>{job_role}</strong> position at GDMR Foundation.</p>"
+            "<p>Our HR team will confirm the schedule and joining details shortly.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Management Interview": {
+        "subject": "Interview Invitation: Management Round — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "Congratulations on progressing to the Management Interview round for the {job_role} role.\n"
+            "Our team will reach out shortly with the schedule.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>Congratulations on progressing to the <strong>Management Interview</strong> "
+            "round for the <strong>{job_role}</strong> role!</p>"
+            "<p>Our team will share the schedule and details shortly.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Shortlisted": {
+        "subject": "Great News — You've Been Shortlisted! | GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "We are delighted to inform you that you have been shortlisted for the {job_role} role "
+            "at GDMR Foundation.\n\n"
+            "Our HR team will be in touch with you shortly regarding the next steps.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>We are delighted to inform you that you have been <strong>shortlisted</strong> "
+            "for the <strong>{job_role}</strong> role at GDMR Foundation! 🎉</p>"
+            "<p>Our HR team will be in touch shortly with details about the next steps in the process.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Documentation Pending": {
+        "subject": "Action Required: Upload Your Documents — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "As part of your selection process for the {job_role} role at GDMR Foundation, "
+            "we require you to upload certain documents.\n\n"
+            "Please use the following link to access your secure document portal:\n"
+            "{portal_url}\n\n"
+            "Kindly upload the required documents at the earliest.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>As part of your selection process for the <strong>{job_role}</strong> role, "
+            "we require you to upload certain documents via our secure portal.</p>"
+            "<p>Please click the button below to access your personalised document portal and "
+            "upload the requested files at the earliest.</p>",
+            "Upload Documents", "{portal_url}",
+        ),
+    },
+    "Offer Released": {
+        "subject": "Congratulations — Offer Letter | GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "We are thrilled to extend an offer of employment to you for the {job_role} role at GDMR Foundation.\n\n"
+            "Our HR team will be in touch shortly with the formal offer letter and onboarding details.\n\n"
+            "Congratulations and we look forward to welcoming you to the team!\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>We are thrilled to extend an <strong>offer of employment</strong> to you for the "
+            "<strong>{job_role}</strong> role at GDMR Foundation! 🎉</p>"
+            "<p>Our HR team will share the formal offer letter and onboarding details shortly. "
+            "Please review and revert at your earliest convenience.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Offer Accepted": {
+        "subject": "Offer Accepted — Welcome to GDMR Foundation!",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "We are overjoyed that you have accepted our offer for the {job_role} role!\n\n"
+            "Our HR team will reach out with your onboarding schedule and joining instructions.\n\n"
+            "Welcome to the GDMR family!\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>We are overjoyed that you have <strong>accepted our offer</strong> for the "
+            "<strong>{job_role}</strong> role! 🎊</p>"
+            "<p>Our HR team will reach out shortly with your onboarding schedule and joining instructions. "
+            "Welcome to the GDMR family — we can't wait to have you on board!</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "Joined": {
+        "subject": "Welcome to GDMR Foundation!",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "A very warm welcome to GDMR Foundation!\n\n"
+            "We are excited to have you join us as {job_role}. "
+            "Your manager and HR team will guide you through the onboarding process.\n\n"
+            "We look forward to a wonderful journey together.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>A very warm welcome to <strong>GDMR Foundation</strong>! 🎉</p>"
+            "<p>We are thrilled to have you join us as <strong>{job_role}</strong>. "
+            "Your manager and HR team will guide you through your onboarding journey.</p>"
+            "<p>We look forward to achieving great things together!</p>",
+            "Visit GDMR Connect", _ATS_DASH,
+        ),
+    },
+    "Rejected": {
+        "subject": "Your Application Status — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "Thank you for your interest in the {job_role} position at GDMR Foundation "
+            "and for taking the time to go through our selection process.\n\n"
+            "After careful consideration, we regret to inform you that we will not be moving "
+            "forward with your application at this time.\n\n"
+            "We appreciate your effort and encourage you to apply for future openings that match your profile.\n\n"
+            "We wish you the very best in your career.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>Thank you for your interest in the <strong>{job_role}</strong> position at GDMR Foundation "
+            "and for the time and effort you invested in our selection process.</p>"
+            "<p>After careful consideration, we regret to inform you that we will not be moving "
+            "forward with your application at this time.</p>"
+            "<p>We truly appreciate your enthusiasm and encourage you to apply for future openings "
+            "that align with your skills. We wish you the very best in your career ahead.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    "On Hold": {
+        "subject": "Application Update — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "We wanted to keep you informed that your application for the {job_role} role "
+            "is currently on hold.\n\n"
+            "We will get back to you as soon as there is an update. Thank you for your patience.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>We wanted to keep you informed that your application for the "
+            "<strong>{job_role}</strong> role is currently <strong>on hold</strong>.</p>"
+            "<p>We will reach out as soon as there is an update. Thank you for your patience.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
+    # "Applied", "Withdrawn", "Screening", "Interview", "Hired" — no email sent
+}
+
+
+def _send_ats_status_email(candidate: dict, status: str):
+    import traceback
+    try:
+        template = STATUS_EMAIL_TEMPLATES.get(status)
+        if not template:
+            return
+
+        name     = candidate.get("name", "Candidate")
+        job_role = (candidate.get("role") or candidate.get("department") or "the advertised position")
+        email    = (candidate.get("email") or "").strip()
+        if not email:
+            print(f"[ats-email] no email address on candidate {candidate.get('_id')} — skipping")
+            return
+
+        doc_token  = candidate.get("doc_token") or ""
+        portal_url = (
+            f"https://www.gdmrconnect.com/documents/{doc_token}"
+            if doc_token else _ATS_DASH
+        )
+
+        subject = template["subject"].format(candidate_name=name, job_role=job_role, portal_url=portal_url)
+        plain   = template["plain"].format(candidate_name=name, job_role=job_role, portal_url=portal_url)
+        html    = template["html"].format(
+            candidate_name=_html.escape(name),
+            job_role=_html.escape(job_role),
+            portal_url=portal_url,
+        )
+
+        ok = send_email(to_email=email, subject=subject, body=plain, html_body=html)
+        print(f"[ats-email] status={status!r} to={email!r} sent={ok}")
+    except Exception as exc:
+        print(f"[ats-email] EXCEPTION for status={status!r}: {exc}\n{traceback.format_exc()}")
+
+
+# ── Admin endpoints ───────────────────────────────────────────────────────────
+
+@bp.route("/api/admin/ats/candidates", methods=["GET"])
+@token_required
+def ats_list_candidates():
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    query      = _ats_scope_query(request.user)
+    candidates = list(ats_candidates_col.find(query).sort("applied_at", -1))
+    serialized = [_serialize_ats(c) for c in candidates]
+
+    sourced_ids = list({c["sourced_by"] for c in serialized if c.get("sourced_by")})
+    sourced_map = {}
+    if sourced_ids:
+        try:
+            obj_ids = [ObjectId(sid) for sid in sourced_ids]
+            for u in users_col.find({"_id": {"$in": obj_ids}}, {"name": 1}):
+                sourced_map[str(u["_id"])] = u["name"]
+        except Exception:
+            pass
+    for c in serialized:
+        c["sourced_by_name"] = sourced_map.get(c.get("sourced_by") or "")
+
+    return jsonify(serialized), 200
+
+
+@bp.route("/api/admin/ats/candidates/<candidate_id>", methods=["GET"])
+@token_required
+def ats_get_candidate(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    candidate = ats_candidates_col.find_one({"_id": obj})
+    if not candidate:
+        return jsonify({"message": "Candidate not found"}), 404
+
+    scope = _ats_scope_query(request.user)
+    if scope and candidate.get("department") not in _mgr_depts(request.user):
+        return jsonify({"message": "Access denied"}), 403
+
+    result     = _serialize_ats(candidate)
+    sourced_by = result.get("sourced_by")
+    if sourced_by:
+        try:
+            sourcer = users_col.find_one({"_id": ObjectId(sourced_by)}, {"name": 1})
+            result["sourced_by_name"] = sourcer["name"] if sourcer else None
+        except Exception:
+            result["sourced_by_name"] = None
+    else:
+        result["sourced_by_name"] = None
+    return jsonify(result), 200
+
+
+@bp.route("/api/admin/ats/candidates", methods=["POST"])
+@token_required
+def ats_create_candidate():
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    data  = request.json or {}
+    name  = str(data.get("name",  "")).strip()
+    email = str(data.get("email", "")).strip()
+    if not name or not email:
+        return jsonify({"message": "name and email are required"}), 400
+
+    skills = data.get("skills", [])
+    if isinstance(skills, str):
+        skills = [s.strip() for s in skills.split(",") if s.strip()]
+
+    sourced_by = str(data.get("sourced_by", "")).strip() or None
+    if sourced_by:
+        try:
+            ObjectId(sourced_by)
+        except Exception:
+            return jsonify({"message": "Invalid sourced_by employee ID"}), 400
+
+    now = datetime.now(timezone.utc)
+    doc = {
+        "name":             name,
+        "email":            email,
+        "phone":            str(data.get("phone", "")).strip(),
+        "department":       str(data.get("department", "")).strip(),
+        "role":             str(data.get("role", "")).strip(),
+        "source":           str(data.get("source", "")).strip(),
+        "sourced_by":       sourced_by,
+        "status":           "Applied",
+        "skills":           skills,
+        "experience_years": data.get("experience_years"),
+        "current_company":  str(data.get("current_company", "")).strip(),
+        "resume_url":       str(data.get("resume_url", "")).strip(),
+        "notes":            str(data.get("notes", "")).strip(),
+        "status_history":   [{"status": "Applied", "at": now, "by": str(request.user["_id"])}],
+        "recordings":       [],
+        "portfolio_links":  [],
+        "documents":        [],
+        "doc_token":        None,
+        "applied_at":       now,
+        "created_by":       str(request.user["_id"]),
+        "created_at":       now,
+        "updated_at":       now,
+    }
+    res        = ats_candidates_col.insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    return jsonify(doc), 201
+
+
+@bp.route("/api/admin/ats/candidates/<candidate_id>", methods=["PUT"])
+@token_required
+def ats_update_candidate(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    data     = request.json or {}
+    editable = [
+        "name", "email", "phone", "department", "role", "source",
+        "skills", "experience_years", "current_company",
+        "resume_url", "notes", "joining_date", "sourced_by",
+    ]
+    update = {"updated_at": datetime.now(timezone.utc)}
+    for f in editable:
+        if f in data:
+            update[f] = data[f]
+    if "skills" in update and isinstance(update["skills"], str):
+        update["skills"] = [s.strip() for s in update["skills"].split(",") if s.strip()]
+    if "sourced_by" in update:
+        val = str(update["sourced_by"]).strip() if update["sourced_by"] else None
+        if val:
+            try:
+                ObjectId(val)
+            except Exception:
+                return jsonify({"message": "Invalid sourced_by employee ID"}), 400
+        update["sourced_by"] = val
+
+    result = ats_candidates_col.update_one({"_id": obj}, {"$set": update})
+    if result.matched_count == 0:
+        return jsonify({"message": "Candidate not found"}), 404
+    return jsonify(_serialize_ats(ats_candidates_col.find_one({"_id": obj}))), 200
+
+
+@bp.route("/api/admin/ats/candidates/<candidate_id>", methods=["DELETE"])
+@token_required
+def ats_delete_candidate(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    candidate = ats_candidates_col.find_one({"_id": obj}, {"resume_url": 1})
+    if not candidate:
+        return jsonify({"message": "Candidate not found"}), 404
+
+    try:
+        import cloudinary.api as _capi
+        _capi.delete_resources_by_prefix(f"gdmr/ats_docs/{candidate_id}")
+    except Exception as _e:
+        print(f"[ats-delete] Cloudinary doc folder cleanup failed: {_e}")
+
+    resume_url = candidate.get("resume_url") or ""
+    if resume_url and "cloudinary.com" in resume_url:
+        try:
+            m = re.search(r"/upload/(?:v\d+/)?(.+?)(?:\.[^./?]+)?$", resume_url)
+            if m:
+                cloudinary.uploader.destroy(m.group(1), resource_type="raw")
+        except Exception as _e:
+            print(f"[ats-delete] Cloudinary resume cleanup failed: {_e}")
+
+    ats_candidates_col.delete_one({"_id": obj})
+    return jsonify({"message": "deleted"}), 200
+
+
+@bp.route("/api/admin/ats/candidates/<candidate_id>/status", methods=["PUT"])
+@token_required
+def ats_update_status(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    status = (request.json or {}).get("status", "")
+    if status not in ATS_STATUSES:
+        return jsonify({"message": f"status must be one of: {', '.join(ATS_STATUSES)}"}), 400
+
+    now           = datetime.now(timezone.utc)
+    history_entry = {"status": status, "at": now, "by": str(request.user["_id"])}
+    set_fields    = {"status": status, "updated_at": now}
+    if status in ("Hired", "Joined"):  set_fields["hired_at"]          = now
+    elif status == "Offer Released":   set_fields["offer_released_at"] = now
+    elif status == "Offer Accepted":   set_fields["offer_accepted_at"] = now
+
+    result = ats_candidates_col.update_one(
+        {"_id": obj},
+        {"$set": set_fields, "$push": {"status_history": history_entry}}
+    )
+    if result.matched_count == 0:
+        return jsonify({"message": "Candidate not found"}), 404
+
+    updated = ats_candidates_col.find_one({"_id": obj})
+    return jsonify(_serialize_ats(updated)), 200
+
+
+@bp.route("/api/admin/ats/candidates/<candidate_id>/send-status-email", methods=["POST"])
+@token_required
+def ats_send_status_email(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    status = str((request.json or {}).get("status", "")).strip()
+    if not status:
+        return jsonify({"message": "status is required"}), 400
+    if status not in STATUS_EMAIL_TEMPLATES:
+        available = ", ".join(sorted(STATUS_EMAIL_TEMPLATES))
+        return jsonify({"message": f"No email template for '{status}'. Available: {available}"}), 400
+
+    candidate = ats_candidates_col.find_one({"_id": obj})
+    if not candidate:
+        return jsonify({"message": "Candidate not found"}), 404
+
+    threading.Thread(
+        target=_send_ats_status_email,
+        args=(dict(candidate), status),
+        daemon=True,
+    ).start()
+    return jsonify({"message": f"Status email for '{status}' queued"}), 200
+
+
+@bp.route("/api/admin/ats/candidates/<candidate_id>/recording", methods=["POST"])
+@token_required
+def ats_add_recording(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    data = request.json or {}
+    url  = str(data.get("url", "")).strip()
+    if not url:
+        return jsonify({"message": "url is required"}), 400
+    entry  = {
+        "type":     str(data.get("type", "")).strip(),
+        "url":      url,
+        "added_at": datetime.now(timezone.utc),
+        "added_by": str(request.user["_id"]),
+    }
+    result = ats_candidates_col.update_one({"_id": obj}, {"$push": {"recordings": entry}})
+    if result.matched_count == 0:
+        return jsonify({"message": "Candidate not found"}), 404
+    return jsonify({"message": "Recording added"}), 200
+
+
+@bp.route("/api/admin/ats/candidates/<candidate_id>/portfolio", methods=["POST"])
+@token_required
+def ats_add_portfolio(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    url = str((request.json or {}).get("url", "")).strip()
+    if not url:
+        return jsonify({"message": "url is required"}), 400
+    result = ats_candidates_col.update_one({"_id": obj}, {"$addToSet": {"portfolio_links": url}})
+    if result.matched_count == 0:
+        return jsonify({"message": "Candidate not found"}), 404
+    return jsonify({"message": "Portfolio link added"}), 200
+
+
+@bp.route("/api/admin/ats/candidates/<candidate_id>/doc-request", methods=["POST"])
+@token_required
+def ats_doc_request(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    candidate = ats_candidates_col.find_one({"_id": obj}, {"email": 1, "name": 1, "doc_token": 1, "documents": 1})
+    if not candidate:
+        return jsonify({"message": "Candidate not found"}), 404
+
+    token         = candidate.get("doc_token") or secrets.token_urlsafe(32)
+    data          = request.json or {}
+    required_docs = data.get("required_docs") or DOC_CHECKLIST_DEFAULT
+
+    existing_names = {d["name"] for d in (candidate.get("documents") or [])}
+    new_entries    = [
+        {"name": doc, "url": None, "status": "Pending", "required": True}
+        for doc in required_docs if doc not in existing_names
+    ]
+
+    now = datetime.now(timezone.utc)
+    ats_candidates_col.update_one(
+        {"_id": obj},
+        {"$set": {"doc_token": token, "updated_at": now},
+         "$push": {"documents": {"$each": new_entries}}},
+    )
+
+    upload_link = f"https://www.gdmrconnect.com/documents/{token}"
+    doc_list    = "\n".join(f"  • {d}" for d in required_docs)
+    body        = (
+        f"Dear {candidate.get('name', 'Candidate')},\n\n"
+        f"As part of the hiring process at GDMR Foundation, please upload the following documents:\n\n"
+        f"{doc_list}\n\n"
+        f"Upload link: {upload_link}\n\n"
+        f"Regards,\nGDMR Foundation HR Team"
+    )
+    threading.Thread(
+        target=send_email,
+        args=(candidate["email"], "Action Required: Upload Your Documents – GDMR Foundation", body),
+        daemon=True,
+    ).start()
+
+    return jsonify({"message": "Document request sent", "upload_link": upload_link, "token": token}), 200
+
+
+@bp.route("/api/admin/ats/stats", methods=["GET"])
+@token_required
+def ats_stats():
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    query = _ats_scope_query(request.user)
+    all_c = list(ats_candidates_col.find(query, {
+        "status": 1, "source": 1, "department": 1, "role": 1,
+        "applied_at": 1, "hired_at": 1,
+    }))
+
+    total           = len(all_c)
+    offers_released = sum(1 for c in all_c if c.get("status") in ("Offer Released", "Offer Accepted", "Hired"))
+    offers_accepted = sum(1 for c in all_c if c.get("status") in ("Offer Accepted", "Hired"))
+    hired           = sum(1 for c in all_c if c.get("status") == "Hired")
+    joining_ratio   = round(hired / offers_released * 100) if offers_released else 0
+
+    by_status, by_source, by_dept, by_role = {}, {}, {}, {}
+    hired_by_src, hire_days = {}, []
+
+    for c in all_c:
+        s   = c.get("status") or "Unknown"
+        src = c.get("source")     or "Unknown"
+        dpt = c.get("department") or "Unknown"
+        rl  = c.get("role")       or "Unknown"
+        by_status[s]   = by_status.get(s,   0) + 1
+        by_source[src] = by_source.get(src, 0) + 1
+        by_dept[dpt]   = by_dept.get(dpt,   0) + 1
+        by_role[rl]    = by_role.get(rl,    0) + 1
+        if c.get("status") == "Hired":
+            hired_by_src[src] = hired_by_src.get(src, 0) + 1
+            if c.get("applied_at") and c.get("hired_at"):
+                days = (c["hired_at"] - c["applied_at"]).days
+                if days >= 0:
+                    hire_days.append(days)
+
+    time_to_hire         = round(sum(hire_days) / len(hire_days)) if hire_days else None
+    source_effectiveness = [
+        {
+            "source": src,
+            "total":  by_source[src],
+            "hired":  hired_by_src.get(src, 0),
+            "rate":   round(hired_by_src.get(src, 0) / by_source[src] * 100),
+        }
+        for src in by_source
+    ]
+
+    return jsonify({
+        "total":                total,
+        "offers_released":      offers_released,
+        "offers_accepted":      offers_accepted,
+        "hired":                hired,
+        "joining_ratio":        joining_ratio,
+        "by_status":            [{"status": k, "count": v} for k, v in by_status.items()],
+        "by_source":            [{"source": k, "count": v} for k, v in by_source.items()],
+        "by_department":        [{"department": k, "count": v} for k, v in by_dept.items()],
+        "by_role":              [{"role": k, "count": v} for k, v in by_role.items()],
+        "time_to_hire":         time_to_hire,
+        "source_effectiveness": source_effectiveness,
+    }), 200
+
+
+@bp.route("/api/admin/ats/candidates/upload", methods=["POST"])
+@token_required
+def ats_upload_resume():
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"message": "file is required"}), 400
+
+    try:
+        import cloudinary.uploader as _cu
+        result     = _cu.upload(file, resource_type="raw", folder="ats_resumes")
+        resume_url = result.get("secure_url", "")
+    except Exception as e:
+        return jsonify({"message": f"Upload failed: {str(e)}"}), 500
+
+    parsed = {"name": "", "email": "", "phone": "", "skills": []}
+    try:
+        import pdfplumber, io as _io
+        file.seek(0)
+        with pdfplumber.open(_io.BytesIO(file.read())) as pdf:
+            text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+        emails = re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)
+        phones = re.findall(r"(?:\+91[\s-]?)?[6-9]\d{9}", text)
+        lines  = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if emails: parsed["email"] = emails[0]
+        if phones: parsed["phone"] = phones[0]
+        if lines:  parsed["name"]  = lines[0]
+    except Exception:
+        pass
+
+    return jsonify({"resume_url": resume_url, "parsed": parsed}), 200
+
+
+@bp.route("/api/admin/ats/candidates/<candidate_id>/document", methods=["PUT"])
+@token_required
+def ats_review_document(candidate_id):
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(candidate_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    data       = request.json or {}
+    doc_name   = (data.get("name") or "").strip()
+    new_status = (data.get("status") or "").strip()
+    allowed    = ("Approved", "Rejected", "Re-upload Requested")
+    if not doc_name:
+        return jsonify({"message": "name is required"}), 400
+    if new_status not in allowed:
+        return jsonify({"message": f"status must be one of: {', '.join(allowed)}"}), 400
+
+    candidate = ats_candidates_col.find_one({"_id": obj}, {"documents": 1})
+    if not candidate:
+        return jsonify({"message": "Candidate not found"}), 404
+
+    docs    = list(candidate.get("documents") or [])
+    matched = False
+    for d in docs:
+        if d.get("name") == doc_name:
+            d["status"]      = new_status
+            d["reviewed_at"] = datetime.now(timezone.utc)
+            d["reviewed_by"] = str(request.user["_id"])
+            matched = True
+            break
+    if not matched:
+        return jsonify({"message": f"Document '{doc_name}' not found on this candidate"}), 404
+
+    ats_candidates_col.update_one(
+        {"_id": obj},
+        {"$set": {"documents": docs, "updated_at": datetime.now(timezone.utc)}}
+    )
+    return jsonify({"documents": docs}), 200
+
+
+# ── Candidate-facing (public, token-based) ────────────────────────────────────
+
+@bp.route("/api/ats/documents/<doc_token>", methods=["GET"])
+def ats_get_doc_checklist(doc_token):
+    c = ats_candidates_col.find_one(
+        {"doc_token": doc_token},
+        {"name": 1, "role": 1, "documents": 1}
+    )
+    if not c:
+        return jsonify({"message": "Invalid or expired link"}), 404
+    docs = c.get("documents") or []
+    return jsonify({
+        "candidate_name": c.get("name", ""),
+        "job_role":       c.get("role", ""),
+        "required":       [d["name"] for d in docs if d.get("required")],
+        "documents":      [
+            {"name": d.get("name"), "url": d.get("url"), "status": d.get("status")}
+            for d in docs if d.get("url")
+        ],
+    }), 200
+
+
+@bp.route("/api/ats/documents/<doc_token>", methods=["POST"])
+def ats_upload_doc(doc_token):
+    c = ats_candidates_col.find_one({"doc_token": doc_token}, {"_id": 1, "documents": 1})
+    if not c:
+        return jsonify({"message": "Invalid or expired link"}), 404
+
+    doc_name = (request.form.get("doc_name") or "").strip()
+    file     = request.files.get("document")
+    if not doc_name or not file:
+        return jsonify({"message": "doc_name and document are required"}), 400
+
+    file.seek(0, 2)
+    if file.tell() > 15 * 1024 * 1024:
+        return jsonify({"message": "File too large (max 15 MB)"}), 400
+    file.seek(0)
+
+    header = file.read(8)
+    file.seek(0)
+    MAGIC = {
+        b"%PDF-":             "application/pdf",
+        b"\xff\xd8\xff":      "image/jpeg",
+        b"\x89PNG\r\n\x1a\n": "image/png",
+    }
+    magic_ok = any(header[:len(sig)] == sig for sig in MAGIC)
+    mime_ok  = file.content_type in {"application/pdf", "image/jpeg", "image/png", "image/jpg"}
+    if not magic_ok or not mime_ok:
+        return jsonify({"message": "Only PDF and image files (JPEG, PNG) are accepted"}), 400
+
+    candidate_id = str(c["_id"])
+    try:
+        import cloudinary.uploader as _cu
+        res = _cu.upload(
+            file,
+            resource_type="auto",
+            folder=f"gdmr/ats_docs/{candidate_id}",
+            use_filename=True,
+            unique_filename=True,
+        )
+        url = res.get("secure_url")
+    except Exception as e:
+        return jsonify({"message": f"Upload failed: {str(e)}"}), 500
+
+    now      = datetime.now(timezone.utc)
+    docs     = list(c.get("documents") or [])
+    replaced = False
+    for d in docs:
+        if d.get("name") == doc_name:
+            d.update({"url": url, "status": "Pending", "uploaded_at": now})
+            replaced = True
+            break
+    if not replaced:
+        docs.append({"name": doc_name, "url": url, "status": "Pending", "required": False, "uploaded_at": now})
+
+    ats_candidates_col.update_one(
+        {"_id": c["_id"]},
+        {"$set": {"documents": docs, "updated_at": now}}
+    )
+
+    safe_docs = []
+    for d in docs:
+        if not d.get("url"):
+            continue
+        d2 = dict(d)
+        for f in ("uploaded_at", "reviewed_at"):
+            if isinstance(d2.get(f), datetime):
+                d2[f] = d2[f].isoformat()
+        safe_docs.append(d2)
+    return jsonify({"url": url, "documents": safe_docs}), 200
