@@ -48,7 +48,7 @@ def today_stats():
     std_leave_ids = {
         l["user_id"] for l in leaves_col.find(
             {"from_date": {"$lte": today}, "to_date": {"$gte": today},
-             "status": {"$nin": ["Rejected"]}},
+             "status": {"$nin": ["Rejected", "Cancelled"]}},
             {"user_id": 1}
         )
     }
@@ -125,7 +125,7 @@ def attendance_summary():
     all_leaves = list(leaves_col.find({
         "from_date": {"$lte": end_str},
         "to_date":   {"$gte": start_str},
-        "status":    {"$nin": ["Rejected"]},
+        "status":    {"$nin": ["Rejected", "Cancelled"]},
     }))
     leaves_by_uid: dict = {}
     for lv in all_leaves:
