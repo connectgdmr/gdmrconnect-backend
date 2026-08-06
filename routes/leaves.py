@@ -352,6 +352,70 @@ def update_leave(leave_id):
     return jsonify({"message": "Leave updated successfully"}), 200
 
 
+@bp.route("/api/leaves/<leave_id>/revoke", methods=["POST"])
+@token_required
+def revoke_leave(leave_id):
+    """
+    Cancels a leave request. Allowed for:
+      - the employee who applied for it (their own leave, any status except
+        already Rejected/Cancelled)
+      - that employee's manager
+      - admin/owner
+    Sets status straight to "Cancelled" — manager_status/admin_status are left
+    untouched as an audit trail of whatever approval state it was in.
+    """
+    try:
+        obj = ObjectId(leave_id)
+    except Exception:
+        return jsonify({"message": "Invalid leave ID"}), 400
+
+    leave = leaves_col.find_one({"_id": obj})
+    if not leave:
+        return jsonify({"message": "Leave not found"}), 404
+
+    role = request.user.get("role")
+    uid  = str(request.user["_id"])
+    is_owner = leave.get("user_id") == uid
+
+    allowed = False
+    if is_owner:
+        allowed = True
+    elif role in ("admin", "owner"):
+        allowed = True
+    elif role == "manager":
+        leave_owner = users_col.find_one({"_id": ObjectId(leave["user_id"])}, {"manager_id": 1})
+        if leave_owner and str(leave_owner.get("manager_id")) == uid:
+            allowed = True
+
+    if not allowed:
+        return jsonify({"message": "Unauthorized"}), 403
+
+    if leave.get("status") in ("Cancelled", "Rejected"):
+        return jsonify({"message": f"Leave is already {leave['status']}."}), 400
+
+    leaves_col.update_one({"_id": obj}, {"$set": {
+        "status":            "Cancelled",
+        "cancelled_at":      datetime.now(timezone.utc),
+        "cancelled_by_role": role,
+    }})
+
+    if not is_owner:
+        try:
+            emp = users_col.find_one({"_id": ObjectId(leave["user_id"])}, {"email": 1})
+            if emp and emp.get("email"):
+                threading.Thread(
+                    target=send_email,
+                    args=(emp["email"], "Leave Revoked",
+                          f"Your leave request ({leave.get('from_date', '')} to {leave.get('to_date', '')}) "
+                          f"has been revoked by your {role}."),
+                    daemon=True,
+                ).start()
+        except Exception as e:
+            print("Revoke email notification error:", e)
+
+    return jsonify({"message": "Leave revoked."}), 200
+
+
 @bp.route("/api/my/leaves", methods=["GET"])
 @token_required
 def my_leaves():
