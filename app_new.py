@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 from config import SECRET_KEY
 from extensions import bcrypt, limiter
-from database import db  # noqa — imported for side-effect (indexes, migration)
+from database import db, mongo_client  # db import is also for side-effect (indexes, migration)
 
 
 def create_app():
@@ -90,9 +90,27 @@ def create_app():
         return response
 
     # ── Health check ──────────────────────────────────────────────────────────
+    @app.route("/")
+    def home():
+        return "GDMR Connect Backend is running normally ✅", 200
+
     @app.route("/health")
     def health():
         return jsonify({"status": "ok"}), 200
+
+    @app.route("/api/health", methods=["GET"])
+    def health_check():
+        try:
+            mongo_client.admin.command("ping")
+            return jsonify({"status": "ok", "db": "connected"}), 200
+        except Exception as e:
+            return jsonify({"status": "error", "db": "disconnected", "detail": str(e)}), 503
+
+    # ── Local file uploads (fallback for anything not stored on Cloudinary) ────
+    @app.route("/uploads/<path:filename>")
+    def serve_upload(filename):
+        uploads_dir = os.path.join(os.getcwd(), "uploads")
+        return send_from_directory(uploads_dir, filename)
 
     # ── Static / SPA file serving ─────────────────────────────────────────────
     # Uncomment if you serve a built React app from this same process.
