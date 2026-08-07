@@ -6,10 +6,9 @@ Rexor in-app AI assistant backed by the Groq API.
 from datetime import datetime
 
 import requests
-from bson import ObjectId
 from flask import Blueprint, request, jsonify
 
-from database import leaves_col, users_col, access_grants_col
+from database import leaves_col, users_col, access_grants_col, attendance_col
 from decorators import token_required
 from extensions import limiter
 from config import GROQ_API_KEY, GROQ_MODEL, IST
@@ -88,16 +87,97 @@ def assistant_chat():
         return jsonify({"message": "Assistant is temporarily unavailable.", "error": str(e)}), 502
 
 
+def _names_summary(ids, active_by_id, limit=20):
+    """Sorted display names for a set of user-id strings, capped so the LLM
+    prompt can't blow up on a huge company — returns (joined_string, total_count)."""
+    names = sorted({active_by_id[i]["name"] for i in ids if i in active_by_id and active_by_id[i].get("name")})
+    if not names:
+        return "None", 0
+    shown = names[:limit]
+    extra = len(names) - len(shown)
+    s = ", ".join(shown)
+    if extra > 0:
+        s += f", and {extra} more"
+    return s, len(names)
+
+
+def _admin_today_snapshot():
+    """
+    Live company snapshot for today, IST — mirrors stats.py's today_stats()
+    counting rules exactly (same active-roster/offboarding/leave logic the
+    dashboard KPIs use), but also resolves display names so Rexor can name
+    people instead of only counting them.
+    """
+    today    = str(datetime.now(IST).date())
+    today_dt = datetime.strptime(today, "%Y-%m-%d")
+
+    all_staff = list(users_col.find(
+        {"role": {"$in": ["employee", "manager"]}},
+        {"_id": 1, "name": 1, "department": 1, "resignation": 1},
+    ))
+    active_by_id = {}
+    for u in all_staff:
+        lwd = (u.get("resignation") or {}).get("last_working_day")
+        if lwd:
+            lwd_str = lwd.date().isoformat() if hasattr(lwd, "date") else str(lwd)[:10]
+            if lwd_str < today:
+                continue
+        active_by_id[str(u["_id"])] = u
+    active_ids = set(active_by_id.keys())
+
+    present_ids = {
+        r["user_id"] for r in attendance_col.find(
+            {"date": today, "type": "checkin"}, {"user_id": 1}
+        )
+    } & active_ids
+
+    std_leave_ids = {
+        l["user_id"] for l in leaves_col.find(
+            {"from_date": {"$lte": today}, "to_date": {"$gte": today},
+             "status": {"$nin": ["Rejected", "Cancelled"]}},
+            {"user_id": 1},
+        )
+    } & active_ids
+    ext_leave_ids = {
+        str(u["_id"]) for u in users_col.find(
+            {"role": {"$in": ["employee", "manager"]},
+             "extended_leaves": {"$elemMatch": {
+                 "from_date": {"$lte": today_dt}, "to_date": {"$gte": today_dt},
+             }}},
+            {"_id": 1},
+        )
+    } & active_ids
+    leave_ids = std_leave_ids | ext_leave_ids
+
+    not_in_ids = active_ids - present_ids - leave_ids
+
+    present_str, present_n = _names_summary(present_ids, active_by_id)
+    leave_str,   leave_n   = _names_summary(leave_ids,   active_by_id)
+    not_in_str,  not_in_n  = _names_summary(not_in_ids,  active_by_id)
+
+    return [
+        f"Today's date: {today}",
+        f"Total active workforce: {len(active_ids)}",
+        f"Present today (checked in): {present_n} — {present_str}",
+        f"On leave today: {leave_n} — {leave_str}",
+        f"Not checked in yet today: {not_in_n} — {not_in_str}",
+    ]
+
+
 @bp.route("/api/assistant/voice", methods=["POST"])
 @token_required
 @limiter.limit("20 per minute")
 def assistant_voice():
     """
     Admin-scoped voice assistant ("Rexor voice mode") — answers spoken
-    questions about LIVE company data (e.g. "who is on leave today?") in
-    either English or Malayalam. The reply is meant to be read aloud by the
-    client via SpeechSynthesis, so it's kept to short, plain, TTS-friendly
-    sentences (no markdown/emojis).
+    questions about LIVE company data (who's on leave / present / not
+    checked in today, headcount, etc.) in either English or Malayalam. The
+    reply is meant to be read aloud by the client via SpeechSynthesis, so
+    it's kept to short, plain, TTS-friendly sentences (no markdown/emojis).
+
+    Accepts an optional `history` (last few {role, content} turns) so
+    follow-up questions ("what about the design team?") resolve naturally
+    instead of every question being answered in isolation.
 
     Admin/owner/delegated-access only — this surfaces company-wide data,
     unlike /api/assistant/chat which only ever sees the caller's own facts.
@@ -120,48 +200,33 @@ def assistant_voice():
     if len(message) > 500:
         return jsonify({"message": "Message is too long."}), 400
 
-    # ---- Live fact: who's on leave today ----------------------------------
-    # Same rule as the admin dashboard's "On Leave" KPI: date range covers
-    # today (IST), status not Rejected/Cancelled, plus anyone on an active
-    # extended leave. Keeping this in sync with stats.py/AdminDashboard.jsx
-    # matters — the voice answer should never contradict what's on screen.
-    today = str(datetime.now(IST).date())
+    # Recent conversation turns, for natural follow-ups — trusted only as
+    # conversational context, never as a source of facts (the system prompt
+    # still restricts the model to the live facts block below).
+    raw_history = data.get("history") if isinstance(data.get("history"), list) else []
+    history = []
+    for turn in raw_history[-8:]:
+        if not isinstance(turn, dict):
+            continue
+        turn_role = "assistant" if turn.get("role") == "assistant" else "user"
+        content   = str(turn.get("content") or "").strip()[:500]
+        if content:
+            history.append({"role": turn_role, "content": content})
 
-    leaves_today = list(leaves_col.find(
-        {"from_date": {"$lte": today}, "to_date": {"$gte": today},
-         "status": {"$nin": ["Rejected", "Cancelled"]}},
-        {"user_id": 1},
-    ))
-    leave_uids = {l["user_id"] for l in leaves_today if l.get("user_id")}
-    valid_oids = [ObjectId(uid) for uid in leave_uids if ObjectId.is_valid(uid)]
-
-    name_docs = list(users_col.find({"_id": {"$in": valid_oids}}, {"name": 1, "department": 1})) if valid_oids else []
-    leave_names = [d.get("name") for d in name_docs if d.get("name")]
-
-    ext_leave_users = list(users_col.find(
-        {"role": {"$in": ["employee", "manager"]},
-         "extended_leaves": {"$elemMatch": {"from_date": {"$lte": today}, "to_date": {"$gte": today}}}},
-        {"name": 1},
-    ))
-    ext_leave_names = [u.get("name") for u in ext_leave_users if u.get("name")]
-
-    all_names   = sorted(set(leave_names) | set(ext_leave_names))
-    leave_count = len(all_names)
-
-    facts = [
-        f"Today's date: {today}",
-        f"Number of employees on leave today: {leave_count}",
-        f"Names of employees on leave today: {', '.join(all_names) if all_names else 'None — nobody is on leave today'}",
-    ]
+    facts = _admin_today_snapshot()
 
     lang_label = "Malayalam" if lang == "ml" else "English"
     system_prompt = (
-        "You are Rexor, GDMR Connect's admin voice assistant. Answer the admin's spoken question "
-        f"in {lang_label} ONLY, in 1-3 short natural sentences meant to be read aloud by text-to-speech "
-        "— no markdown, no bullet points, no emojis, no headings. Use ONLY the facts listed below; never "
-        "invent names, numbers, or company data you weren't given. Keep employee names exactly as given, "
-        "in Latin script — do not translate or transliterate names even when replying in Malayalam.\n\n"
-        "Facts:\n" + "\n".join(f"- {f}" for f in facts)
+        "You are Rexor, GDMR Connect's admin voice assistant — warm, brisk, and conversational, like a "
+        "sharp EA speaking out loud, not a report generator. Continue the conversation naturally using the "
+        "chat history for context (e.g. resolve 'what about them' / follow-up questions against the prior "
+        f"turn). Reply in {lang_label} ONLY, in 1-3 short natural sentences meant to be read aloud by "
+        "text-to-speech — no markdown, no bullet points, no emojis, no headings, no restating the question. "
+        "Use ONLY the facts listed below; never invent names, numbers, or company data you weren't given — "
+        "if something isn't in the facts, say you don't have that yet rather than guessing. Keep employee "
+        "names exactly as given, in Latin script — do not translate or transliterate names even when "
+        "replying in Malayalam.\n\nLive facts (as of right now):\n"
+        + "\n".join(f"- {f}" for f in facts)
     )
 
     try:
@@ -172,9 +237,10 @@ def assistant_voice():
                 "model":       GROQ_MODEL,
                 "messages":    [
                     {"role": "system", "content": system_prompt},
+                    *history,
                     {"role": "user",   "content": message},
                 ],
-                "temperature": 0.3,
+                "temperature": 0.4,
                 "max_tokens":  200,
             },
             timeout=12,
