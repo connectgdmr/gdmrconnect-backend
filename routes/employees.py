@@ -4,7 +4,9 @@ routes/employees.py — GDMR Connect
 Employee & manager directory, department management, work-types, access grants.
 """
 import re
+import secrets
 import threading
+import cloudinary.uploader
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
@@ -413,6 +415,68 @@ def edit_employee(emp_id):
     if update:
         users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": update})
     return jsonify({"message": "Employee profile updated successfully."}), 200
+
+
+# ── Employee documents (personal file: resume, ID proof, certificates, etc.) ──
+# Carried over automatically when someone is onboarded from the ATS pipeline
+# (see routes/ats.py's ats_update_status), and admins can add/remove more here.
+
+@bp.route("/api/admin/employees/<emp_id>/documents", methods=["POST"])
+@token_required
+def upload_employee_document(emp_id):
+    if not _is_admin(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(emp_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    if not users_col.find_one({"_id": obj}, {"_id": 1}):
+        return jsonify({"message": "Employee not found"}), 404
+
+    doc_name = (request.form.get("name") or "").strip()
+    file     = request.files.get("file")
+    if not doc_name or not file:
+        return jsonify({"message": "name and file are required"}), 400
+
+    file.seek(0, 2)
+    if file.tell() > 15 * 1024 * 1024:
+        return jsonify({"message": "File too large (max 15 MB)"}), 400
+    file.seek(0)
+
+    try:
+        res = cloudinary.uploader.upload(
+            file, resource_type="auto", folder=f"gdmr/employee_docs/{emp_id}",
+            use_filename=True, unique_filename=True,
+        )
+        url = res.get("secure_url")
+    except Exception as e:
+        return jsonify({"message": f"Upload failed: {str(e)}"}), 500
+
+    now = datetime.now(timezone.utc)
+    doc = {
+        "id":          secrets.token_hex(8),
+        "name":        doc_name,
+        "url":         url,
+        "uploaded_at": now,
+        "uploaded_by": str(request.user["_id"]),
+        "source":      "manual",
+    }
+    users_col.update_one({"_id": obj}, {"$push": {"documents": doc}})
+    doc["uploaded_at"] = doc["uploaded_at"].isoformat()
+    return jsonify(doc), 201
+
+
+@bp.route("/api/admin/employees/<emp_id>/documents/<doc_id>", methods=["DELETE"])
+@token_required
+def delete_employee_document(emp_id, doc_id):
+    if not _is_admin(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(emp_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    users_col.update_one({"_id": obj}, {"$pull": {"documents": {"id": doc_id}}})
+    return jsonify({"message": "Document removed."}), 200
 
 
 @bp.route("/api/admin/employees/<emp_id>/promote", methods=["PUT"])

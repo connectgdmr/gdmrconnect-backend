@@ -15,8 +15,10 @@ from bson import ObjectId
 
 from database import ats_candidates_col, users_col
 from decorators import token_required
+from extensions import bcrypt
 from helpers import _is_admin, _mgr_depts
-from utils import send_email
+from utils import send_email, generate_random_password
+from config import IST
 
 bp = Blueprint("ats", __name__)
 
@@ -557,6 +559,95 @@ def ats_delete_candidate(candidate_id):
     return jsonify({"message": "deleted"}), 200
 
 
+def _auto_onboard_employee(candidate: dict, actor_id: str):
+    """
+    Recruitment → Employees bridge: the moment a candidate's status flips to
+    'Hired'/'Joined', spin up their real employee account automatically,
+    carrying over name/email/phone/department/position and every document
+    on file (resume + anything they uploaded via the doc-collection link) —
+    no manual re-entry. Idempotent: does nothing if an employee account
+    already exists for this candidate (matched by onboarded_employee_id
+    first, then by email as a fallback for older candidates).
+
+    Returns the new employee's ObjectId, or None if one already existed /
+    onboarding couldn't proceed (e.g. missing email — caller just logs it).
+    """
+    if candidate.get("onboarded_employee_id"):
+        return None
+
+    email = (candidate.get("email") or "").strip()
+    name  = (candidate.get("name") or "").strip()
+    if not email or not name:
+        return None
+
+    existing = users_col.find_one({"email": email}, {"_id": 1})
+    if existing:
+        ats_candidates_col.update_one(
+            {"_id": candidate["_id"]},
+            {"$set": {"onboarded_employee_id": str(existing["_id"])}},
+        )
+        return None
+
+    now = datetime.now(timezone.utc)
+    doj = candidate.get("joining_date") or str(datetime.now(IST).date())
+
+    documents = []
+    if candidate.get("resume_url"):
+        documents.append({
+            "id": secrets.token_hex(8), "name": "Resume / CV",
+            "url": candidate["resume_url"], "uploaded_at": now,
+            "uploaded_by": actor_id, "source": "ats",
+        })
+    for d in candidate.get("documents") or []:
+        if not d.get("url"):
+            continue
+        documents.append({
+            "id": secrets.token_hex(8), "name": d.get("name") or "Document",
+            "url": d["url"], "uploaded_at": d.get("uploaded_at") or now,
+            "uploaded_by": actor_id, "source": "ats",
+        })
+
+    password = generate_random_password()
+    hashed   = bcrypt.generate_password_hash(password).decode("utf-8")
+
+    user_doc = {
+        "name": name, "email": email, "password": hashed,
+        "password_changed": False, "role": "employee",
+        "department": candidate.get("department", ""),
+        "position":   candidate.get("role", ""),
+        "phone":      candidate.get("phone", ""),
+        "doj": doj, "employee_code": "",
+        "created_at": now, "manager_id": None, "shift": "morning",
+        "late_checkin_count_monthly": 0, "last_late_checkin_month": None,
+        "documents": documents,
+        "source_candidate_id": str(candidate["_id"]),
+    }
+    res = users_col.insert_one(user_doc)
+
+    ats_candidates_col.update_one(
+        {"_id": candidate["_id"]},
+        {"$set": {"onboarded_employee_id": str(res.inserted_id)}},
+    )
+
+    subject = "Welcome to GDMR Connect: Your New Account Credentials"
+    body    = (
+        f"Dear {name},\n\n"
+        "Congratulations, and welcome aboard! Your employee account for the GDMR Connect "
+        "app has been created automatically as part of your onboarding.\n\n"
+        "Please use the following credentials to log in:\n"
+        f"Username (Email): {email}\n"
+        f"Temporary Password: {password}\n\n"
+        "We recommend logging in as soon as possible and updating your password.\n\n"
+        "Thank you,\nThe GDMR Connect Team"
+    )
+    try:
+        threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
+    except Exception as e:
+        print("Failed to dispatch onboarding welcome email:", e)
+
+    return res.inserted_id
+
+
 @bp.route("/api/admin/ats/candidates/<candidate_id>/status", methods=["PUT"])
 @token_required
 def ats_update_status(candidate_id):
@@ -586,6 +677,17 @@ def ats_update_status(candidate_id):
         return jsonify({"message": "Candidate not found"}), 404
 
     updated = ats_candidates_col.find_one({"_id": obj})
+
+    # Recruitment → Employees bridge — auto-create the real employee account
+    # the moment someone is marked Hired/Joined, carrying over their details
+    # and every document on file. See _auto_onboard_employee for details.
+    if status in ("Hired", "Joined"):
+        try:
+            _auto_onboard_employee(updated, str(request.user["_id"]))
+            updated = ats_candidates_col.find_one({"_id": obj})
+        except Exception as e:
+            print("Auto-onboarding error:", e)
+
     return jsonify(_serialize_ats(updated)), 200
 
 
