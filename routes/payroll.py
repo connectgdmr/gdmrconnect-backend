@@ -210,6 +210,7 @@ def run_payroll():
         lop               = _to_money(adj.get("lop", 0))
         tds               = _to_money(adj.get("tds", 0))
         other_deductions  = _to_money(adj.get("other_deductions", 0))
+        remark            = str(adj.get("remark", "") or "").strip()
         total_deductions  = round(pf + esi + lop + tds + other_deductions + professional_tax + gratuity, 2)
         net               = round(gross + bonus - total_deductions, 2)
 
@@ -265,6 +266,7 @@ def run_payroll():
             "loan_emi":         loan_emi,
             "advance_recovery": advance_recovery,
             "net":              net,
+            "remark":           remark,
             **display,
             "status":           "Pending",
             "created_at":       now,
@@ -294,6 +296,12 @@ def list_payslips():
     query = {}
     month = request.args.get("month")
     year  = request.args.get("year")
+    # Full history for one employee (used by the clickable-name payroll
+    # profile popup) — deliberately not paired with month/year so it
+    # returns every payslip they've ever had, newest first.
+    employee_id = request.args.get("employee_id")
+    if employee_id:
+        query["employee_id"] = employee_id
     if month:
         try:
             query["month"] = int(month)

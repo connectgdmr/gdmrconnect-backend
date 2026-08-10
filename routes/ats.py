@@ -26,14 +26,17 @@ bp = Blueprint("ats", __name__)
 # ── Status constants ──────────────────────────────────────────────────────────
 
 ATS_STATUSES = (
-    "Applied",
+    "New Application",
+    "Resume Screening",
     "Screening Call Scheduled",
+    "Screening Call Completed",
     "Technical Assessment",
     "Technical Interview",
     "HR Interview",
     "Management Interview",
     "Shortlisted",
     "Documentation Pending",
+    "Offer Discussion",
     "Offer Released",
     "Offer Accepted",
     "Joined",
@@ -41,10 +44,24 @@ ATS_STATUSES = (
     "On Hold",
     "Withdrawn",
     # Legacy values kept so existing records remain valid
+    "Applied",
     "Screening",
     "Interview",
     "Hired",
 )
+
+# Candidate fields the frontend Add/Edit Candidate form actually sends. Kept
+# as one list so create/update/serialize can't silently drift apart again —
+# that drift (this list existing nowhere, each endpoint hand-rolling its own
+# subset under different names) was exactly the bug where Education/CTC/
+# Location/Notice Period/Campaign/Job Role never saved.
+CANDIDATE_TEXT_FIELDS = [
+    "phone", "department", "job_role", "source", "campaign", "education",
+    "current_company", "current_ctc", "expected_ctc", "current_location",
+    "preferred_location", "notice_period", "resume_url", "remarks", "joining_date",
+]
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PHONE_RE = re.compile(r"^(?:\+?\d{1,3}[\s-]?)?\d{10}$")
 
 DOC_CHECKLIST_DEFAULT = [
     "Resume / CV",
@@ -80,6 +97,15 @@ def _ats_scope_query(user):
 
 def _serialize_ats(c):
     c["_id"] = str(c["_id"])
+    # Backward compat: candidates created before the field-name fix stored
+    # the job title under the legacy key "role" — surface it as job_role too
+    # so old records don't suddenly look blank.
+    if not c.get("job_role") and c.get("role"):
+        c["job_role"] = c["role"]
+    if not c.get("experience") and c.get("experience_years"):
+        c["experience"] = c["experience_years"]
+    if not c.get("remarks") and c.get("notes"):
+        c["remarks"] = c["notes"]
     for f in ("applied_at", "created_at", "updated_at",
               "hired_at", "offer_released_at", "offer_accepted_at"):
         if isinstance(c.get(f), datetime):
@@ -354,7 +380,7 @@ def _send_ats_status_email(candidate: dict, status: str):
             return
 
         name     = candidate.get("name", "Candidate")
-        job_role = (candidate.get("role") or candidate.get("department") or "the advertised position")
+        job_role = (candidate.get("job_role") or candidate.get("role") or candidate.get("department") or "the advertised position")
         email    = (candidate.get("email") or "").strip()
         if not email:
             print(f"[ats-email] no email address on candidate {candidate.get('_id')} — skipping")
@@ -445,8 +471,13 @@ def ats_create_candidate():
     data  = request.json or {}
     name  = str(data.get("name",  "")).strip()
     email = str(data.get("email", "")).strip()
-    if not name or not email:
-        return jsonify({"message": "name and email are required"}), 400
+    if not name:
+        return jsonify({"message": "name is required"}), 400
+    if email and not EMAIL_RE.match(email):
+        return jsonify({"message": "Please enter a valid email address."}), 400
+    phone = str(data.get("phone", "")).strip()
+    if phone and not PHONE_RE.match(phone.replace(" ", "")):
+        return jsonify({"message": "Please enter a valid 10-digit phone number."}), 400
 
     skills = data.get("skills", [])
     if isinstance(skills, str):
@@ -461,20 +492,14 @@ def ats_create_candidate():
 
     now = datetime.now(timezone.utc)
     doc = {
-        "name":             name,
-        "email":            email,
-        "phone":            str(data.get("phone", "")).strip(),
-        "department":       str(data.get("department", "")).strip(),
-        "role":             str(data.get("role", "")).strip(),
-        "source":           str(data.get("source", "")).strip(),
-        "sourced_by":       sourced_by,
-        "status":           "Applied",
-        "skills":           skills,
-        "experience_years": data.get("experience_years"),
-        "current_company":  str(data.get("current_company", "")).strip(),
-        "resume_url":       str(data.get("resume_url", "")).strip(),
-        "notes":            str(data.get("notes", "")).strip(),
-        "status_history":   [{"status": "Applied", "at": now, "by": str(request.user["_id"])}],
+        "name":   name,
+        "email":  email,
+        "sourced_by": sourced_by,
+        "status": "New Application",
+        "skills": skills,
+        "experience": data.get("experience"),
+        **{f: str(data.get(f, "") or "").strip() for f in CANDIDATE_TEXT_FIELDS},
+        "status_history":   [{"status": "New Application", "at": now, "by": str(request.user["_id"])}],
         "recordings":       [],
         "portfolio_links":  [],
         "documents":        [],
@@ -499,12 +524,17 @@ def ats_update_candidate(candidate_id):
     except Exception:
         return jsonify({"message": "Invalid ID"}), 400
 
-    data     = request.json or {}
-    editable = [
-        "name", "email", "phone", "department", "role", "source",
-        "skills", "experience_years", "current_company",
-        "resume_url", "notes", "joining_date", "sourced_by",
-    ]
+    before = ats_candidates_col.find_one({"_id": obj})
+    if not before:
+        return jsonify({"message": "Candidate not found"}), 404
+
+    data = request.json or {}
+    if "email" in data and data["email"] and not EMAIL_RE.match(str(data["email"]).strip()):
+        return jsonify({"message": "Please enter a valid email address."}), 400
+    if "phone" in data and data["phone"] and not PHONE_RE.match(str(data["phone"]).strip().replace(" ", "")):
+        return jsonify({"message": "Please enter a valid 10-digit phone number."}), 400
+
+    editable = ["name", "email", "skills", "experience", "source", *CANDIDATE_TEXT_FIELDS]
     update = {"updated_at": datetime.now(timezone.utc)}
     for f in editable:
         if f in data:
@@ -523,7 +553,17 @@ def ats_update_candidate(candidate_id):
     result = ats_candidates_col.update_one({"_id": obj}, {"$set": update})
     if result.matched_count == 0:
         return jsonify({"message": "Candidate not found"}), 404
-    return jsonify(_serialize_ats(ats_candidates_col.find_one({"_id": obj}))), 200
+
+    updated = ats_candidates_col.find_one({"_id": obj})
+
+    # Recruitment ↔ Employees sync — if this candidate was already onboarded,
+    # push any changed profile fields (job role, department, phone, CTC,
+    # education, etc.) onto their linked employee record and log what
+    # changed so it shows up in their employee history timeline.
+    if before.get("onboarded_employee_id"):
+        _sync_candidate_to_employee(before, updated, str(request.user["_id"]))
+
+    return jsonify(_serialize_ats(updated)), 200
 
 
 @bp.route("/api/admin/ats/candidates/<candidate_id>", methods=["DELETE"])
@@ -557,6 +597,87 @@ def ats_delete_candidate(candidate_id):
 
     ats_candidates_col.delete_one({"_id": obj})
     return jsonify({"message": "deleted"}), 200
+
+
+# Recruitment-only detail that doesn't otherwise exist on an employee record
+# (education, CTC, notice period, etc.) — carried onto the employee as one
+# sub-document, plus kept in sync afterwards. {candidate field: display label}
+RECRUITMENT_PROFILE_FIELDS = {
+    "education":          "Education",
+    "experience":         "Experience",
+    "current_ctc":        "Current CTC",
+    "expected_ctc":       "Expected CTC",
+    "current_location":   "Current Location",
+    "preferred_location": "Preferred Location",
+    "notice_period":      "Notice Period",
+    "campaign":           "Recruitment Campaign",
+}
+
+
+def _job_role_of(candidate: dict) -> str:
+    return candidate.get("job_role") or candidate.get("role") or ""
+
+
+def _recruitment_profile_of(candidate: dict) -> dict:
+    return {k: candidate.get(k, "") for k in RECRUITMENT_PROFILE_FIELDS}
+
+
+def _sync_candidate_to_employee(before: dict, after: dict, actor_id: str):
+    """
+    Keeps an already-onboarded employee's record in sync with later edits to
+    their original candidate profile — e.g. HR corrects the job role or CTC
+    after joining. Only touches fields that actually changed, and logs a
+    human-readable line into employee.profile_history so it shows up on
+    their Employee profile timeline (see EmployeeJourneyModal).
+    """
+    emp_id = after.get("onboarded_employee_id")
+    if not emp_id:
+        return
+    try:
+        emp_obj = ObjectId(emp_id)
+    except Exception:
+        return
+
+    changes = []
+    update  = {}
+
+    new_role = _job_role_of(after)
+    if new_role and new_role != _job_role_of(before):
+        update["position"] = new_role
+        changes.append(f"Job Role → {new_role}")
+
+    new_dept = after.get("department", "")
+    if new_dept and new_dept != before.get("department", ""):
+        update["department"] = new_dept
+        changes.append(f"Department → {new_dept}")
+
+    new_phone = after.get("phone", "")
+    if new_phone and new_phone != before.get("phone", ""):
+        update["phone"] = new_phone
+        changes.append("Phone updated")
+
+    new_profile = _recruitment_profile_of(after)
+    if new_profile != _recruitment_profile_of(before):
+        update["recruitment_profile"] = new_profile
+        changed_labels = [
+            label for field, label in RECRUITMENT_PROFILE_FIELDS.items()
+            if after.get(field, "") != before.get(field, "")
+        ]
+        if changed_labels:
+            changes.append(f"{', '.join(changed_labels)} updated")
+
+    if not update:
+        return
+
+    now = datetime.now(timezone.utc)
+    history_entry = {
+        "at": now, "by": actor_id,
+        "summary": "Synced from recruitment: " + "; ".join(changes),
+    }
+    users_col.update_one(
+        {"_id": emp_obj},
+        {"$set": update, "$push": {"profile_history": history_entry}},
+    )
 
 
 def _auto_onboard_employee(candidate: dict, actor_id: str):
@@ -614,13 +735,18 @@ def _auto_onboard_employee(candidate: dict, actor_id: str):
         "name": name, "email": email, "password": hashed,
         "password_changed": False, "role": "employee",
         "department": candidate.get("department", ""),
-        "position":   candidate.get("role", ""),
+        "position":   _job_role_of(candidate),
         "phone":      candidate.get("phone", ""),
         "doj": doj, "employee_code": "",
         "created_at": now, "manager_id": None, "shift": "morning",
         "late_checkin_count_monthly": 0, "last_late_checkin_month": None,
         "documents": documents,
         "source_candidate_id": str(candidate["_id"]),
+        "recruitment_profile": _recruitment_profile_of(candidate),
+        "profile_history": [{
+            "at": now, "by": actor_id,
+            "summary": "Onboarded from Recruitment — profile carried over from candidate record.",
+        }],
     }
     res = users_col.insert_one(user_doc)
 
@@ -821,14 +947,15 @@ def ats_stats():
         return jsonify({"message": "Unauthorized"}), 403
     query = _ats_scope_query(request.user)
     all_c = list(ats_candidates_col.find(query, {
-        "status": 1, "source": 1, "department": 1, "role": 1,
+        "status": 1, "source": 1, "department": 1, "role": 1, "job_role": 1,
         "applied_at": 1, "hired_at": 1,
     }))
 
+    HIRED_STATUSES = ("Joined", "Hired")
     total           = len(all_c)
-    offers_released = sum(1 for c in all_c if c.get("status") in ("Offer Released", "Offer Accepted", "Hired"))
-    offers_accepted = sum(1 for c in all_c if c.get("status") in ("Offer Accepted", "Hired"))
-    hired           = sum(1 for c in all_c if c.get("status") == "Hired")
+    offers_released = sum(1 for c in all_c if c.get("status") in ("Offer Released", "Offer Accepted", *HIRED_STATUSES))
+    offers_accepted = sum(1 for c in all_c if c.get("status") in ("Offer Accepted", *HIRED_STATUSES))
+    hired           = sum(1 for c in all_c if c.get("status") in HIRED_STATUSES)
     joining_ratio   = round(hired / offers_released * 100) if offers_released else 0
 
     by_status, by_source, by_dept, by_role = {}, {}, {}, {}
@@ -838,12 +965,12 @@ def ats_stats():
         s   = c.get("status") or "Unknown"
         src = c.get("source")     or "Unknown"
         dpt = c.get("department") or "Unknown"
-        rl  = c.get("role")       or "Unknown"
+        rl  = _job_role_of(c)     or "Unknown"
         by_status[s]   = by_status.get(s,   0) + 1
         by_source[src] = by_source.get(src, 0) + 1
         by_dept[dpt]   = by_dept.get(dpt,   0) + 1
         by_role[rl]    = by_role.get(rl,    0) + 1
-        if c.get("status") == "Hired":
+        if c.get("status") in HIRED_STATUSES:
             hired_by_src[src] = hired_by_src.get(src, 0) + 1
             if c.get("applied_at") and c.get("hired_at"):
                 days = (c["hired_at"] - c["applied_at"]).days
@@ -958,14 +1085,14 @@ def ats_review_document(candidate_id):
 def ats_get_doc_checklist(doc_token):
     c = ats_candidates_col.find_one(
         {"doc_token": doc_token},
-        {"name": 1, "role": 1, "documents": 1}
+        {"name": 1, "role": 1, "job_role": 1, "documents": 1}
     )
     if not c:
         return jsonify({"message": "Invalid or expired link"}), 404
     docs = c.get("documents") or []
     return jsonify({
         "candidate_name": c.get("name", ""),
-        "job_role":       c.get("role", ""),
+        "job_role":       _job_role_of(c),
         "required":       [d["name"] for d in docs if d.get("required")],
         "documents":      [
             {"name": d.get("name"), "url": d.get("url"), "status": d.get("status")}
