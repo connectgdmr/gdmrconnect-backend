@@ -80,9 +80,14 @@ def upsert_salary(employee_id):
     if not emp:
         return jsonify({"message": "Employee not found"}), 404
 
+    existing_structure = salary_structures_col.find_one({"employee_id": employee_id})
+    old_gross = sum(_to_money((existing_structure or {}).get(f, 0)) for f in SALARY_EARNINGS)
+
     data          = request.json or {}
     salary_fields = {f: _to_money(data.get(f, 0)) for f in SALARY_EARNINGS + SALARY_DEDUCTIONS}
     salary_fields["bonus"] = _to_money(data.get("bonus", 0))
+    new_gross = sum(salary_fields[f] for f in SALARY_EARNINGS)
+    increment_amount = _to_money(data.get("increment_amount", 0))
 
     display_fields = {}
     for df in SALARY_DISPLAY_FIELDS:
@@ -100,12 +105,18 @@ def upsert_salary(employee_id):
     else:
         effective_date = now
 
+    increment_type   = str(data.get("increment_type",   "")).strip()
+    increment_reason = str(data.get("increment_reason", "")).strip()
+
     history_entry = {
         **salary_fields,
-        "effective_date":   effective_date,
-        "increment_type":   str(data.get("increment_type",   "")).strip(),
-        "increment_reason": str(data.get("increment_reason", "")).strip(),
-        "recorded_at":      now,
+        "effective_date":    effective_date,
+        "increment_type":    increment_type,
+        "increment_reason":  increment_reason,
+        "increment_amount":  increment_amount,
+        "previous_gross":    old_gross,
+        "new_gross":         new_gross,
+        "recorded_at":       now,
     }
 
     salary_structures_col.update_one(
@@ -116,6 +127,36 @@ def upsert_salary(employee_id):
         },
         upsert=True,
     )
+
+    # Career Journey audit trail — every salary change (increment, promotion,
+    # correction, etc.) shows up on the employee's profile timeline, the same
+    # way recruitment sync events do (see routes/ats.py's profile_history use).
+    if existing_structure is not None and new_gross != old_gross:
+        delta = new_gross - old_gross
+        sign  = "+" if delta >= 0 else "−"
+        summary = (
+            f"Salary updated ({increment_type or 'Change'}): "
+            f"₹{old_gross:,.0f} → ₹{new_gross:,.0f} ({sign}₹{abs(delta):,.0f})"
+        )
+        if increment_reason:
+            summary += f" — {increment_reason}"
+        users_col.update_one(
+            {"_id": emp["_id"]},
+            {"$push": {"profile_history": {
+                "at": now, "by": str(request.user["_id"]), "type": "salary_change",
+                "summary": summary, "increment_type": increment_type,
+            }}},
+        )
+    elif existing_structure is None and new_gross > 0:
+        users_col.update_one(
+            {"_id": emp["_id"]},
+            {"$push": {"profile_history": {
+                "at": now, "by": str(request.user["_id"]), "type": "salary_change",
+                "summary": f"Salary structure set: ₹{new_gross:,.0f} gross/month ({increment_type or 'New Hire'})",
+                "increment_type": increment_type,
+            }}},
+        )
+
     return jsonify({"message": "Salary structure saved", "salary": {**salary_fields, **display_fields}}), 200
 
 
@@ -147,6 +188,9 @@ def get_salary_history(employee_id):
         row["effective_date"]   = ed.isoformat() if isinstance(ed, datetime) else ed
         row["increment_type"]   = entry.get("increment_type", "")
         row["increment_reason"] = entry.get("increment_reason", "")
+        row["increment_amount"] = entry.get("increment_amount", 0)
+        row["previous_gross"]   = entry.get("previous_gross", 0)
+        row["new_gross"]        = entry.get("new_gross", 0)
         rec = entry.get("recorded_at")
         row["recorded_at"]      = rec.isoformat() if isinstance(rec, datetime) else rec
         result.append(row)

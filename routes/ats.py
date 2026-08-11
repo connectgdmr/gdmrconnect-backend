@@ -684,7 +684,7 @@ def _sync_candidate_to_employee(before: dict, after: dict, actor_id: str):
 
     now = datetime.now(timezone.utc)
     history_entry = {
-        "at": now, "by": actor_id,
+        "at": now, "by": actor_id, "type": "recruitment_sync",
         "summary": "Synced from recruitment: " + "; ".join(changes),
     }
     users_col.update_one(
@@ -763,7 +763,7 @@ def _auto_onboard_employee(candidate: dict, actor_id: str):
         "recruitment_profile": _recruitment_profile_of(candidate),
         "employment_type": employment_type, "contract_months": contract_months,
         "profile_history": [{
-            "at": now, "by": actor_id,
+            "at": now, "by": actor_id, "type": "onboarding",
             "summary": "Onboarded from Recruitment — profile carried over from candidate record.",
         }],
     }
@@ -1131,7 +1131,7 @@ def ats_get_doc_checklist(doc_token):
 
 @bp.route("/api/ats/documents/<doc_token>", methods=["POST"])
 def ats_upload_doc(doc_token):
-    c = ats_candidates_col.find_one({"doc_token": doc_token}, {"_id": 1, "documents": 1})
+    c = ats_candidates_col.find_one({"doc_token": doc_token}, {"_id": 1, "documents": 1, "onboarded_employee_id": 1})
     if not c:
         return jsonify({"message": "Invalid or expired link"}), 404
 
@@ -1186,6 +1186,34 @@ def ats_upload_doc(doc_token):
         {"_id": c["_id"]},
         {"$set": {"documents": docs, "updated_at": now}}
     )
+
+    # If this candidate was already onboarded (status flipped to Hired/Joined
+    # before they finished uploading every requested document), carry this
+    # one over to their employee record too — otherwise it only ever shows
+    # up on the candidate, and their Employee profile's Documents section
+    # stays stuck at whatever existed at the moment they were hired.
+    emp_id = c.get("onboarded_employee_id")
+    if emp_id:
+        try:
+            emp_obj = ObjectId(emp_id)
+        except Exception:
+            emp_obj = None
+        if emp_obj:
+            emp = users_col.find_one({"_id": emp_obj}, {"documents": 1})
+            if emp is not None:
+                emp_doc = {
+                    "id": secrets.token_hex(8), "name": doc_name, "url": url,
+                    "uploaded_at": now, "uploaded_by": "candidate", "source": "ats",
+                }
+                existing_docs = emp.get("documents") or []
+                match = next((d for d in existing_docs if d.get("name") == doc_name), None)
+                if match:
+                    users_col.update_one(
+                        {"_id": emp_obj, "documents.id": match.get("id")},
+                        {"$set": {"documents.$.url": url, "documents.$.uploaded_at": now}},
+                    )
+                else:
+                    users_col.update_one({"_id": emp_obj}, {"$push": {"documents": emp_doc}})
 
     safe_docs = []
     for d in docs:
