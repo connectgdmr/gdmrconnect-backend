@@ -11,7 +11,7 @@ from flask_limiter.util import get_remote_address
 from database import users_col
 from decorators import token_required
 from extensions import bcrypt, limiter
-from helpers import _sanitize, _valid_email, is_strong_password
+from helpers import _sanitize, _valid_email, is_strong_password, is_offboarded
 from utils import send_email, generate_random_password
 
 bp = Blueprint("auth", __name__)
@@ -80,6 +80,12 @@ def login():
         {"_id": user["_id"]},
         {"$set": {"failed_login_attempts": 0, "locked_until": None}}
     )
+
+    # Offboarded employees (resignation notice + last working day already
+    # passed — same rule used to block attendance check-in/out) lose portal
+    # access too, even though their password/account still exists.
+    if is_offboarded(user):
+        return jsonify({"message": "Your employment has ended. Portal access is no longer available."}), 403
 
     token = jwt.encode(
         {"user_id": str(user["_id"]), "exp": datetime.now(timezone.utc) + timedelta(hours=4)},
