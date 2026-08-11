@@ -12,8 +12,9 @@ import cloudinary.uploader
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
+from pymongo import ReturnDocument
 
-from database import ats_candidates_col, users_col
+from database import ats_candidates_col, users_col, counters_col
 from decorators import token_required
 from extensions import bcrypt
 from helpers import _is_admin, _mgr_depts, parse_employment_type, _has_module_grant
@@ -103,6 +104,22 @@ def _ats_scope_query(user):
     if _has_module_grant(user, "ats"):
         return {}
     return {"department": {"$in": depts}}
+
+
+def _next_applicant_code():
+    """
+    Atomically issue the next ATS applicant code (e.g. "APP-0007"). Uses a
+    dedicated counters collection — find_one_and_update with $inc is atomic
+    in MongoDB, unlike count_documents()+1, which can hand out the same
+    number twice under concurrent requests or after a deletion.
+    """
+    doc = counters_col.find_one_and_update(
+        {"_id": "ats_applicant"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return f"APP-{doc['seq']:04d}"
 
 
 def _serialize_ats(c):
@@ -489,6 +506,17 @@ def ats_create_candidate():
     if phone and not PHONE_RE.match(phone.replace(" ", "")):
         return jsonify({"message": "Please enter a valid 10-digit phone number."}), 400
 
+    # One entry per phone number / email — reject outright rather than
+    # silently creating a second "New Application" for someone already in
+    # the pipeline. PHONE_RE guarantees the last 10 chars of a valid phone
+    # are the bare local number with no separators, regardless of whether
+    # a country code/space/hyphen prefix was typed, so comparing on that
+    # tail catches "9876543210" vs "+91 9876543210" as the same number.
+    if email and ats_candidates_col.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}):
+        return jsonify({"message": "A candidate with this email already exists."}), 400
+    if phone and ats_candidates_col.find_one({"phone": {"$regex": re.escape(phone[-10:]) + "$"}}):
+        return jsonify({"message": "A candidate with this phone number already exists."}), 400
+
     skills = data.get("skills", [])
     if isinstance(skills, str):
         skills = [s.strip() for s in skills.split(",") if s.strip()]
@@ -502,6 +530,7 @@ def ats_create_candidate():
 
     now = datetime.now(timezone.utc)
     doc = {
+        "applicant_code": _next_applicant_code(),
         "name":   name,
         "email":  email,
         "sourced_by": sourced_by,
@@ -543,6 +572,17 @@ def ats_update_candidate(candidate_id):
         return jsonify({"message": "Please enter a valid email address."}), 400
     if "phone" in data and data["phone"] and not PHONE_RE.match(str(data["phone"]).strip().replace(" ", "")):
         return jsonify({"message": "Please enter a valid 10-digit phone number."}), 400
+
+    new_email = str(data.get("email", "")).strip()
+    if "email" in data and new_email and ats_candidates_col.find_one({
+        "_id": {"$ne": obj}, "email": {"$regex": f"^{re.escape(new_email)}$", "$options": "i"},
+    }):
+        return jsonify({"message": "A candidate with this email already exists."}), 400
+    new_phone = str(data.get("phone", "")).strip()
+    if "phone" in data and new_phone and ats_candidates_col.find_one({
+        "_id": {"$ne": obj}, "phone": {"$regex": re.escape(new_phone[-10:]) + "$"},
+    }):
+        return jsonify({"message": "A candidate with this phone number already exists."}), 400
 
     editable = ["name", "email", "skills", "experience", "source", *CANDIDATE_TEXT_FIELDS]
     update = {"updated_at": datetime.now(timezone.utc)}

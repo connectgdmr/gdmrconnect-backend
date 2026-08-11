@@ -78,6 +78,9 @@ clients_col = db["clients"]
 # ── ATS ───────────────────────────────────────────────────────────────────────
 ats_candidates_col = db["ats_candidates"]
 
+# ── Sequence counters (atomic auto-increment IDs, e.g. applicant codes) ───────
+counters_col = db["counters"]
+
 # ── Team Chat ─────────────────────────────────────────────────────────────────
 conversations_col = db["conversations"]
 messages_col      = db["messages"]
@@ -119,6 +122,8 @@ try:
     work_plans_col.create_index([("department", 1), ("date", 1)], background=True)
     clients_col.create_index("name", unique=True, background=True)
     ats_candidates_col.create_index("email", background=True)
+    ats_candidates_col.create_index("phone", background=True)
+    ats_candidates_col.create_index("applicant_code", unique=True, sparse=True, background=True)
     ats_candidates_col.create_index("status", background=True)
     ats_candidates_col.create_index("department", background=True)
     ats_candidates_col.create_index("doc_token", background=True)
