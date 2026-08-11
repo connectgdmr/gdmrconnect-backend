@@ -122,6 +122,34 @@ def is_offboarded(user_doc):
     return lwd_date < _today_ist()
 
 
+# ── Employment type helpers ─────────────────────────────────────────────────
+
+def parse_employment_type(data):
+    """
+    Validates the Employment Type / Contract Duration fields shared by the
+    Add Employee form and ATS auto-onboarding.
+
+    Returns (employment_type, contract_months, error_message) —
+    error_message is None on success. Only Permanent employees get portal
+    login credentials; Contract employees are stored as records only
+    (no password / no welcome email).
+    """
+    employment_type = data.get("employment_type") or "Permanent"
+    if employment_type not in ("Permanent", "Contract"):
+        return None, None, "employment_type must be 'Permanent' or 'Contract'."
+
+    contract_months = None
+    if employment_type == "Contract":
+        try:
+            contract_months = int(data.get("contract_months"))
+        except (TypeError, ValueError):
+            contract_months = None
+        if not contract_months or contract_months < 1:
+            return None, None, "Contract Duration (months) is required for Contract employees."
+
+    return employment_type, contract_months, None
+
+
 # ── Role helpers ──────────────────────────────────────────────────────────────
 
 def _is_admin(user):

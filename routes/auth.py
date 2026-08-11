@@ -55,6 +55,11 @@ def login():
         bcrypt.check_password_hash(_dummy, password)
         return jsonify({"message": "Incorrect email or password."}), 401
 
+    # Contract employees are stored as records only — no portal login was ever
+    # created for them, so there's no password hash to compare against.
+    if not user.get("password"):
+        return jsonify({"message": "This account does not have portal login access. Please contact HR."}), 403
+
     # Account lockout check
     now          = datetime.now(timezone.utc)
     locked_until = user.get("locked_until")
@@ -129,6 +134,12 @@ def forgot_password():
 
     user = users_col.find_one({"email": email})
     if not user:
+        return jsonify({"message": "If this email exists, a password reset has been sent."}), 200
+
+    # Contract employees are data-only records with no portal login — don't
+    # let a forgot-password request silently grant them one. Same generic
+    # response either way so this doesn't leak account status.
+    if user.get("employment_type") == "Contract":
         return jsonify({"message": "If this email exists, a password reset has been sent."}), 200
 
     temp_password = generate_random_password()

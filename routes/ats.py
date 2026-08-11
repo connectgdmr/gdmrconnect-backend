@@ -16,7 +16,7 @@ from bson import ObjectId
 from database import ats_candidates_col, users_col
 from decorators import token_required
 from extensions import bcrypt
-from helpers import _is_admin, _mgr_depts
+from helpers import _is_admin, _mgr_depts, parse_employment_type
 from utils import send_email, generate_random_password
 from config import IST
 
@@ -59,6 +59,7 @@ CANDIDATE_TEXT_FIELDS = [
     "phone", "department", "job_role", "source", "campaign", "education",
     "current_company", "current_ctc", "expected_ctc", "current_location",
     "preferred_location", "notice_period", "resume_url", "remarks", "joining_date",
+    "employment_type", "contract_months",
 ]
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 PHONE_RE = re.compile(r"^(?:\+?\d{1,3}[\s-]?)?\d{10}$")
@@ -656,6 +657,18 @@ def _sync_candidate_to_employee(before: dict, after: dict, actor_id: str):
         update["phone"] = new_phone
         changes.append("Phone updated")
 
+    new_emp_type   = after.get("employment_type") or "Permanent"
+    emp_type_changed = new_emp_type != (before.get("employment_type") or "Permanent")
+    if emp_type_changed:
+        update["employment_type"] = new_emp_type
+        changes.append(f"Employment Type → {new_emp_type}")
+
+    new_contract_months = after.get("contract_months") if new_emp_type == "Contract" else None
+    if new_contract_months != before.get("contract_months"):
+        update["contract_months"] = new_contract_months
+        if not emp_type_changed:
+            changes.append("Contract Duration updated")
+
     new_profile = _recruitment_profile_of(after)
     if new_profile != _recruitment_profile_of(before):
         update["recruitment_profile"] = new_profile
@@ -728,11 +741,16 @@ def _auto_onboard_employee(candidate: dict, actor_id: str):
             "uploaded_by": actor_id, "source": "ats",
         })
 
-    password = generate_random_password()
-    hashed   = bcrypt.generate_password_hash(password).decode("utf-8")
+    # Employment Type / Contract Duration, set on the candidate record (Add/Edit
+    # Candidate form). Falls back to Permanent if unset or invalid — this is an
+    # automatic bridge triggered by a status change, not a form submission the
+    # recruiter can immediately fix, so it stays lenient rather than blocking.
+    employment_type, contract_months, _emp_type_err = parse_employment_type(candidate)
+    if _emp_type_err:
+        employment_type, contract_months = "Permanent", None
 
     user_doc = {
-        "name": name, "email": email, "password": hashed,
+        "name": name, "email": email,
         "password_changed": False, "role": "employee",
         "department": candidate.get("department", ""),
         "position":   _job_role_of(candidate),
@@ -743,11 +761,20 @@ def _auto_onboard_employee(candidate: dict, actor_id: str):
         "documents": documents,
         "source_candidate_id": str(candidate["_id"]),
         "recruitment_profile": _recruitment_profile_of(candidate),
+        "employment_type": employment_type, "contract_months": contract_months,
         "profile_history": [{
             "at": now, "by": actor_id,
             "summary": "Onboarded from Recruitment — profile carried over from candidate record.",
         }],
     }
+
+    # Only Permanent hires get portal login credentials — Contract hires are
+    # stored as records only (no password, no welcome email).
+    password = None
+    if employment_type == "Permanent":
+        password = generate_random_password()
+        user_doc["password"] = bcrypt.generate_password_hash(password).decode("utf-8")
+
     res = users_col.insert_one(user_doc)
 
     ats_candidates_col.update_one(
@@ -755,21 +782,22 @@ def _auto_onboard_employee(candidate: dict, actor_id: str):
         {"$set": {"onboarded_employee_id": str(res.inserted_id)}},
     )
 
-    subject = "Welcome to GDMR Connect: Your New Account Credentials"
-    body    = (
-        f"Dear {name},\n\n"
-        "Congratulations, and welcome aboard! Your employee account for the GDMR Connect "
-        "app has been created automatically as part of your onboarding.\n\n"
-        "Please use the following credentials to log in:\n"
-        f"Username (Email): {email}\n"
-        f"Temporary Password: {password}\n\n"
-        "We recommend logging in as soon as possible and updating your password.\n\n"
-        "Thank you,\nThe GDMR Connect Team"
-    )
-    try:
-        threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
-    except Exception as e:
-        print("Failed to dispatch onboarding welcome email:", e)
+    if employment_type == "Permanent":
+        subject = "Welcome to GDMR Connect: Your New Account Credentials"
+        body    = (
+            f"Dear {name},\n\n"
+            "Congratulations, and welcome aboard! Your employee account for the GDMR Connect "
+            "app has been created automatically as part of your onboarding.\n\n"
+            "Please use the following credentials to log in:\n"
+            f"Username (Email): {email}\n"
+            f"Temporary Password: {password}\n\n"
+            "We recommend logging in as soon as possible and updating your password.\n\n"
+            "Thank you,\nThe GDMR Connect Team"
+        )
+        try:
+            threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
+        except Exception as e:
+            print("Failed to dispatch onboarding welcome email:", e)
 
     return res.inserted_id
 

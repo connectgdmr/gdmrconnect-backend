@@ -17,7 +17,7 @@ from database import (
 )
 from decorators import token_required
 from extensions import bcrypt
-from helpers import _is_admin, _mgr_depts, _serialize_emp_status
+from helpers import _is_admin, _mgr_depts, _serialize_emp_status, parse_employment_type
 from utils import send_email, generate_random_password
 from config import IST
 
@@ -143,39 +143,53 @@ def add_employee():
     if users_col.find_one({"email": email}):
         return jsonify({"message": "User with this email already exists"}), 400
 
-    password = generate_random_password()
-    hashed   = bcrypt.generate_password_hash(password).decode("utf-8")
+    employment_type, contract_months, emp_type_err = parse_employment_type(data)
+    if emp_type_err:
+        return jsonify({"message": emp_type_err}), 400
 
     shift = data.get("shift", "morning")
     if shift not in ("morning", "night", "general"):
         shift = "morning"
 
     user_doc = {
-        "name": name, "email": email, "password": hashed,
+        "name": name, "email": email,
         "password_changed": False, "role": "employee",
         "department": department, "position": position, "doj": doj,
         "employee_code": employee_code, "created_at": datetime.now(timezone.utc),
         "manager_id": manager_id, "shift": shift,
         "late_checkin_count_monthly": 0, "last_late_checkin_month": None,
+        "employment_type": employment_type, "contract_months": contract_months,
     }
+
+    # Only Permanent employees get portal login credentials — Contract
+    # employees are stored as records only (no password, no welcome email).
+    password = None
+    if employment_type == "Permanent":
+        password = generate_random_password()
+        user_doc["password"] = bcrypt.generate_password_hash(password).decode("utf-8")
+
     res = users_col.insert_one(user_doc)
 
-    subject = "Welcome to GDMR Connect: Your New Account Credentials"
-    body    = (
-        f"Dear {name},\n\n"
-        "Your new employee account for the GDMR Connect Attendance App has been successfully created.\n\n"
-        "Please use the following credentials to log in:\n"
-        f"Username (Email): {email}\n"
-        f"Temporary Password: {password}\n\n"
-        "We recommend logging in as soon as possible and updating your password to a strong format.\n\n"
-        "Thank you,\nThe GDMR Connect Team"
-    )
-    try:
-        threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
-    except Exception as e:
-        print("Failed to dispatch welcome email:", e)
+    if employment_type == "Permanent":
+        subject = "Welcome to GDMR Connect: Your New Account Credentials"
+        body    = (
+            f"Dear {name},\n\n"
+            "Your new employee account for the GDMR Connect Attendance App has been successfully created.\n\n"
+            "Please use the following credentials to log in:\n"
+            f"Username (Email): {email}\n"
+            f"Temporary Password: {password}\n\n"
+            "We recommend logging in as soon as possible and updating your password to a strong format.\n\n"
+            "Thank you,\nThe GDMR Connect Team"
+        )
+        try:
+            threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
+        except Exception as e:
+            print("Failed to dispatch welcome email:", e)
+        message = "Employee created successfully"
+    else:
+        message = "Employee record created (Contract — no login access)."
 
-    return jsonify({"message": "Employee created successfully", "id": str(res.inserted_id)}), 201
+    return jsonify({"message": message, "id": str(res.inserted_id)}), 201
 
 
 # ── Employee / Manager directory ──────────────────────────────────────────────
