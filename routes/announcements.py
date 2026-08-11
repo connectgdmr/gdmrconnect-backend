@@ -10,7 +10,7 @@ from bson import ObjectId
 from database import (announcements_col, corrections_col, attendance_col,
                       users_col)
 from decorators import token_required
-from helpers import _is_admin
+from helpers import _is_admin, is_offboarded
 from config import IST
 
 bp = Blueprint("announcements", __name__)
@@ -281,9 +281,10 @@ def get_my_profile():
     user     = request.user
     birthday = user.get("birthday")
     return jsonify({
-        "birthday": birthday.strftime("%Y-%m-%d") if isinstance(birthday, datetime) else birthday,
-        "phone":    user.get("phone"),
-        "bio":      user.get("bio"),
+        "birthday":   birthday.strftime("%Y-%m-%d") if isinstance(birthday, datetime) else birthday,
+        "phone":      user.get("phone"),
+        "bio":        user.get("bio"),
+        "offboarded": is_offboarded(user),
     }), 200
 
 

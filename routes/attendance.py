@@ -10,7 +10,7 @@ from bson import ObjectId
 
 from database import attendance_col, leaves_col, access_grants_col, users_col
 from decorators import token_required
-from helpers import utc_to_ist, format_datetime_ist
+from helpers import utc_to_ist, format_datetime_ist, is_offboarded
 from config import IST
 
 bp = Blueprint("attendance", __name__)
@@ -21,6 +21,9 @@ bp = Blueprint("attendance", __name__)
 def checkin_photo():
     if request.user.get("role") not in ["employee", "manager"]:
         return jsonify({"message": "Unauthorized"}), 403
+
+    if is_offboarded(request.user):
+        return jsonify({"message": "Your employment has ended. Attendance check-in is no longer available."}), 403
 
     uid            = str(request.user["_id"])
     now_ist        = datetime.now(IST)
@@ -120,6 +123,9 @@ def checkin_photo():
 def checkout_photo():
     if request.user.get("role") not in ["employee", "manager"]:
         return jsonify({"message": "Unauthorized"}), 403
+
+    if is_offboarded(request.user):
+        return jsonify({"message": "Your employment has ended. Attendance check-out is no longer available."}), 403
 
     uid            = str(request.user["_id"])
     now_ist        = datetime.now(IST)

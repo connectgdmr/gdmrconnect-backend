@@ -100,6 +100,28 @@ def _serialize_emp_status(user_doc):
         user_doc["resignation"] = None
 
 
+# ── Employment status checks ────────────────────────────────────────────────
+
+def is_offboarded(user_doc):
+    """
+    True once an employee's resignation notice + last working day have both
+    been recorded and the last working day has already passed (IST "today").
+    Mirrors the same rule used across stats.py, assistant.py, employees.py,
+    and the frontend isOffboarded() helpers — kept here as the single
+    canonical backend implementation.
+    """
+    resignation = (user_doc or {}).get("resignation") or {}
+    notice_date = resignation.get("notice_date")
+    lwd = resignation.get("last_working_day")
+    if not notice_date or not lwd:
+        return False
+    if isinstance(lwd, datetime):
+        lwd_date = lwd.date()
+    else:
+        lwd_date = datetime.strptime(str(lwd)[:10], "%Y-%m-%d").date()
+    return lwd_date < _today_ist()
+
+
 # ── Role helpers ──────────────────────────────────────────────────────────────
 
 def _is_admin(user):
