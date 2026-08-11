@@ -19,11 +19,16 @@ bp = Blueprint("lms", __name__)
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
 def _get_lms_grant(user):
-    """Return active LMS grant for this user, or None."""
+    """
+    Return active LMS grant for this user, or None. "modules" (a list) is
+    the current field — Mongo matches "modules": "lms" against any document
+    whose modules array contains "lms". "module" (a single string) is kept
+    for grants created before the multi-module Grant Access picker existed.
+    """
     return access_grants_col.find_one({
         "employee_id": str(user["_id"]),
         "is_active":   True,
-        "module":      "lms",
+        "$or": [{"modules": "lms"}, {"module": "lms"}],
     })
 
 

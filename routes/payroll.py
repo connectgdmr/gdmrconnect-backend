@@ -15,7 +15,7 @@ from bson import ObjectId
 
 from database import (salary_structures_col, payslips_col, payroll_loans_col, users_col)
 from decorators import token_required
-from helpers import _is_admin, _to_money
+from helpers import _is_admin, _to_money, _has_module_grant
 
 bp = Blueprint("payroll", __name__)
 
@@ -30,8 +30,10 @@ SALARY_DISPLAY_FIELDS = [
 ]
 
 
-def _payroll_allowed(user):
+def _payroll_allowed(user, write=False):
     if _is_admin(user):
+        return True
+    if _has_module_grant(user, "payroll", write=write):
         return True
     dept = (user.get("department") or "").strip().lower()
     return dept.startswith("accounts")
@@ -70,7 +72,7 @@ def list_salaries():
 @bp.route("/api/admin/payroll/salaries/<employee_id>", methods=["PUT"])
 @token_required
 def upsert_salary(employee_id):
-    if not _payroll_allowed(request.user):
+    if not _payroll_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
 
     try:
@@ -203,7 +205,7 @@ def get_salary_history(employee_id):
 @bp.route("/api/admin/payroll/run", methods=["POST"])
 @token_required
 def run_payroll():
-    if not _payroll_allowed(request.user):
+    if not _payroll_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
 
     data = request.json or {}
@@ -587,7 +589,7 @@ def export_payroll():
 @bp.route("/api/admin/payroll/payslips/<payslip_id>/status", methods=["PUT"])
 @token_required
 def update_payslip_status(payslip_id):
-    if not _payroll_allowed(request.user):
+    if not _payroll_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
 
     try:
@@ -644,7 +646,7 @@ def list_payroll_loans():
 @bp.route("/api/admin/payroll/loans", methods=["POST"])
 @token_required
 def create_payroll_loan():
-    if not _payroll_allowed(request.user):
+    if not _payroll_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
 
     data        = request.get_json(silent=True) or {}
@@ -696,7 +698,7 @@ def create_payroll_loan():
 @bp.route("/api/admin/payroll/loans/<loan_id>/status", methods=["PUT"])
 @token_required
 def update_payroll_loan_status(loan_id):
-    if not _payroll_allowed(request.user):
+    if not _payroll_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
 
     try:

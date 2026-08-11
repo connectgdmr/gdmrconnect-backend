@@ -11,9 +11,9 @@ from datetime import datetime, timezone, timedelta
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
 
-from database import leaves_col, users_col, access_grants_col
+from database import leaves_col, users_col
 from decorators import token_required
-from helpers import _is_admin
+from helpers import _is_admin, _has_module_grant
 from config import IST, HR_EMAIL, DASHBOARD_URL
 from utils import send_email
 
@@ -270,7 +270,7 @@ def apply_leave():
 @token_required
 def admin_view_leaves():
     role          = request.user.get("role")
-    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    has_delegated = _has_module_grant(request.user, "leaves")
     if role not in ["admin", "owner", "manager"] and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -300,7 +300,7 @@ def admin_view_leaves():
 @token_required
 def update_leave(leave_id):
     role          = request.user.get("role")
-    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    has_delegated = _has_module_grant(request.user, "leaves")
     if role not in ["admin", "owner", "manager"] and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -313,7 +313,7 @@ def update_leave(leave_id):
     if role in ("admin", "owner"):
         update_fields["admin_status"] = action
     elif has_delegated:
-        if has_delegated.get("access_level") == "view_only":
+        if not _has_module_grant(request.user, "leaves", write=True):
             return jsonify({"message": "Unauthorized: Your delegated access is View Only."}), 403
         update_fields["admin_status"] = action
     elif role == "manager":

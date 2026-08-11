@@ -8,9 +8,9 @@ from datetime import datetime, timezone, timedelta, time
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
 
-from database import attendance_col, leaves_col, access_grants_col, users_col
+from database import attendance_col, leaves_col, users_col
 from decorators import token_required
-from helpers import utc_to_ist, format_datetime_ist, is_offboarded
+from helpers import utc_to_ist, format_datetime_ist, is_offboarded, _is_admin, _has_module_grant
 from config import IST
 
 bp = Blueprint("attendance", __name__)
@@ -224,9 +224,7 @@ def my_attendance():
 @bp.route("/api/admin/attendance/<emp_id>", methods=["GET"])
 @token_required
 def admin_employee_attendance(emp_id):
-    role          = request.user.get("role")
-    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
-    if role not in ("admin", "owner") and not has_delegated:
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "attendance")):
         return jsonify({"message": "Unauthorized"}), 403
 
     emp = users_col.find_one({"_id": ObjectId(emp_id)})

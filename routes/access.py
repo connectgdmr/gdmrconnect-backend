@@ -9,10 +9,18 @@ from bson import ObjectId
 
 from database import access_grants_col, users_col
 from decorators import token_required
-from helpers import _is_admin, utc_to_ist
+from helpers import _is_admin, utc_to_ist, GRANTABLE_MODULES
 from config import IST
 
 bp = Blueprint("access", __name__)
+
+
+@bp.route("/api/admin/grantable-modules", methods=["GET"])
+@token_required
+def grantable_modules():
+    if not _is_admin(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    return jsonify([{"key": k, "label": v} for k, v in GRANTABLE_MODULES.items()]), 200
 
 
 @bp.route("/api/admin/grant-access", methods=["POST"])
@@ -36,13 +44,21 @@ def grant_access():
     if not emp or _is_admin(emp):
         return jsonify({"message": "Invalid employee or employee is already an admin."}), 400
 
-    module = data.get("module", "attendance")
-    if module not in ("attendance", "lms"):
-        module = "attendance"
+    # "modules" replaces the old single "module" string — an admin can now
+    # delegate any combination of features in one grant. Still accepts a
+    # legacy single "module" string for backward compatibility with any
+    # old frontend build still calling this endpoint the old way.
+    modules = data.get("modules")
+    if not modules:
+        legacy = data.get("module")
+        modules = [legacy] if legacy else []
+    modules = [m for m in modules if m in GRANTABLE_MODULES]
+    if not modules:
+        return jsonify({"message": "Select at least one feature to grant access to."}), 400
 
     grant_record = {
         "employee_id":       emp_id,
-        "module":            module,
+        "modules":           modules,
         "access_level":      access_level,
         "scope":             scope,
         "custom_date":       custom_date,

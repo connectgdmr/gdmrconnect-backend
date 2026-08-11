@@ -11,7 +11,7 @@ from bson import ObjectId
 
 from database import assessments_col, candidates_col
 from decorators import token_required
-from helpers import _is_admin
+from helpers import _is_admin, _has_module_grant
 from utils import send_email
 
 bp = Blueprint("assessment", __name__)
@@ -20,7 +20,7 @@ bp = Blueprint("assessment", __name__)
 @bp.route("/api/admin/assessments", methods=["GET"])
 @token_required
 def list_assessments():
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "assessment")):
         return jsonify({"message": "Unauthorized"}), 403
     rows = []
     for a in assessments_col.find().sort("created_at", -1):
@@ -32,7 +32,7 @@ def list_assessments():
 @bp.route("/api/admin/assessments", methods=["POST"])
 @token_required
 def create_assessment():
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "assessment", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     data  = request.json or {}
     title = str(data.get("title", "")).strip()
@@ -54,7 +54,7 @@ def create_assessment():
 @bp.route("/api/admin/assessments/<assessment_id>", methods=["PUT"])
 @token_required
 def update_assessment(assessment_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "assessment", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(assessment_id)
@@ -74,7 +74,7 @@ def update_assessment(assessment_id):
 @bp.route("/api/admin/assessments/<assessment_id>", methods=["DELETE"])
 @token_required
 def delete_assessment(assessment_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "assessment", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(assessment_id)
@@ -90,7 +90,7 @@ def delete_assessment(assessment_id):
 @bp.route("/api/admin/assessments/invite", methods=["POST"])
 @token_required
 def invite_candidate():
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "assessment", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     data          = request.json or {}
     name          = str(data.get("name",          "")).strip()
@@ -135,7 +135,7 @@ def invite_candidate():
 @bp.route("/api/admin/assessments/candidates", methods=["GET"])
 @token_required
 def list_candidates():
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "assessment")):
         return jsonify({"message": "Unauthorized"}), 403
     assessment_id = request.args.get("assessmentId")
     query         = {"assessment_id": assessment_id} if assessment_id else {}
@@ -149,7 +149,7 @@ def list_candidates():
 @bp.route("/api/admin/assessments/candidates/<candidate_id>/result", methods=["GET"])
 @token_required
 def candidate_result(candidate_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "assessment")):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         invite = candidates_col.find_one({"_id": ObjectId(candidate_id)})

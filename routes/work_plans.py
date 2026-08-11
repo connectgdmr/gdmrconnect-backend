@@ -12,10 +12,10 @@ from datetime import datetime, timezone, timedelta
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
 
-from database import work_plans_col, access_grants_col, users_col, attendance_col
+from database import work_plans_col, users_col, attendance_col
 from decorators import token_required
 from helpers import (
-    _is_admin, _mgr_depts, _is_task_done,
+    _is_admin, _mgr_depts, _is_task_done, _has_module_grant,
     _checkin_map, _serialize_plan, _range_start, _build_analytics, _today_ist,
     format_datetime_ist,
 )
@@ -316,7 +316,7 @@ def my_work_analytics_ai():
 @token_required
 def admin_work_plans():
     role          = request.user.get("role")
-    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    has_delegated = _has_module_grant(request.user, "work-by-team")
     if role not in ("admin", "owner", "manager") and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -335,7 +335,7 @@ def admin_work_plans():
 @token_required
 def admin_work_analytics():
     role          = request.user.get("role")
-    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    has_delegated = _has_module_grant(request.user, "work-by-team")
     if role not in ("admin", "owner", "manager") and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
@@ -355,7 +355,7 @@ def admin_work_analytics():
 @token_required
 def comment_work_plan(plan_id):
     role          = request.user.get("role")
-    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
+    has_delegated = _has_module_grant(request.user, "work-by-team")
     if role not in ("admin", "owner", "manager") and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 

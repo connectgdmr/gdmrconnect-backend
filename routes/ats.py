@@ -16,7 +16,7 @@ from bson import ObjectId
 from database import ats_candidates_col, users_col
 from decorators import token_required
 from extensions import bcrypt
-from helpers import _is_admin, _mgr_depts, parse_employment_type
+from helpers import _is_admin, _mgr_depts, parse_employment_type, _has_module_grant
 from utils import send_email, generate_random_password
 from config import IST
 
@@ -75,7 +75,7 @@ DOC_CHECKLIST_DEFAULT = [
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _ats_allowed(user):
+def _ats_allowed(user, write=False):
     role = user.get("role")
     if role in ("admin", "owner"):
         return True
@@ -83,6 +83,8 @@ def _ats_allowed(user):
     if "hr" in dept or "human resource" in dept:
         return True
     if role == "manager":
+        return True
+    if _has_module_grant(user, "ats", write=write):
         return True
     return False
 
@@ -467,7 +469,7 @@ def ats_get_candidate(candidate_id):
 @bp.route("/api/admin/ats/candidates", methods=["POST"])
 @token_required
 def ats_create_candidate():
-    if not _ats_allowed(request.user):
+    if not _ats_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
     data  = request.json or {}
     name  = str(data.get("name",  "")).strip()
@@ -518,7 +520,7 @@ def ats_create_candidate():
 @bp.route("/api/admin/ats/candidates/<candidate_id>", methods=["PUT"])
 @token_required
 def ats_update_candidate(candidate_id):
-    if not _ats_allowed(request.user):
+    if not _ats_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(candidate_id)
@@ -570,7 +572,7 @@ def ats_update_candidate(candidate_id):
 @bp.route("/api/admin/ats/candidates/<candidate_id>", methods=["DELETE"])
 @token_required
 def ats_delete_candidate(candidate_id):
-    if not _ats_allowed(request.user):
+    if not _ats_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(candidate_id)
@@ -815,7 +817,7 @@ def _auto_onboard_employee(candidate: dict, actor_id: str):
 @bp.route("/api/admin/ats/candidates/<candidate_id>/status", methods=["PUT"])
 @token_required
 def ats_update_status(candidate_id):
-    if not _ats_allowed(request.user):
+    if not _ats_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(candidate_id)
@@ -858,7 +860,7 @@ def ats_update_status(candidate_id):
 @bp.route("/api/admin/ats/candidates/<candidate_id>/send-status-email", methods=["POST"])
 @token_required
 def ats_send_status_email(candidate_id):
-    if not _ats_allowed(request.user):
+    if not _ats_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(candidate_id)
@@ -887,7 +889,7 @@ def ats_send_status_email(candidate_id):
 @bp.route("/api/admin/ats/candidates/<candidate_id>/recording", methods=["POST"])
 @token_required
 def ats_add_recording(candidate_id):
-    if not _ats_allowed(request.user):
+    if not _ats_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(candidate_id)
@@ -913,7 +915,7 @@ def ats_add_recording(candidate_id):
 @bp.route("/api/admin/ats/candidates/<candidate_id>/portfolio", methods=["POST"])
 @token_required
 def ats_add_portfolio(candidate_id):
-    if not _ats_allowed(request.user):
+    if not _ats_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(candidate_id)
@@ -932,7 +934,7 @@ def ats_add_portfolio(candidate_id):
 @bp.route("/api/admin/ats/candidates/<candidate_id>/doc-request", methods=["POST"])
 @token_required
 def ats_doc_request(candidate_id):
-    if not _ats_allowed(request.user):
+    if not _ats_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(candidate_id)
@@ -1061,7 +1063,7 @@ def ats_stats():
 @bp.route("/api/admin/ats/candidates/upload", methods=["POST"])
 @token_required
 def ats_upload_resume():
-    if not _ats_allowed(request.user):
+    if not _ats_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
     file = request.files.get("file")
     if not file:
@@ -1100,7 +1102,7 @@ def ats_upload_resume():
 @bp.route("/api/admin/ats/candidates/<candidate_id>/document", methods=["PUT"])
 @token_required
 def ats_review_document(candidate_id):
-    if not _ats_allowed(request.user):
+    if not _ats_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(candidate_id)

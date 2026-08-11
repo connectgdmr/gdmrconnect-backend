@@ -17,7 +17,7 @@ from database import (
 )
 from decorators import token_required
 from extensions import bcrypt
-from helpers import _is_admin, _mgr_depts, _serialize_emp_status, parse_employment_type
+from helpers import _is_admin, _mgr_depts, _serialize_emp_status, parse_employment_type, _has_module_grant
 from utils import send_email, generate_random_password
 from config import IST
 
@@ -126,7 +126,7 @@ def register_manager():
 @bp.route("/api/admin/employees", methods=["POST"])
 @token_required
 def add_employee():
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "employees", write=True)):
         return jsonify({"message": "Unauthorized access."}), 403
 
     data          = request.json
@@ -198,10 +198,7 @@ def add_employee():
 @bp.route("/api/admin/employees", methods=["GET"])
 @token_required
 def list_employees():
-    role         = request.user.get("role")
-    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
-
-    if role not in ("admin", "owner") and not has_delegated:
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "employees")):
         return jsonify({"message": "Unauthorized access."}), 403
 
     emp_query: dict = {"role": {"$in": ["employee", "manager", "owner"]}}
@@ -230,7 +227,7 @@ def list_employees():
 @bp.route("/api/admin/managers", methods=["GET"])
 @token_required
 def list_managers():
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "manager")):
         return jsonify({"message": "Unauthorized"}), 403
     managers = []
     for m in users_col.find({"role": {"$in": ["manager", "owner"]}}, {"password": 0}):
@@ -242,7 +239,7 @@ def list_managers():
 @bp.route("/api/admin/managers/<man_id>/role", methods=["PUT"])
 @token_required
 def update_manager_role(man_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "manager", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     data     = request.get_json(silent=True) or {}
     new_role = (data.get("role") or "").strip().lower()
@@ -266,7 +263,7 @@ def update_manager_role(man_id):
 @bp.route("/api/admin/departments", methods=["GET"])
 @token_required
 def list_departments():
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "departments")):
         return jsonify({"message": "Unauthorized"}), 403
     depts = []
     for d in departments_col.find().sort("name", 1):
@@ -280,7 +277,7 @@ def list_departments():
 @bp.route("/api/admin/departments", methods=["POST"])
 @token_required
 def create_department():
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "departments", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     data = request.json or {}
     name = str(data.get("name", "")).strip()
@@ -306,7 +303,7 @@ def create_department():
 @bp.route("/api/admin/departments/<dept_id>", methods=["PUT"])
 @token_required
 def update_department(dept_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "departments", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         dept = departments_col.find_one({"_id": ObjectId(dept_id)})
@@ -416,7 +413,7 @@ def manager_my_employees():
 @bp.route("/api/admin/employees/<emp_id>", methods=["PUT"])
 @token_required
 def edit_employee(emp_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "employees", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     data   = request.json
     update = {}
@@ -439,7 +436,7 @@ def edit_employee(emp_id):
 @bp.route("/api/admin/employees/<emp_id>/documents", methods=["POST"])
 @token_required
 def upload_employee_document(emp_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "employees", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(emp_id)
@@ -484,7 +481,7 @@ def upload_employee_document(emp_id):
 @bp.route("/api/admin/employees/<emp_id>/documents/<doc_id>", methods=["DELETE"])
 @token_required
 def delete_employee_document(emp_id, doc_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "employees", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(emp_id)
@@ -497,7 +494,7 @@ def delete_employee_document(emp_id, doc_id):
 @bp.route("/api/admin/employees/<emp_id>/promote", methods=["PUT"])
 @token_required
 def promote_to_manager(emp_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "manager", write=True)):
         return jsonify({"message": "Unauthorized. Only admins can promote employees."}), 403
     emp = users_col.find_one({"_id": ObjectId(emp_id)})
     if not emp:
@@ -520,7 +517,7 @@ def promote_to_manager(emp_id):
 @bp.route("/api/admin/managers/<man_id>", methods=["PUT"])
 @token_required
 def edit_manager(man_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "manager", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     data   = request.json
     update = {}
@@ -577,7 +574,7 @@ def _status_payload(emp_id):
 @bp.route("/api/admin/employees/<emp_id>/status", methods=["GET"])
 @token_required
 def get_employee_status(emp_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "employees")):
         return jsonify({"message": "Unauthorized"}), 403
     emp, err = _get_emp_or_404(emp_id)
     if err:
@@ -589,7 +586,7 @@ def get_employee_status(emp_id):
 @bp.route("/api/admin/employees/<emp_id>/extended-leave", methods=["POST"])
 @token_required
 def add_extended_leave(emp_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "employees", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     emp, err = _get_emp_or_404(emp_id)
     if err:
@@ -622,7 +619,7 @@ def add_extended_leave(emp_id):
 @bp.route("/api/admin/employees/<emp_id>/extended-leave/<leave_id>", methods=["DELETE"])
 @token_required
 def delete_extended_leave(emp_id, leave_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "employees", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     emp, err = _get_emp_or_404(emp_id)
     if err:
@@ -640,7 +637,7 @@ def delete_extended_leave(emp_id, leave_id):
 @bp.route("/api/admin/employees/<emp_id>/resignation", methods=["PUT"])
 @token_required
 def set_resignation(emp_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "employees", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     emp, err = _get_emp_or_404(emp_id)
     if err:
@@ -674,7 +671,7 @@ def set_resignation(emp_id):
 @bp.route("/api/admin/employees/<emp_id>/resignation", methods=["DELETE"])
 @token_required
 def clear_resignation(emp_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "employees", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     emp, err = _get_emp_or_404(emp_id)
     if err:

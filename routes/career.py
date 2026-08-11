@@ -12,7 +12,7 @@ from bson import ObjectId
 
 from database import career_jobs_col, referrals_col, users_col
 from decorators import token_required
-from helpers import _is_admin
+from helpers import _is_admin, _has_module_grant
 from utils import send_email
 
 bp = Blueprint("career", __name__)
@@ -34,7 +34,7 @@ def _normalize_requirements(raw):
 @bp.route("/api/admin/career/jobs", methods=["GET"])
 @token_required
 def list_jobs():
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "career")):
         return jsonify({"message": "Unauthorized"}), 403
     rows = []
     for j in career_jobs_col.find().sort("created_at", -1):
@@ -47,7 +47,7 @@ def list_jobs():
 @bp.route("/api/admin/career/jobs", methods=["POST"])
 @token_required
 def create_job():
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "career", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     data  = request.json or {}
     title = str(data.get("title", "")).strip()
@@ -71,7 +71,7 @@ def create_job():
 @bp.route("/api/admin/career/jobs/<job_id>", methods=["PUT"])
 @token_required
 def update_job(job_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "career", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(job_id)
@@ -95,7 +95,7 @@ def update_job(job_id):
 @bp.route("/api/admin/career/jobs/<job_id>", methods=["DELETE"])
 @token_required
 def delete_job(job_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "career", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(job_id)
@@ -110,7 +110,7 @@ def delete_job(job_id):
 @bp.route("/api/admin/career/referrals", methods=["GET"])
 @token_required
 def admin_list_referrals():
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "career")):
         return jsonify({"message": "Unauthorized"}), 403
     job_id = request.args.get("job_id")
     query  = {"job_id": job_id} if job_id else {}
@@ -124,7 +124,7 @@ def admin_list_referrals():
 @bp.route("/api/admin/career/referrals/<referral_id>", methods=["PUT"])
 @token_required
 def update_referral(referral_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "career", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(referral_id)

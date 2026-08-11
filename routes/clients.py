@@ -9,6 +9,7 @@ from bson import ObjectId
 
 from database import clients_col, work_plans_col
 from decorators import token_required
+from helpers import _has_module_grant
 
 bp = Blueprint("clients", __name__)
 
@@ -33,7 +34,7 @@ def list_clients():
 @token_required
 def create_client():
     role = request.user.get("role")
-    if role not in ("admin", "owner", "manager"):
+    if role not in ("admin", "owner", "manager") and not _has_module_grant(request.user, "clients", write=True):
         return jsonify({"message": "Unauthorized"}), 403
     data = request.json or {}
     name = str(data.get("name", "")).strip()
@@ -55,7 +56,7 @@ def create_client():
 @token_required
 def delete_client(client_id):
     role = request.user.get("role")
-    if role not in ("admin", "owner", "manager"):
+    if role not in ("admin", "owner", "manager") and not _has_module_grant(request.user, "clients", write=True):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         obj = ObjectId(client_id)

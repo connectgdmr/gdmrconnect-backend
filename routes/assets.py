@@ -10,7 +10,7 @@ from bson import ObjectId
 
 from database import assets_col, users_col
 from decorators import token_required
-from helpers import _is_admin, _mgr_depts
+from helpers import _is_admin, _mgr_depts, _has_module_grant
 from utils import send_email
 
 bp = Blueprint("assets", __name__)
@@ -101,7 +101,7 @@ def manager_update_asset(asset_id):
 @bp.route("/api/admin/assets", methods=["GET"])
 @token_required
 def admin_get_assets():
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "assets")):
         return jsonify({"message": "Unauthorized access. Admins only."}), 403
 
     rows = []
@@ -114,7 +114,7 @@ def admin_get_assets():
 @bp.route("/api/admin/assets/<asset_id>", methods=["PUT"])
 @token_required
 def admin_update_asset(asset_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "assets", write=True)):
         return jsonify({"message": "Unauthorized action. Admins only."}), 403
 
     data         = request.json
@@ -143,7 +143,7 @@ def admin_update_asset(asset_id):
 @bp.route("/api/admin/assets/<asset_id>/assign", methods=["POST"])
 @token_required
 def assign_asset_to_office_admin(asset_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "assets", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
 
     data   = request.json or {}

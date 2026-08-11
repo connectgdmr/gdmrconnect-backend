@@ -10,7 +10,7 @@ from bson import ObjectId
 from database import (announcements_col, corrections_col, attendance_col,
                       users_col)
 from decorators import token_required
-from helpers import _is_admin, is_offboarded
+from helpers import _is_admin, is_offboarded, _has_module_grant
 from config import IST
 
 bp = Blueprint("announcements", __name__)
@@ -23,7 +23,7 @@ bp = Blueprint("announcements", __name__)
 @bp.route("/api/announcements", methods=["POST"])
 @token_required
 def create_announcement():
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "announcements", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
     data = request.json
     announcements_col.insert_one({
@@ -47,7 +47,7 @@ def get_announcements():
 @bp.route("/api/announcements/<ann_id>", methods=["PUT"])
 @token_required
 def update_announcement(ann_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "announcements", write=True)):
         return jsonify({"message": "Unauthorized access. Admins only."}), 403
     data    = request.json
     title   = data.get("title")
@@ -67,7 +67,7 @@ def update_announcement(ann_id):
 @bp.route("/api/announcements/<ann_id>", methods=["DELETE"])
 @token_required
 def delete_announcement(ann_id):
-    if not _is_admin(request.user):
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "announcements", write=True)):
         return jsonify({"message": "Unauthorized access. Admins only."}), 403
     result = announcements_col.delete_one({"_id": ObjectId(ann_id)})
     if result.deleted_count == 0:

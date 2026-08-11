@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timedelta
 from bson import ObjectId
 from config import IST
-from database import attendance_col, users_col
+from database import attendance_col, users_col, access_grants_col
 
 
 # ── Timezone helpers ──────────────────────────────────────────────────────────
@@ -164,6 +164,58 @@ def _mgr_depts(user):
     if isinstance(d, list):
         return [x for x in d if x]
     return [d] if d else []
+
+
+# ── Delegated (Grant Access) module permissions ─────────────────────────────
+# Canonical set of admin features that "Grant Access" can delegate, keyed the
+# same as the sidebar's view name so frontend/backend stay in sync. Excludes
+# things that must always stay admin-only regardless of delegation: creating
+# other admin accounts, and Grant Access itself (both would be privilege-
+# escalation loopholes — a delegated user could otherwise grant themselves
+# permanent admin).
+GRANTABLE_MODULES = {
+    "employees":     "Employees",
+    "leaves":        "Leave Requests",
+    "attendance":    "Attendance",
+    "departments":   "Departments",
+    "manager":       "Managers",
+    "summary":       "Reports",
+    "pms":           "PMS",
+    "announcements": "Announcements",
+    "assets":        "Manage Assets",
+    "work-by-team":  "Work by Team",
+    "clients":       "Clients",
+    "assessment":    "Assessments",
+    "lms":           "LMS",
+    "career":        "Jobs",
+    "ats":           "Recruitment",
+    "payroll":       "Payroll",
+}
+
+
+def _has_module_grant(user, module, write=False):
+    """
+    True if this user holds an active delegated-access grant (see
+    routes/access.py) covering `module`. write=True additionally requires
+    the grant's access_level to be 'view_edit' rather than 'view_only'.
+
+    Callers should check _is_admin(user) separately (usually
+    `_is_admin(user) or _has_module_grant(user, "x")`) — this only covers
+    delegated, non-admin access. Mirrors the pattern routes/lms.py already
+    used for LMS-specific grants, generalized to every grantable module.
+    """
+    grant = access_grants_col.find_one({"employee_id": str(user["_id"]), "is_active": True})
+    if not grant:
+        return False
+    modules = grant.get("modules")
+    if not modules:
+        legacy = grant.get("module")  # older grants stored a single "module" string
+        modules = [legacy] if legacy else []
+    if module not in modules:
+        return False
+    if write and grant.get("access_level") != "view_edit":
+        return False
+    return True
 
 
 # ── Payroll helpers ───────────────────────────────────────────────────────────

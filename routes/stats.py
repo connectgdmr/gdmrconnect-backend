@@ -8,8 +8,9 @@ from datetime import datetime, timezone, timedelta
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
 
-from database import (attendance_col, leaves_col, access_grants_col, users_col)
+from database import (attendance_col, leaves_col, users_col)
 from decorators import token_required
+from helpers import _is_admin, _has_module_grant
 from config import IST
 
 bp = Blueprint("stats", __name__)
@@ -18,9 +19,9 @@ bp = Blueprint("stats", __name__)
 @bp.route("/api/admin/today-stats", methods=["GET"])
 @token_required
 def today_stats():
-    role          = request.user.get("role")
-    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
-    if role not in ("admin", "owner") and not has_delegated:
+    if not (_is_admin(request.user)
+            or _has_module_grant(request.user, "summary")
+            or _has_module_grant(request.user, "attendance")):
         return jsonify({"message": "Unauthorized"}), 403
 
     today    = str(datetime.now(IST).date())
@@ -88,9 +89,7 @@ def today_stats():
 @bp.route("/api/admin/attendance-summary", methods=["GET"])
 @token_required
 def attendance_summary():
-    role          = request.user.get("role")
-    has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
-    if role not in ("admin", "owner") and not has_delegated:
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "attendance")):
         return jsonify({"message": "Unauthorized"}), 403
 
     month_param = request.args.get("month")
