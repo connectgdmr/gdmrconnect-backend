@@ -95,6 +95,13 @@ def _ats_scope_query(user):
     dept_lower = " ".join(d.lower() for d in depts)
     if role in ("admin", "owner") or "hr" in dept_lower or "human resource" in dept_lower:
         return {}
+    # A "Recruitment" (ats) Grant Access delegation is meant to give
+    # admin-equivalent visibility for that feature, not just the delegate's
+    # own department — otherwise candidates outside their department (i.e.
+    # most of them) silently disappear even though _ats_allowed() lets the
+    # request through.
+    if _has_module_grant(user, "ats"):
+        return {}
     return {"department": {"$in": depts}}
 
 
