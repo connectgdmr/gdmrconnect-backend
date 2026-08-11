@@ -106,7 +106,7 @@ def attendance_summary():
 
     employees = list(users_col.find(
         {"role": {"$in": ["employee", "manager"]}},
-        {"name": 1, "joined_at": 1, "resignation": 1, "extended_leaves": 1}
+        {"name": 1, "doj": 1, "resignation": 1, "extended_leaves": 1}
     ))
     emp_names = {str(e["_id"]): e.get("name", "") for e in employees}
 
@@ -147,7 +147,7 @@ def attendance_summary():
 
         for emp in employees:
             uid    = str(emp["_id"])
-            joined = _date_str(emp.get("joined_at"))
+            joined = _date_str(emp.get("doj"))
             if joined and day_str < joined:
                 continue
             resignation = emp.get("resignation") or {}

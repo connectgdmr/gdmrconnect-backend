@@ -929,25 +929,42 @@ def ats_doc_request(candidate_id):
     except Exception:
         return jsonify({"message": "Invalid ID"}), 400
 
-    candidate = ats_candidates_col.find_one({"_id": obj}, {"email": 1, "name": 1, "doc_token": 1, "documents": 1})
+    candidate = ats_candidates_col.find_one({"_id": obj}, {"email": 1, "name": 1, "doc_token": 1, "documents": 1, "resume_url": 1})
     if not candidate:
         return jsonify({"message": "Candidate not found"}), 404
 
     token         = candidate.get("doc_token") or secrets.token_urlsafe(32)
     data          = request.json or {}
     required_docs = data.get("required_docs") or DOC_CHECKLIST_DEFAULT
+    resume_url    = candidate.get("resume_url")
 
-    existing_names = {d["name"] for d in (candidate.get("documents") or [])}
+    docs = list(candidate.get("documents") or [])
+
+    # A resume uploaded at application time (candidate.resume_url) lives
+    # completely separately from the documents checklist — without this,
+    # "Resume / CV" always shows Pending on the checklist even when the
+    # candidate already has one on file. Auto-fulfil it here instead of
+    # asking them to upload the same file again.
+    if resume_url and "Resume / CV" in required_docs:
+        matched = False
+        for d in docs:
+            if d.get("name") == "Resume / CV" and not d.get("url"):
+                d.update({"url": resume_url, "status": "Submitted"})
+                matched = True
+        if not matched and not any(d.get("name") == "Resume / CV" for d in docs):
+            docs.append({"name": "Resume / CV", "url": resume_url, "status": "Submitted", "required": True, "uploaded_at": datetime.now(timezone.utc)})
+
+    existing_names = {d.get("name") for d in docs}
     new_entries    = [
         {"name": doc, "url": None, "status": "Pending", "required": True}
         for doc in required_docs if doc not in existing_names
     ]
+    docs.extend(new_entries)
 
     now = datetime.now(timezone.utc)
     ats_candidates_col.update_one(
         {"_id": obj},
-        {"$set": {"doc_token": token, "updated_at": now},
-         "$push": {"documents": {"$each": new_entries}}},
+        {"$set": {"doc_token": token, "documents": docs, "updated_at": now}},
     )
 
     upload_link = f"https://www.gdmrconnect.com/documents/{token}"
