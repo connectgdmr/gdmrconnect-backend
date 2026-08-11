@@ -726,20 +726,30 @@ def _auto_onboard_employee(candidate: dict, actor_id: str):
     doj = candidate.get("joining_date") or str(datetime.now(IST).date())
 
     documents = []
+    doc_names_added = set()
     if candidate.get("resume_url"):
         documents.append({
             "id": secrets.token_hex(8), "name": "Resume / CV",
             "url": candidate["resume_url"], "uploaded_at": now,
             "uploaded_by": actor_id, "source": "ats",
         })
+        doc_names_added.add("Resume / CV")
     for d in candidate.get("documents") or []:
         if not d.get("url"):
             continue
+        # The checklist can carry its own "Resume / CV" entry (auto-filled
+        # from resume_url when a doc request is sent — see ats_doc_request)
+        # — skip it here so it isn't copied a second time alongside the one
+        # already added above from candidate.resume_url directly.
+        doc_display_name = d.get("name") or "Document"
+        if doc_display_name in doc_names_added:
+            continue
         documents.append({
-            "id": secrets.token_hex(8), "name": d.get("name") or "Document",
+            "id": secrets.token_hex(8), "name": doc_display_name,
             "url": d["url"], "uploaded_at": d.get("uploaded_at") or now,
             "uploaded_by": actor_id, "source": "ats",
         })
+        doc_names_added.add(doc_display_name)
 
     # Employment Type / Contract Duration, set on the candidate record (Add/Edit
     # Candidate form). Falls back to Permanent if unset or invalid — this is an
@@ -1059,7 +1069,12 @@ def ats_upload_resume():
 
     try:
         import cloudinary.uploader as _cu
-        result     = _cu.upload(file, resource_type="raw", folder="ats_resumes")
+        # use_filename/unique_filename preserve the original extension in the
+        # delivered URL (e.g. "...ats_resumes/resume_ab12cd.docx") — without
+        # them Cloudinary generates a bare public_id with NO extension at
+        # all, which is why "View" couldn't tell the browser what kind of
+        # file it was and just downloaded a nameless blob.
+        result     = _cu.upload(file, resource_type="raw", folder="ats_resumes", use_filename=True, unique_filename=True)
         resume_url = result.get("secure_url", "")
     except Exception as e:
         return jsonify({"message": f"Upload failed: {str(e)}"}), 500
@@ -1218,19 +1233,19 @@ def ats_upload_doc(doc_token):
         if emp_obj:
             emp = users_col.find_one({"_id": emp_obj}, {"documents": 1})
             if emp is not None:
-                emp_doc = {
-                    "id": secrets.token_hex(8), "name": doc_name, "url": url,
-                    "uploaded_at": now, "uploaded_by": "candidate", "source": "ats",
-                }
-                existing_docs = emp.get("documents") or []
-                match = next((d for d in existing_docs if d.get("name") == doc_name), None)
-                if match:
-                    users_col.update_one(
-                        {"_id": emp_obj, "documents.id": match.get("id")},
-                        {"$set": {"documents.$.url": url, "documents.$.uploaded_at": now}},
-                    )
-                else:
-                    users_col.update_one({"_id": emp_obj}, {"$push": {"documents": emp_doc}})
+                emp_docs = list(emp.get("documents") or [])
+                matched  = False
+                for d in emp_docs:
+                    if d.get("name") == doc_name:
+                        d.update({"url": url, "uploaded_at": now})
+                        matched = True
+                        break
+                if not matched:
+                    emp_docs.append({
+                        "id": secrets.token_hex(8), "name": doc_name, "url": url,
+                        "uploaded_at": now, "uploaded_by": "candidate", "source": "ats",
+                    })
+                users_col.update_one({"_id": emp_obj}, {"$set": {"documents": emp_docs}})
 
     safe_docs = []
     for d in docs:
