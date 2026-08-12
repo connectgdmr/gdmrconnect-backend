@@ -269,8 +269,11 @@ def apply_leave():
 @bp.route("/api/admin/leaves", methods=["GET"])
 @token_required
 def admin_view_leaves():
-    role          = request.user.get("role")
-    has_delegated = _has_module_grant(request.user, "leaves")
+    role = request.user.get("role")
+    # A read-only "Attendance" grant needs this too — the Attendance page's
+    # "On Leave Today" stat and its detail modal both call this endpoint.
+    # Writes (approve/reject in update_leave below) stay gated to "leaves" only.
+    has_delegated = _has_module_grant(request.user, "leaves") or _has_module_grant(request.user, "attendance")
     if role not in ["admin", "owner", "manager"] and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 

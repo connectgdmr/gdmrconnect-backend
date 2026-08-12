@@ -198,7 +198,12 @@ def add_employee():
 @bp.route("/api/admin/employees", methods=["GET"])
 @token_required
 def list_employees():
-    if not (_is_admin(request.user) or _has_module_grant(request.user, "employees")):
+    # A read-only "Attendance" grant needs the roster too — AdminAttendancePage
+    # uses this endpoint to build its employee grid and to resolve names for
+    # the Present/Absent/Not-Checked-In detail modals.
+    if not (_is_admin(request.user)
+            or _has_module_grant(request.user, "employees")
+            or _has_module_grant(request.user, "attendance")):
         return jsonify({"message": "Unauthorized access."}), 403
 
     emp_query: dict = {"role": {"$in": ["employee", "manager", "owner"]}}
