@@ -13,7 +13,7 @@ from bson import ObjectId
 
 from database import (
     users_col, access_grants_col, attendance_col, leaves_col,
-    pms_reviews_col, corrections_col, departments_col,
+    pms_reviews_col, corrections_col, departments_col, ats_candidates_col,
 )
 from decorators import token_required
 from extensions import bcrypt
@@ -337,7 +337,28 @@ def update_department(dept_id):
         old_name       = dept["name"]
         update["name"] = new_name
         if old_name != new_name:
-            users_col.update_many({"department": old_name}, {"$set": {"department": new_name}})
+            # Propagate the rename to every affected employee/manager.
+            # department can be a plain string OR a list (managers of
+            # multiple departments) — a bare update_many($set) would match
+            # array fields too (Mongo's regex-on-array semantics) but then
+            # overwrite the WHOLE array with a single string, silently
+            # dropping their other departments. Match case/whitespace-
+            # tolerantly (same rule create/rename already use for name
+            # clashes) and replace only the matching element per document.
+            name_re = {"$regex": f"^{re.escape(old_name)}$", "$options": "i"}
+            for u in users_col.find({"department": name_re}, {"department": 1}):
+                dv = u.get("department")
+                if isinstance(dv, list):
+                    new_dv = [new_name if isinstance(d, str) and d.strip().lower() == old_name.strip().lower() else d for d in dv]
+                else:
+                    new_dv = new_name
+                users_col.update_one({"_id": u["_id"]}, {"$set": {"department": new_dv}})
+
+            # Also update any ATS candidate still carrying the old name —
+            # otherwise editing that candidate later (for any unrelated
+            # reason) re-syncs the stale department right back onto their
+            # linked employee record via _sync_candidate_to_employee.
+            ats_candidates_col.update_many({"department": name_re}, {"$set": {"department": new_name}})
 
     if "description" in data:
         update["description"] = str(data["description"]).strip()
