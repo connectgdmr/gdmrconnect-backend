@@ -215,7 +215,11 @@ def list_employees():
         ]
 
     all_users = list(users_col.find(emp_query, {"password": 0}))
-    managers  = {str(u["_id"]): u["name"] for u in all_users if u.get("role") == "manager"}
+    # Owners can be assigned as a manager too (see update_manager_role, which
+    # promotes manager -> owner) — list_managers() already includes both
+    # roles for the "Assigned Manager" dropdown; this lookup must match or
+    # anyone assigned to an owner shows "Unassigned" here despite saving fine.
+    managers  = {str(u["_id"]): u["name"] for u in all_users if u.get("role") in ("manager", "owner")}
 
     rows = []
     for u in all_users:
