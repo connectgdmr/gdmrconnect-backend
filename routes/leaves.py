@@ -236,6 +236,40 @@ def apply_leave():
     if f_date < max_past_date:
         return jsonify({"message": "Leave application for past dates is limited to 7 days."}), 400
 
+    # Block duplicate/overlapping leave requests for the same employee.
+    # The one legitimate way two records can share a date is a half-day
+    # "First Half" leave paired with a half-day "Second Half" leave on
+    # that exact same single day — everything else that overlaps an
+    # existing Pending/Approved request is rejected.
+    uid = str(request.user["_id"])
+    existing = leaves_col.find(
+        {
+            "user_id":   uid,
+            "status":    {"$in": ["Pending", "Approved"]},
+            "from_date": {"$lte": to_date},
+            "to_date":   {"$gte": from_date},
+        },
+        {"from_date": 1, "to_date": 1, "type": 1, "period": 1, "status": 1},
+    )
+    for ex in existing:
+        same_single_day = (
+            from_date == to_date
+            and ex.get("from_date") == ex.get("to_date") == from_date
+        )
+        distinct_half_day_pair = (
+            same_single_day
+            and leave_type == "half" and ex.get("type") == "half"
+            and period and ex.get("period")
+            and period != ex.get("period")
+        )
+        if distinct_half_day_pair:
+            continue
+        return jsonify({
+            "message": f"You already have a {ex.get('status', 'Pending').lower()} leave request covering "
+                       f"{ex.get('from_date')}"
+                       f"{' to ' + ex.get('to_date') if ex.get('to_date') != ex.get('from_date') else ''}."
+        }), 409
+
     attachment_url = None
     file = request.files.get("attachment")
     if file:
