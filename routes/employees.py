@@ -238,7 +238,12 @@ def list_employees():
 @bp.route("/api/admin/managers", methods=["GET"])
 @token_required
 def list_managers():
-    if not (_is_admin(request.user) or _has_module_grant(request.user, "manager")):
+    # Read-only: "employees" also needs this for EmployeeForm's "Assigned
+    # Manager" dropdown when adding/editing staff — same rationale as the
+    # "ats" additions to list_employees()/list_departments() above.
+    if not (_is_admin(request.user)
+            or _has_module_grant(request.user, "manager")
+            or _has_module_grant(request.user, "employees")):
         return jsonify({"message": "Unauthorized"}), 403
     managers = []
     for m in users_col.find({"role": {"$in": ["manager", "owner"]}}, {"password": 0}):
