@@ -122,6 +122,74 @@ def is_offboarded(user_doc):
     return lwd_date < _today_ist()
 
 
+# ── Attendance day classification ───────────────────────────────────────────
+
+def _date_str(val):
+    """Normalize a Mongo date value (datetime or already-a-string) to 'YYYY-MM-DD', or None."""
+    if val is None:
+        return None
+    if hasattr(val, "date"):
+        return val.date().isoformat()
+    return str(val)[:10]
+
+
+def classify_attendance_day(emp, day_str, day_checkins, leaves_by_uid, is_weekend, is_today):
+    """
+    Single source of truth for "what was this employee's status on this day" —
+    extracted verbatim from routes/stats.py's attendance_summary() so it and
+    the monthly attendance calendar (routes/calendar.py) share one
+    implementation and can never drift apart.
+
+    Returns "present" | "leave" | "absent" | "not_checked_in" | None.
+    None means this employee doesn't belong in any bucket for this day: not
+    yet joined, already offboarded, or a weekend/day off with nothing recorded.
+
+    Args:
+        emp:            employee doc with at least _id, doj, resignation,
+                        extended_leaves.
+        day_str:        the day being classified, "YYYY-MM-DD".
+        day_checkins:   set of user_id strings who checked in on this day.
+        leaves_by_uid:  {user_id: [leave_doc, ...]} — standard (leaves_col)
+                        leave requests overlapping the period, already
+                        pre-filtered to non-Rejected/Cancelled by the caller.
+        is_weekend:     whether day_str falls on Sat/Sun.
+        is_today:       whether day_str is "today" in IST — a missing
+                        check-in today reads as "not_checked_in" (still
+                        pending), not "absent", until the day has passed.
+    """
+    uid    = str(emp["_id"])
+    joined = _date_str(emp.get("doj"))
+    if joined and day_str < joined:
+        return None
+    resignation = emp.get("resignation") or {}
+    lwd = _date_str(resignation.get("last_working_day"))
+    if lwd and day_str > lwd:
+        return None
+
+    if uid in day_checkins:
+        return "present"
+
+    on_leave = any(
+        lv.get("from_date", "") <= day_str <= lv.get("to_date", "")
+        for lv in leaves_by_uid.get(uid, [])
+    )
+    if not on_leave:
+        for el in (emp.get("extended_leaves") or []):
+            el_from = _date_str(el.get("from_date"))
+            el_to   = _date_str(el.get("to_date"))
+            if el_from and el_to and el_from <= day_str <= el_to:
+                on_leave = True
+                break
+    if on_leave:
+        return "leave"
+
+    if is_today:
+        return "not_checked_in"
+    if not is_weekend:
+        return "absent"
+    return None
+
+
 # ── Employment type helpers ─────────────────────────────────────────────────
 
 def parse_employment_type(data):

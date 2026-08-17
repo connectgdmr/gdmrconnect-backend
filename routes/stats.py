@@ -10,7 +10,7 @@ from bson import ObjectId
 
 from database import (attendance_col, leaves_col, users_col)
 from decorators import token_required
-from helpers import _is_admin, _has_module_grant
+from helpers import _is_admin, _has_module_grant, classify_attendance_day
 from config import IST
 
 bp = Blueprint("stats", __name__)
@@ -109,13 +109,6 @@ def attendance_summary():
     ))
     emp_names = {str(e["_id"]): e.get("name", "") for e in employees}
 
-    def _date_str(val):
-        if val is None:
-            return None
-        if hasattr(val, "date"):
-            return val.date().isoformat()
-        return str(val)[:10]
-
     all_recs = attendance_col.find({"date": {"$regex": f"^{month_param}"}, "type": "checkin"})
     checkins_by_date: dict = {}
     for rec in all_recs:
@@ -146,37 +139,16 @@ def attendance_summary():
 
         for emp in employees:
             uid    = str(emp["_id"])
-            joined = _date_str(emp.get("doj"))
-            if joined and day_str < joined:
-                continue
-            resignation = emp.get("resignation") or {}
-            lwd = _date_str(resignation.get("last_working_day"))
-            if lwd and day_str > lwd:
-                continue
-
-            if uid in day_checkins:
+            status = classify_attendance_day(emp, day_str, day_checkins, leaves_by_uid, is_weekend, is_today)
+            if status == "present":
                 present_ids.append(uid)
-                continue
-
-            on_leave = any(
-                lv.get("from_date", "") <= day_str <= lv.get("to_date", "")
-                for lv in leaves_by_uid.get(uid, [])
-            )
-            if not on_leave:
-                for el in (emp.get("extended_leaves") or []):
-                    el_from = _date_str(el.get("from_date"))
-                    el_to   = _date_str(el.get("to_date"))
-                    if el_from and el_to and el_from <= day_str <= el_to:
-                        on_leave = True
-                        break
-            if on_leave:
+            elif status == "leave":
                 leave_ids.append(uid)
-                continue
-
-            if is_today:
+            elif status == "not_checked_in":
                 nci_ids.append(uid)
-            elif not is_weekend:
+            elif status == "absent":
                 absent_ids.append(uid)
+            # status is None: not yet joined / already offboarded / weekend with nothing recorded — no bucket
 
         def _names(ids):
             return [emp_names[uid] for uid in ids if emp_names.get(uid)]

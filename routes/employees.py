@@ -23,6 +23,25 @@ from config import IST
 
 bp = Blueprint("employees", __name__)
 
+# Employee document taxonomy — the categories the HRIS spec calls out
+# explicitly, plus "Other" as a catch-all. Documents predating this list
+# (or uploaded without a type) default to "Other" rather than failing.
+DOCUMENT_TYPES = [
+    "Personal / ID Proof",
+    "Educational Certificate",
+    "Professional Certificate",
+    "Previous Company Payslip",
+    "Experience Certificate",
+    "Offer Letter",
+    "Appointment Letter",
+    "Confirmation Letter",
+    "Increment / Salary Revision Letter",
+    "Promotion Letter",
+    "Warning / Memo Letter",
+    "Training Certificate",
+    "Other",
+]
+
 
 # ── Admin management ──────────────────────────────────────────────────────────
 
@@ -491,6 +510,14 @@ def upload_employee_document(emp_id):
     if not doc_name or not file:
         return jsonify({"message": "name and file are required"}), 400
 
+    doc_type = (request.form.get("type") or "").strip()
+    if doc_type and doc_type not in DOCUMENT_TYPES:
+        return jsonify({"message": f"type must be one of: {', '.join(DOCUMENT_TYPES)}"}), 400
+    doc_type = doc_type or "Other"
+
+    expiry_raw  = request.form.get("expiry_date")
+    expiry_date = str(expiry_raw)[:10] if expiry_raw else None
+
     file.seek(0, 2)
     if file.tell() > 15 * 1024 * 1024:
         return jsonify({"message": "File too large (max 15 MB)"}), 400
@@ -509,10 +536,13 @@ def upload_employee_document(emp_id):
     doc = {
         "id":          secrets.token_hex(8),
         "name":        doc_name,
+        "type":        doc_type,
         "url":         url,
+        "expiry_date": expiry_date,
         "uploaded_at": now,
         "uploaded_by": str(request.user["_id"]),
         "source":      "manual",
+        "history":     [],
     }
     users_col.update_one({"_id": obj}, {"$push": {"documents": doc}})
     doc["uploaded_at"] = doc["uploaded_at"].isoformat()
@@ -530,6 +560,82 @@ def delete_employee_document(emp_id, doc_id):
         return jsonify({"message": "Invalid ID"}), 400
     users_col.update_one({"_id": obj}, {"$pull": {"documents": {"id": doc_id}}})
     return jsonify({"message": "Document removed."}), 200
+
+
+@bp.route("/api/admin/employees/<emp_id>/documents/<doc_id>/replace", methods=["PUT"])
+@token_required
+def replace_employee_document(emp_id, doc_id):
+    """Upload a new file version for an existing document entry, keeping the
+    previous version in that entry's history[] instead of losing it (the old
+    delete-then-reupload flow had no version trail at all)."""
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "employees", write=True)):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(emp_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+
+    emp = users_col.find_one({"_id": obj, "documents.id": doc_id}, {"documents.$": 1})
+    if not emp or not emp.get("documents"):
+        return jsonify({"message": "Document not found"}), 404
+    old_doc = emp["documents"][0]
+
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"message": "file is required"}), 400
+    file.seek(0, 2)
+    if file.tell() > 15 * 1024 * 1024:
+        return jsonify({"message": "File too large (max 15 MB)"}), 400
+    file.seek(0)
+
+    try:
+        res = cloudinary.uploader.upload(
+            file, resource_type="auto", folder=f"gdmr/employee_docs/{emp_id}",
+            use_filename=True, unique_filename=True,
+        )
+        url = res.get("secure_url")
+    except Exception as e:
+        return jsonify({"message": f"Upload failed: {str(e)}"}), 500
+
+    now = datetime.now(timezone.utc)
+    expiry_raw  = request.form.get("expiry_date")
+    expiry_date = str(expiry_raw)[:10] if expiry_raw else old_doc.get("expiry_date")
+
+    prior_version = {
+        "url":         old_doc.get("url"),
+        "uploaded_at": old_doc.get("uploaded_at"),
+        "uploaded_by": old_doc.get("uploaded_by"),
+    }
+    uploaded_by = str(request.user["_id"])
+
+    users_col.update_one(
+        {"_id": obj, "documents.id": doc_id},
+        {
+            "$set": {
+                "documents.$.url":         url,
+                "documents.$.expiry_date": expiry_date,
+                "documents.$.uploaded_at": now,
+                "documents.$.uploaded_by": uploaded_by,
+            },
+            "$push": {"documents.$.history": prior_version},
+        },
+    )
+
+    # Return the updated document entry so the frontend can patch its local
+    # copy directly, instead of re-fetching the whole employee roster.
+    updated_doc = {
+        **old_doc,
+        "url":         url,
+        "expiry_date": expiry_date,
+        "uploaded_at": now.isoformat(),
+        "uploaded_by": uploaded_by,
+        "history":     (old_doc.get("history") or []) + [{
+            "url":         prior_version["url"],
+            "uploaded_at": prior_version["uploaded_at"].isoformat() if hasattr(prior_version["uploaded_at"], "isoformat") else prior_version["uploaded_at"],
+            "uploaded_by": prior_version["uploaded_by"],
+        }],
+    }
+    return jsonify({"message": "Document replaced.", "document": updated_doc}), 200
 
 
 @bp.route("/api/admin/employees/<emp_id>/promote", methods=["PUT"])
