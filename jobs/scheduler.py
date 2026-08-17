@@ -7,6 +7,7 @@ APScheduler background jobs:
   - Daily work-plan summaries     (11:00 AM IST)
   - Owner HTML daily digest       (11:30 AM IST)
   - Weekly work-plan reports      (Monday 9:00 AM IST)
+  - LMS course-expiry reminders   (9:05 AM IST daily)
 """
 import threading
 import html as _html
@@ -15,7 +16,7 @@ from bson import ObjectId
 
 from database import (
     users_col, pms_reviews_col, access_grants_col,
-    work_plans_col, attendance_col,
+    work_plans_col, attendance_col, lms_courses_col, lms_progress_col,
 )
 from config import IST, OWNER_EMAILS
 from helpers import _is_task_done, _checkin_map, format_datetime_ist
@@ -364,6 +365,70 @@ def send_weekly_work_reports():
 
 
 # =============================================================================
+# LMS course-expiry reminders
+# =============================================================================
+
+def send_lms_expiry_reminders():
+    """9:05 AM IST daily — remind employees whose assigned course expires in
+    exactly 2 days and who haven't completed it yet."""
+    print("Running LMS Expiry Reminder Job...")
+    target_date = (datetime.now(IST).date() + timedelta(days=2)).isoformat()
+    courses = list(lms_courses_col.find({"expiry_date": target_date}))
+    if not courses:
+        return
+
+    for course in courses:
+        course_id = str(course["_id"])
+        title     = course.get("title", "your course")
+
+        completed_uids = {
+            r["user_id"] for r in lms_progress_col.find(
+                {"course_id": course_id, "status": "Completed"}, {"user_id": 1}
+            )
+        }
+        # Anyone with a non-completed progress row…
+        remind_uids = {
+            r["user_id"] for r in lms_progress_col.find(
+                {"course_id": course_id, "status": {"$ne": "Completed"}}, {"user_id": 1}
+            )
+        }
+        # …plus department-wide assignees who haven't opened the course yet
+        # (they get no progress row at all until their first completed lesson).
+        depts = course.get("assigned_departments") or []
+        if depts:
+            for u in users_col.find(
+                {"role": {"$in": ["employee", "manager"]}, "department": {"$in": depts}},
+                {"_id": 1}
+            ):
+                uid = str(u["_id"])
+                if uid not in completed_uids:
+                    remind_uids.add(uid)
+
+        if not remind_uids:
+            continue
+
+        uid_objs = []
+        for uid in remind_uids:
+            try: uid_objs.append(ObjectId(uid))
+            except Exception: pass
+
+        for u in users_col.find({"_id": {"$in": uid_objs}}, {"name": 1, "email": 1}):
+            if not u.get("email"):
+                continue
+            subject = f"Reminder: \"{title}\" expires in 2 days"
+            body = (
+                f"Hello {u.get('name', '')},\n\n"
+                f"This is a reminder that the course \"{title}\" assigned to you on GDMR Connect "
+                f"expires on {course.get('expiry_date')} — just 2 days from now.\n\n"
+                f"Please log in to GDMR Connect and complete it before it expires.\n"
+            )
+            try:
+                threading.Thread(target=send_email, args=(u["email"], subject, body), daemon=True).start()
+            except Exception as e:
+                print(f"LMS expiry reminder failed for {u.get('email')}: {e}")
+
+
+# =============================================================================
 # Scheduler startup — called from create_app()
 # =============================================================================
 
@@ -371,11 +436,12 @@ def start_scheduler():
     from apscheduler.schedulers.background import BackgroundScheduler
     try:
         scheduler = BackgroundScheduler(timezone=IST)
-        scheduler.add_job(func=send_pms_reminders,       trigger="cron",     hour=10, minute=0)
-        scheduler.add_job(func=auto_expire_grants,        trigger="interval", minutes=30)
-        scheduler.add_job(func=send_daily_work_summaries, trigger="cron",     hour=11, minute=0)
-        scheduler.add_job(func=send_owner_daily_digest,   trigger="cron",     hour=11, minute=30)
-        scheduler.add_job(func=send_weekly_work_reports,  trigger="cron",     day_of_week="mon", hour=9, minute=0)
+        scheduler.add_job(func=send_pms_reminders,        trigger="cron",     hour=10, minute=0)
+        scheduler.add_job(func=auto_expire_grants,         trigger="interval", minutes=30)
+        scheduler.add_job(func=send_daily_work_summaries,  trigger="cron",     hour=11, minute=0)
+        scheduler.add_job(func=send_owner_daily_digest,    trigger="cron",     hour=11, minute=30)
+        scheduler.add_job(func=send_weekly_work_reports,   trigger="cron",     day_of_week="mon", hour=9, minute=0)
+        scheduler.add_job(func=send_lms_expiry_reminders,  trigger="cron",     hour=9, minute=5)
         scheduler.start()
         print("Background Job Scheduler initialized successfully.")
     except Exception as e:

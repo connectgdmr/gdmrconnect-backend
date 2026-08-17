@@ -3,6 +3,7 @@ routes/lms.py — GDMR Connect
 ================================
 Learning Management System: admin courses, manager courses, employee learning.
 """
+import threading
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
@@ -12,6 +13,7 @@ from database import (lms_courses_col, lms_progress_col,
 from decorators import token_required
 from helpers import _is_admin, _mgr_depts, _today_ist
 from config import IST
+from utils import send_email
 
 bp = Blueprint("lms", __name__)
 
@@ -58,6 +60,47 @@ def _normalize_modules(modules):
             elif l.get("_id"):
                 l["_id"] = str(l["_id"])
     return modules
+
+
+def _notify_course_assigned(employee_ids, course_title, expiry_date, scheduled_at=None):
+    """Fire-and-forget email to each newly-assigned employee. Looks up
+    name/email itself so both the admin and manager assign endpoints can
+    share this without duplicating the lookup + email copy."""
+    if not employee_ids:
+        return
+    uid_objs = []
+    for uid in employee_ids:
+        try:
+            uid_objs.append(ObjectId(uid))
+        except Exception:
+            pass
+    if not uid_objs:
+        return
+
+    starts_line = ""
+    if scheduled_at:
+        sched = scheduled_at
+        if sched.tzinfo is None:
+            sched = sched.replace(tzinfo=timezone.utc)
+        starts_line = f"It becomes available to you on {sched.astimezone(IST).strftime('%d %b %Y, %I:%M %p')} IST.\n"
+
+    expiry_line = f"Please complete it before it expires on {expiry_date}.\n" if expiry_date else ""
+
+    for u in users_col.find({"_id": {"$in": uid_objs}}, {"name": 1, "email": 1}):
+        if not u.get("email"):
+            continue
+        subject = f"New Course Assigned: {course_title}"
+        body = (
+            f"Hello {u.get('name', '')},\n\n"
+            f"You've been assigned a new course on GDMR Connect: \"{course_title}\".\n"
+            f"{starts_line}"
+            f"{expiry_line}\n"
+            f"Log in to GDMR Connect to start learning.\n"
+        )
+        try:
+            threading.Thread(target=send_email, args=(u["email"], subject, body), daemon=True).start()
+        except Exception as e:
+            print(f"LMS assignment email failed for {u.get('email')}: {e}")
 
 
 # ── Admin endpoints ──────────────────────────────────────────────────────────
@@ -156,7 +199,8 @@ def assign_course(course_id):
         course_obj = ObjectId(course_id)
     except Exception:
         return jsonify({"message": "Invalid course ID"}), 400
-    if not lms_courses_col.find_one({"_id": course_obj}):
+    course_doc = lms_courses_col.find_one({"_id": course_obj})
+    if not course_doc:
         return jsonify({"message": "Course not found"}), 404
 
     data             = request.json or {}
@@ -195,6 +239,7 @@ def assign_course(course_id):
 
     now = datetime.now(timezone.utc)
     assigned = skipped = 0
+    newly_assigned_ids = []
     for uid in employee_ids:
         try:
             result = lms_progress_col.update_one(
@@ -212,10 +257,14 @@ def assign_course(course_id):
             )
             if result.upserted_id:
                 assigned += 1
+                newly_assigned_ids.append(uid)
             else:
                 skipped += 1
         except Exception:
             pass
+
+    _notify_course_assigned(newly_assigned_ids, course_doc.get("title", "this course"),
+                             course_doc.get("expiry_date"), scheduled_at)
 
     msg = f"Course assigned to {assigned} employee(s)"
     if skipped:
@@ -421,6 +470,7 @@ def manager_assign_course(course_id):
 
     now = datetime.now(timezone.utc)
     assigned = skipped = 0
+    newly_assigned_ids = []
     for uid in employee_ids:
         try:
             result = lms_progress_col.update_one(
@@ -438,10 +488,14 @@ def manager_assign_course(course_id):
             )
             if result.upserted_id:
                 assigned += 1
+                newly_assigned_ids.append(uid)
             else:
                 skipped += 1
         except Exception:
             pass
+
+    _notify_course_assigned(newly_assigned_ids, course.get("title", "this course"),
+                             course.get("expiry_date"), scheduled_at)
 
     msg = f"Course assigned to {assigned} employee(s)"
     if skipped:
