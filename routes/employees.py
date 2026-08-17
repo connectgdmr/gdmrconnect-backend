@@ -200,10 +200,12 @@ def add_employee():
 def list_employees():
     # A read-only "Attendance" grant needs the roster too — AdminAttendancePage
     # uses this endpoint to build its employee grid and to resolve names for
-    # the Present/Absent/Not-Checked-In detail modals.
+    # the Present/Absent/Not-Checked-In detail modals. Same for "ats" (Recruitment)
+    # — AdminATS's Add Candidate form needs it for the Sourced By / Department pickers.
     if not (_is_admin(request.user)
             or _has_module_grant(request.user, "employees")
-            or _has_module_grant(request.user, "attendance")):
+            or _has_module_grant(request.user, "attendance")
+            or _has_module_grant(request.user, "ats")):
         return jsonify({"message": "Unauthorized access."}), 403
 
     emp_query: dict = {"role": {"$in": ["employee", "manager", "owner"]}}
@@ -272,7 +274,11 @@ def update_manager_role(man_id):
 @bp.route("/api/admin/departments", methods=["GET"])
 @token_required
 def list_departments():
-    if not (_is_admin(request.user) or _has_module_grant(request.user, "departments")):
+    # Read-only: "ats" (Recruitment) also needs this for the Add Candidate
+    # form's Department dropdown — same rationale as list_employees() above.
+    if not (_is_admin(request.user)
+            or _has_module_grant(request.user, "departments")
+            or _has_module_grant(request.user, "ats")):
         return jsonify({"message": "Unauthorized"}), 403
     depts = []
     for d in departments_col.find().sort("name", 1):
