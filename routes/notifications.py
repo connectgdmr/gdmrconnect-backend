@@ -47,6 +47,12 @@ def get_notification_counts():
         counts["assets"] = assets_col.count_documents({
             "status": "Pending", "admin_status": "Pending"
         })
+        # Manager/admin/owner-submitted corrections are routed to admin for
+        # approval (see request_correction() in announcements.py) — same
+        # "Pending" badge pattern as leaves/assets above.
+        counts["corrections"] = corrections_col.count_documents({
+            "approval_target": "admin", "status": "Pending"
+        })
 
     return jsonify(counts), 200
 
