@@ -156,6 +156,8 @@ def add_employee():
     position      = data.get("position", "")
     manager_id    = data.get("manager_id")
     doj           = data.get("doj", "")
+    confirmation_date = data.get("confirmation_date", "")
+    promotion_date    = data.get("promotion_date", "")
     employee_code = (data.get("employee_code") or "").strip()
 
     if not name or not email:
@@ -175,6 +177,7 @@ def add_employee():
         "name": name, "email": email, "phone": phone,
         "password_changed": False, "role": "employee",
         "department": department, "position": position, "doj": doj,
+        "confirmation_date": confirmation_date, "promotion_date": promotion_date,
         "employee_code": employee_code, "created_at": datetime.now(timezone.utc),
         "manager_id": manager_id, "shift": shift,
         "late_checkin_count_monthly": 0, "last_late_checkin_month": None,
