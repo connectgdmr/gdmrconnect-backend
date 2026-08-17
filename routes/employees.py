@@ -477,7 +477,8 @@ def edit_employee(emp_id):
         return jsonify({"message": "Unauthorized"}), 403
     data   = request.json
     update = {}
-    for k in ["name", "department", "position", "email", "phone", "manager_id", "shift", "doj", "employee_code"]:
+    for k in ["name", "department", "position", "email", "phone", "manager_id", "shift", "doj", "employee_code",
+              "confirmation_date", "promotion_date"]:
         if k in data:
             update[k] = data[k]
     if "manager_id" in data and not data["manager_id"]:
