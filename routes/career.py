@@ -29,6 +29,22 @@ def _normalize_requirements(raw):
     return [str(item).strip() for item in items if str(item).strip()]
 
 
+def _read_status(raw):
+    """Tolerant read: only an explicit 'closed' (any case) reads as closed —
+    everything else (including legacy 'Open' rows predating this fix, or a
+    missing field) reads as active. Avoids needing a one-off DB migration."""
+    return "closed" if str(raw or "").strip().lower() == "closed" else "active"
+
+
+def _to_int_or_none(v):
+    if v in (None, ""):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 # ── Admin endpoints ──────────────────────────────────────────────────────────
 
 @bp.route("/api/admin/career/jobs", methods=["GET"])
@@ -38,8 +54,10 @@ def list_jobs():
         return jsonify({"message": "Unauthorized"}), 403
     rows = []
     for j in career_jobs_col.find().sort("created_at", -1):
-        j["_id"]          = str(j["_id"])
-        j["requirements"] = _normalize_requirements(j.get("requirements"))
+        j["_id"]            = str(j["_id"])
+        j["requirements"]   = _normalize_requirements(j.get("requirements"))
+        j["status"]         = _read_status(j.get("status"))
+        j["employment_type"] = j.get("employment_type") or "Full-time"
         rows.append(j)
     return jsonify(rows), 200
 
@@ -53,15 +71,21 @@ def create_job():
     title = str(data.get("title", "")).strip()
     if not title:
         return jsonify({"message": "title is required"}), 400
+    status = str(data.get("status", "active")).strip().lower()
+    if status not in ("active", "closed"):
+        return jsonify({"message": "status must be 'active' or 'closed'"}), 400
     doc = {
-        "title":        title,
-        "department":   str(data.get("department",  "")).strip(),
-        "description":  str(data.get("description", "")).strip(),
-        "requirements": _normalize_requirements(data.get("requirements")),
-        "type":         data.get("type", "Full-time"),
-        "status":       "Open",
-        "created_by":   str(request.user["_id"]),
-        "created_at":   datetime.now(timezone.utc),
+        "title":           title,
+        "department":      str(data.get("department",  "")).strip(),
+        "location":        str(data.get("location",    "")).strip(),
+        "employment_type": str(data.get("employment_type", "Full-time")).strip() or "Full-time",
+        "description":     str(data.get("description", "")).strip(),
+        "requirements":    _normalize_requirements(data.get("requirements")),
+        "salary_min":      _to_int_or_none(data.get("salary_min")),
+        "salary_max":      _to_int_or_none(data.get("salary_max")),
+        "status":          status,
+        "created_by":      str(request.user["_id"]),
+        "created_at":      datetime.now(timezone.utc),
     }
     res       = career_jobs_col.insert_one(doc)
     doc["_id"] = str(res.inserted_id)
@@ -79,13 +103,21 @@ def update_job(job_id):
         return jsonify({"message": "Invalid ID"}), 400
     data   = request.json or {}
     update = {"updated_at": datetime.now(timezone.utc)}
-    for k in ["title", "department", "description", "type", "status"]:
+    for k in ["title", "department", "location", "employment_type", "description"]:
         if k in data:
-            update[k] = data[k]
+            update[k] = str(data[k] or "").strip()
+    for k in ["salary_min", "salary_max"]:
+        if k in data:
+            update[k] = _to_int_or_none(data.get(k))
     if "requirements" in data:
         update["requirements"] = _normalize_requirements(data.get("requirements"))
-    if "status" in update and update["status"] not in ("Open", "Closed"):
-        return jsonify({"message": "status must be 'Open' or 'Closed'"}), 400
+    if "status" in data:
+        status = str(data["status"]).strip().lower()
+        if status not in ("active", "closed"):
+            return jsonify({"message": "status must be 'active' or 'closed'"}), 400
+        update["status"] = status
+    if "title" in update and not update["title"]:
+        return jsonify({"message": "title cannot be blank"}), 400
     result = career_jobs_col.update_one({"_id": obj}, {"$set": update})
     if result.matched_count == 0:
         return jsonify({"message": "Job not found"}), 404
@@ -117,6 +149,12 @@ def admin_list_referrals():
     rows   = []
     for r in referrals_col.find(query).sort("submitted_at", -1):
         r["_id"] = str(r["_id"])
+        # Backward-compat for any referrals submitted before the field/status
+        # rename (referrer_name -> referred_by_name, Pending -> New).
+        if not r.get("referred_by_name") and r.get("referrer_name"):
+            r["referred_by_name"] = r["referrer_name"]
+        if r.get("status") == "Pending":
+            r["status"] = "New"
         rows.append(r)
     return jsonify(rows), 200
 
@@ -132,7 +170,9 @@ def update_referral(referral_id):
         return jsonify({"message": "Invalid ID"}), 400
     data           = request.json or {}
     status         = data.get("status")
-    valid_statuses = {"Pending", "Reviewed", "Shortlisted", "Rejected", "Hired"}
+    # Must match the admin UI's REF_STATUSES exactly, or "New"/"Interview" picks
+    # in the dropdown fail with a 400 the UI doesn't surface.
+    valid_statuses = {"New", "Shortlisted", "Interview", "Hired", "Rejected"}
     if not status or status not in valid_statuses:
         return jsonify({"message": f"status must be one of: {', '.join(sorted(valid_statuses))}"}), 400
     result = referrals_col.update_one(
@@ -164,7 +204,9 @@ def submit_referral():
         return jsonify({"message": "job_id, candidate_name, and candidate_email are required"}), 400
 
     try:
-        job = career_jobs_col.find_one({"_id": ObjectId(job_id), "status": "Open"})
+        # Tolerant match: accept "active" (current scheme), "Open" (legacy),
+        # or a missing status field — anything that isn't explicitly closed.
+        job = career_jobs_col.find_one({"_id": ObjectId(job_id), "status": {"$nin": ["closed", "Closed"]}})
     except Exception:
         return jsonify({"message": "Invalid job ID"}), 400
     if not job:
@@ -197,18 +239,18 @@ def submit_referral():
             return jsonify({"message": "Resume upload failed. Please try again."}), 500
 
     doc = {
-        "job_id":          job_id,
-        "job_title":       job.get("title", ""),
-        "referred_by":     str(request.user["_id"]),
-        "referrer_name":   request.user.get("name", ""),
-        "candidate_name":  candidate_name,
-        "candidate_email": candidate_email,
-        "candidate_phone": candidate_phone,
-        "resume_url":      resume_link,
-        "resume_file_url": resume_file_url,
-        "notes":           notes,
-        "status":          "Pending",
-        "submitted_at":    datetime.now(timezone.utc),
+        "job_id":            job_id,
+        "job_title":         job.get("title", ""),
+        "referred_by":       str(request.user["_id"]),
+        "referred_by_name":  request.user.get("name", ""),
+        "candidate_name":    candidate_name,
+        "candidate_email":   candidate_email,
+        "candidate_phone":   candidate_phone,
+        "resume_url":        resume_link,
+        "resume_file_url":   resume_file_url,
+        "notes":             notes,
+        "status":            "New",
+        "submitted_at":      datetime.now(timezone.utc),
     }
     res       = referrals_col.insert_one(doc)
     doc["_id"] = str(res.inserted_id)
@@ -220,9 +262,9 @@ def submit_referral():
         except Exception:
             manager = None
         if manager and manager.get("email"):
-            subject = f"New Referral from {doc['referrer_name']}"
+            subject = f"New Referral from {doc['referred_by_name']}"
             body = (
-                f"{doc['referrer_name']} has submitted a referral.\n\n"
+                f"{doc['referred_by_name']} has submitted a referral.\n\n"
                 f"Candidate : {candidate_name}\n"
                 f"Email     : {candidate_email}\n"
                 f"Phone     : {candidate_phone or '—'}\n"
@@ -242,9 +284,12 @@ def submit_referral():
 def public_career_jobs():
     """Open job listings — no authentication required."""
     rows = []
-    for j in career_jobs_col.find({"status": "Open"}).sort("created_at", -1):
-        j["_id"]          = str(j["_id"])
-        j["requirements"] = _normalize_requirements(j.get("requirements"))
+    # Tolerant match: "active" (current scheme), "Open" (legacy), or a
+    # missing status field all count as open — only "closed" is excluded.
+    for j in career_jobs_col.find({"status": {"$nin": ["closed", "Closed"]}}).sort("created_at", -1):
+        j["_id"]            = str(j["_id"])
+        j["requirements"]   = _normalize_requirements(j.get("requirements"))
+        j["employment_type"] = j.get("employment_type") or "Full-time"
         rows.append(j)
     return jsonify(rows), 200
 
@@ -256,5 +301,7 @@ def my_referrals():
     rows = []
     for r in referrals_col.find({"referred_by": uid}).sort("submitted_at", -1):
         r["_id"] = str(r["_id"])
+        if r.get("status") == "Pending":
+            r["status"] = "New"
         rows.append(r)
     return jsonify(rows), 200
