@@ -271,6 +271,37 @@ def admin_approve_correction():
     return jsonify({"message": f"Correction {action}"}), 200
 
 
+@bp.route("/api/admin/reports/corrections", methods=["GET"])
+@token_required
+def corrections_report():
+    """HR report: EVERY correction request for a month, regardless of
+    approval_target — unlike /api/admin/corrections (an approval queue that
+    deliberately only shows requests routed to admin), this is a superset
+    covering both manager-approved and admin-approved requests, with each
+    employee's department resolved for the HR Reports filter/export."""
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "attendance")):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    month = request.args.get("month")
+    if not month:
+        return jsonify({"message": "month required"}), 400
+
+    rows = []
+    for c in corrections_col.find({"month": month}).sort("created_at", -1):
+        c["_id"] = str(c["_id"])
+        uid = c.get("user_id")
+        emp = None
+        try:
+            emp = users_col.find_one({"_id": ObjectId(uid)}, {"name": 1, "department": 1}) if uid else None
+        except Exception:
+            pass
+        c["employee_name"] = (emp.get("name") if emp else None) or c.get("employee_name") or "Unknown"
+        c["department"]    = emp.get("department") if emp else None
+        c["user_id"]       = uid
+        rows.append(c)
+    return jsonify(rows), 200
+
+
 # =============================================================================
 # USER PROFILE
 # =============================================================================

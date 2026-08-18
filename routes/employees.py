@@ -154,6 +154,7 @@ def add_employee():
     phone         = (data.get("phone") or "").strip()
     department    = data.get("department", "")
     position      = data.get("position", "")
+    location      = (data.get("location") or "").strip()
     manager_id    = data.get("manager_id")
     doj           = data.get("doj", "")
     confirmation_date = data.get("confirmation_date", "")
@@ -176,7 +177,7 @@ def add_employee():
     user_doc = {
         "name": name, "email": email, "phone": phone,
         "password_changed": False, "role": "employee",
-        "department": department, "position": position, "doj": doj,
+        "department": department, "position": position, "location": location, "doj": doj,
         "confirmation_date": confirmation_date, "promotion_date": promotion_date,
         "employee_code": employee_code, "created_at": datetime.now(timezone.utc),
         "manager_id": manager_id, "shift": shift,
@@ -480,7 +481,7 @@ def edit_employee(emp_id):
         return jsonify({"message": "Unauthorized"}), 403
     data   = request.json
     update = {}
-    for k in ["name", "department", "position", "email", "phone", "manager_id", "shift", "doj", "employee_code",
+    for k in ["name", "department", "position", "location", "email", "phone", "manager_id", "shift", "doj", "employee_code",
               "confirmation_date", "promotion_date"]:
         if k in data:
             update[k] = data[k]

@@ -239,3 +239,39 @@ def admin_employee_attendance(emp_id):
         a["employee_email"] = emp.get("email")
         records.append(a)
     return jsonify(records), 200
+
+
+@bp.route("/api/admin/reports/late-checkins", methods=["GET"])
+@token_required
+def late_checkins_report():
+    """HR report: every late check-in for a month — status_indicator is
+    stamped "Present (Late)" at check-in time itself (see checkin_photo()
+    above), across all three shifts, so this is a direct query rather than
+    a recomputation from raw check-in time-of-day."""
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "attendance")):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    month = request.args.get("month")
+    if not month:
+        return jsonify({"message": "month required"}), 400
+
+    emp_map = {
+        str(u["_id"]): {"name": u.get("name"), "department": u.get("department")}
+        for u in users_col.find({"role": {"$in": ["employee", "manager"]}}, {"name": 1, "department": 1})
+    }
+
+    rows = []
+    for rec in attendance_col.find({
+        "type":             "checkin",
+        "date":             {"$regex": f"^{month}"},
+        "status_indicator": "Present (Late)",
+    }).sort("date", 1):
+        emp = emp_map.get(rec.get("user_id"), {})
+        rows.append({
+            "date":           rec.get("date"),
+            "user_id":        rec.get("user_id"),
+            "employee_name":  emp.get("name", "Unknown"),
+            "department":     emp.get("department"),
+            "time":           format_datetime_ist(rec["time"]) if rec.get("time") else None,
+        })
+    return jsonify(rows), 200
