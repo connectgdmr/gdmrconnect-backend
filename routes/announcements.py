@@ -16,6 +16,50 @@ from config import IST
 bp = Blueprint("announcements", __name__)
 
 
+def _apply_correction_attendance(correction, cid):
+    """
+    Insert the attendance record an approved correction implies. Returns True
+    if a record was inserted, False if new_time couldn't be parsed.
+
+    `attendance_id` on a correction doc is a client-supplied hint, not a
+    trustworthy ObjectId — both correction forms send the literal string
+    "manual_entry" for requests filed without an existing record to
+    reference, which is not a valid ObjectId. ObjectId.is_valid() guards
+    against that (and any other malformed value) instead of letting
+    ObjectId(attendance_id) raise, get caught by the bare except below, and
+    silently skip the insert entirely — which is exactly what was happening
+    for every correction until this fix: the request would show "Approved"
+    but the employee's day never actually left LOP/absent.
+    """
+    try:
+        new_time_str = correction["new_time"]
+        if "T" in new_time_str and not new_time_str.endswith("Z") and "+" not in new_time_str:
+            new_dt = datetime.fromisoformat(new_time_str)
+        else:
+            new_dt = datetime.fromisoformat(new_time_str.replace("Z", "+00:00"))
+
+        attendance_id    = correction.get("attendance_id")
+        original_record   = (
+            attendance_col.find_one({"_id": ObjectId(attendance_id)})
+            if attendance_id and ObjectId.is_valid(attendance_id) else None
+        )
+        record_type = original_record.get("type", "checkin") if original_record else "checkin"
+
+        attendance_col.insert_one({
+            "user_id":          correction["user_id"],
+            "type":             record_type,
+            "date":             str(new_dt.date()),
+            "time":             new_dt,
+            "photo_url":        None,
+            "status_indicator": "Corrected",
+            "correction_ref":   cid,
+        })
+        return True
+    except Exception as e:
+        print("Error updating attendance log:", e)
+        return False
+
+
 # =============================================================================
 # ANNOUNCEMENTS
 # =============================================================================
@@ -172,30 +216,7 @@ def approve_correction():
     corrections_col.update_one({"_id": ObjectId(cid)}, {"$set": {"status": action}})
 
     if action == "Approved":
-        try:
-            new_time_str = correction["new_time"]
-            if "T" in new_time_str and not new_time_str.endswith("Z") and "+" not in new_time_str:
-                new_dt = datetime.fromisoformat(new_time_str)
-            else:
-                new_dt = datetime.fromisoformat(new_time_str.replace("Z", "+00:00"))
-
-            original_record = (
-                attendance_col.find_one({"_id": ObjectId(correction["attendance_id"])})
-                if correction.get("attendance_id") else None
-            )
-            record_type = original_record.get("type", "checkin") if original_record else "checkin"
-
-            attendance_col.insert_one({
-                "user_id":          correction["user_id"],
-                "type":             record_type,
-                "date":             str(new_dt.date()),
-                "time":             new_dt,
-                "photo_url":        None,
-                "status_indicator": "Corrected",
-                "correction_ref":   cid,
-            })
-        except Exception as e:
-            print("Error updating attendance log:", e)
+        _apply_correction_attendance(correction, cid)
 
     return jsonify({"message": f"Correction {action}"}), 200
 
@@ -243,32 +264,44 @@ def admin_approve_correction():
     corrections_col.update_one({"_id": ObjectId(cid)}, {"$set": {"status": action}})
 
     if action == "Approved":
-        try:
-            new_time_str = correction["new_time"]
-            if "T" in new_time_str and not new_time_str.endswith("Z") and "+" not in new_time_str:
-                new_dt = datetime.fromisoformat(new_time_str)
-            else:
-                new_dt = datetime.fromisoformat(new_time_str.replace("Z", "+00:00"))
-
-            original_record = (
-                attendance_col.find_one({"_id": ObjectId(correction["attendance_id"])})
-                if correction.get("attendance_id") else None
-            )
-            record_type = original_record.get("type", "checkin") if original_record else "checkin"
-
-            attendance_col.insert_one({
-                "user_id":          correction["user_id"],
-                "type":             record_type,
-                "date":             str(new_dt.date()),
-                "time":             new_dt,
-                "photo_url":        None,
-                "status_indicator": "Corrected",
-                "correction_ref":   cid,
-            })
-        except Exception as e:
-            print("Error updating attendance log:", e)
+        _apply_correction_attendance(correction, cid)
 
     return jsonify({"message": f"Correction {action}"}), 200
+
+
+@bp.route("/api/admin/corrections/backfill", methods=["POST"])
+@token_required
+def backfill_approved_corrections():
+    """
+    One-off repair: every correction request historically carried a bogus
+    attendance_id ("manual_entry" — a placeholder string sent by both
+    correction forms, not a real ObjectId). Approving a correction tried
+    ObjectId(attendance_id) to find the original record, which raised on
+    that string and was swallowed by the bare except — so the correction
+    shows "Approved" but the employee's day never actually left LOP/absent.
+    Both submission forms and _apply_correction_attendance() are fixed now;
+    this backfills every already-approved correction still missing its
+    attendance record. Idempotent — safe to call more than once, it skips
+    anything that already has one (found via correction_ref).
+    """
+    if not _is_admin(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    fixed = skipped = 0
+    for correction in corrections_col.find({"status": "Approved"}):
+        cid = str(correction["_id"])
+        if attendance_col.find_one({"correction_ref": cid}):
+            skipped += 1
+            continue
+        if _apply_correction_attendance(correction, cid):
+            fixed += 1
+        else:
+            skipped += 1
+
+    return jsonify({
+        "message": f"Backfilled {fixed} correction(s); {skipped} already applied or unparseable.",
+        "fixed": fixed, "skipped": skipped,
+    }), 200
 
 
 @bp.route("/api/admin/reports/corrections", methods=["GET"])
