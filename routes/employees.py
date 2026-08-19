@@ -225,10 +225,16 @@ def list_employees():
     # uses this endpoint to build its employee grid and to resolve names for
     # the Present/Absent/Not-Checked-In detail modals. Same for "ats" (Recruitment)
     # — AdminATS's Add Candidate form needs it for the Sourced By / Department pickers.
+    # "manager" — RegisterManager's Departments checklist (register + edit) reads
+    # this to derive the full department list, same as "departments" below needs
+    # it to sync its dropdown against every department actually in use, not just
+    # the formal departments_col rows.
     if not (_is_admin(request.user)
             or _has_module_grant(request.user, "employees")
             or _has_module_grant(request.user, "attendance")
-            or _has_module_grant(request.user, "ats")):
+            or _has_module_grant(request.user, "ats")
+            or _has_module_grant(request.user, "manager")
+            or _has_module_grant(request.user, "departments")):
         return jsonify({"message": "Unauthorized access."}), 403
 
     emp_query: dict = {"role": {"$in": ["employee", "manager", "owner"]}}
@@ -308,11 +314,13 @@ def list_departments():
     # same endpoint to populate the Department field on the Add/Edit forms;
     # without it here the dropdown silently renders with zero options (404s
     # under the hood, EmployeeDashboard's loadDelegatedDepartments() swallows
-    # the failure and just leaves the list empty).
+    # the failure and just leaves the list empty). "manager" — RegisterManager's
+    # Departments checklist needs it too, for the same reason.
     if not (_is_admin(request.user)
             or _has_module_grant(request.user, "departments")
             or _has_module_grant(request.user, "ats")
-            or _has_module_grant(request.user, "employees")):
+            or _has_module_grant(request.user, "employees")
+            or _has_module_grant(request.user, "manager")):
         return jsonify({"message": "Unauthorized"}), 403
     depts = []
     for d in departments_col.find().sort("name", 1):
