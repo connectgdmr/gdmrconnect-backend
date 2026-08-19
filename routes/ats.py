@@ -300,6 +300,27 @@ STATUS_EMAIL_TEMPLATES = {
             "Upload Documents", "{portal_url}",
         ),
     },
+    "Offer Discussion": {
+        "subject": "Let's Discuss Your Offer — GDMR Foundation",
+        "plain": (
+            "Dear {candidate_name},\n\n"
+            "Congratulations! We would like to move forward with extending you an offer "
+            "for the {job_role} role at GDMR Foundation.\n\n"
+            "Before we finalize the offer letter, our HR team would like to connect with you "
+            "to discuss the role, compensation, and joining timeline.\n\n"
+            "We will reach out shortly to schedule this conversation.\n\n"
+            "Regards,\nGDMR Foundation HR Team"
+        ),
+        "html": _ats_email_wrapper(
+            "<p>Dear <strong>{candidate_name}</strong>,</p>"
+            "<p>Congratulations! We would like to move forward with extending you an offer for the "
+            "<strong>{job_role}</strong> role at GDMR Foundation. 🎉</p>"
+            "<p>Before we finalize the offer letter, our HR team would like to connect with you to "
+            "discuss the role, compensation, and joining timeline.</p>"
+            "<p>We will reach out shortly to schedule this conversation.</p>",
+            "Visit Our Website", _ATS_DASH,
+        ),
+    },
     "Offer Released": {
         "subject": "Congratulations — Offer Letter | GDMR Foundation",
         "plain": (
