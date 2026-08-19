@@ -304,9 +304,15 @@ def update_manager_role(man_id):
 def list_departments():
     # Read-only: "ats" (Recruitment) also needs this for the Add Candidate
     # form's Department dropdown — same rationale as list_employees() above.
+    # "employees" too — a delegate with Manage Employees access hits this
+    # same endpoint to populate the Department field on the Add/Edit forms;
+    # without it here the dropdown silently renders with zero options (404s
+    # under the hood, EmployeeDashboard's loadDelegatedDepartments() swallows
+    # the failure and just leaves the list empty).
     if not (_is_admin(request.user)
             or _has_module_grant(request.user, "departments")
-            or _has_module_grant(request.user, "ats")):
+            or _has_module_grant(request.user, "ats")
+            or _has_module_grant(request.user, "employees")):
         return jsonify({"message": "Unauthorized"}), 403
     depts = []
     for d in departments_col.find().sort("name", 1):
