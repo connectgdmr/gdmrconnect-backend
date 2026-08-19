@@ -16,6 +16,7 @@ from bson import ObjectId
 from database import (salary_structures_col, payslips_col, payroll_loans_col, users_col)
 from decorators import token_required
 from helpers import _is_admin, _to_money, _has_module_grant
+from routes.calendar import _month_calendar_for_employee
 
 bp = Blueprint("payroll", __name__)
 
@@ -198,6 +199,54 @@ def get_salary_history(employee_id):
         result.append(row)
 
     return jsonify(result), 200
+
+
+# ── Stage 3: payroll auto-LOP ────────────────────────────────────────────────
+
+@bp.route("/api/admin/payroll/lop-preview", methods=["GET"])
+@token_required
+def payroll_lop_preview():
+    """Auto-fill preview for the Run Payroll screen: per employee, the LOP day
+    count already computed by the Stage 1 attendance calendar
+    (routes/calendar.py's classify_attendance_day -> "absent" -> "lop") for the
+    selected month, converted to a rupee amount at that employee's per-day rate.
+    Purely additive read — HR still edits the value in the Run Payroll table
+    before /payroll/run is called, so nothing here changes what gets saved."""
+    if not _payroll_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    try:
+        month = int(request.args.get("month"))
+        year  = int(request.args.get("year"))
+    except (TypeError, ValueError):
+        return jsonify({"message": "month (1-12) and year are required"}), 400
+    if not (1 <= month <= 12) or year < 2000:
+        return jsonify({"message": "Invalid month or year"}), 400
+
+    month_str     = f"{year:04d}-{month:02d}"
+    days_in_month = calendar.monthrange(year, month)[1]
+
+    rows = []
+    for s in salary_structures_col.find():
+        eid = s.get("employee_id")
+        if not eid:
+            continue
+        gross = round(sum(_to_money(s.get(f, 0)) for f in SALARY_EARNINGS), 2)
+        if gross <= 0:
+            continue
+
+        cal_result = _month_calendar_for_employee(eid, month_str)
+        lop_days   = (cal_result or {}).get("summary", {}).get("lop", 0)
+        per_day    = round(gross / days_in_month, 2) if days_in_month else 0
+        lop_amount = round(lop_days * per_day, 2)
+
+        rows.append({
+            "employee_id": eid,
+            "lop_days":    lop_days,
+            "lop_amount":  lop_amount,
+        })
+
+    return jsonify(rows), 200
 
 
 # ── Payroll run ───────────────────────────────────────────────────────────────
