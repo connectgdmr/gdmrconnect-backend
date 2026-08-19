@@ -267,23 +267,28 @@ def _has_module_grant(user, module, write=False):
     routes/access.py) covering `module`. write=True additionally requires
     the grant's access_level to be 'view_edit' rather than 'view_only'.
 
-    Callers should check _is_admin(user) separately (usually
-    `_is_admin(user) or _has_module_grant(user, "x")`) — this only covers
-    delegated, non-admin access. Mirrors the pattern routes/lms.py already
-    used for LMS-specific grants, generalized to every grantable module.
+    An employee can hold more than one active grant at once (routes/access.py
+    ::grant_access() doesn't deactivate a prior grant when a new one is made —
+    my_delegated_access() and the frontend's delegatedGrants already treat
+    them as a set, checking every active grant with `.some()`). This must do
+    the same: scanning only the first grant find_one() happens to return
+    would miss a module that's only covered by a *different* active grant
+    (e.g. an earlier "employees" grant plus a separate later "manager"
+    grant — find_one() could hand back the "employees" one and make a valid
+    "manager" grant look like it doesn't exist).
     """
-    grant = access_grants_col.find_one({"employee_id": str(user["_id"]), "is_active": True})
-    if not grant:
-        return False
-    modules = grant.get("modules")
-    if not modules:
-        legacy = grant.get("module")  # older grants stored a single "module" string
-        modules = [legacy] if legacy else []
-    if module not in modules:
-        return False
-    if write and grant.get("access_level") != "view_edit":
-        return False
-    return True
+    grants = access_grants_col.find({"employee_id": str(user["_id"]), "is_active": True})
+    for grant in grants:
+        modules = grant.get("modules")
+        if not modules:
+            legacy = grant.get("module")  # older grants stored a single "module" string
+            modules = [legacy] if legacy else []
+        if module not in modules:
+            continue
+        if write and grant.get("access_level") != "view_edit":
+            continue  # this grant covers the module but not for writing — another active grant might
+        return True
+    return False
 
 
 # ── Payroll helpers ───────────────────────────────────────────────────────────
