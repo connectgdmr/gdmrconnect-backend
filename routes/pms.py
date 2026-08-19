@@ -12,7 +12,7 @@ from bson import ObjectId
 
 from database import pms_templates_col, pms_reviews_col, users_col
 from decorators import token_required
-from helpers import _is_admin, _mgr_depts
+from helpers import _is_admin, _mgr_depts, _has_module_grant
 from config import IST
 
 bp = Blueprint("pms", __name__)
@@ -21,7 +21,13 @@ bp = Blueprint("pms", __name__)
 @bp.route("/api/admin/pms-template", methods=["POST"])
 @token_required
 def save_pms_template():
-    if request.user.get("role") not in ("admin", "owner", "manager"):
+    # PMSWorkspace.jsx (scope="admin") is what a delegated "pms" grant
+    # renders — this whole file predates the Grant Access system and only
+    # ever checked real role, so a delegate (role usually "employee") always
+    # 403'd here regardless of their grant. Every endpoint below gets the
+    # same _has_module_grant(..., "pms") addition for that reason.
+    if request.user.get("role") not in ("admin", "owner", "manager") \
+            and not _has_module_grant(request.user, "pms", write=True):
         return jsonify({"message": "Unauthorized"}), 403
 
     data       = request.json
@@ -113,7 +119,8 @@ def get_manager_pms():
     otherwise every admin-built review in the department would leak through
     the department filter below.
     """
-    if request.user.get("role") not in ("manager", "admin", "owner"):
+    if request.user.get("role") not in ("manager", "admin", "owner") \
+            and not _has_module_grant(request.user, "pms"):
         return jsonify({"message": "Unauthorized"}), 403
 
     depts = _mgr_depts(request.user)
@@ -153,7 +160,8 @@ def share_pms_with_admin(review_id):
     only share reviews in their own department; admin/owner can share (or
     re-share) any review. One-way from this endpoint (no unshare).
     """
-    if request.user.get("role") not in ("manager", "admin", "owner"):
+    if request.user.get("role") not in ("manager", "admin", "owner") \
+            and not _has_module_grant(request.user, "pms", write=True):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         review = pms_reviews_col.find_one({"_id": ObjectId(review_id)})
@@ -174,7 +182,8 @@ def share_pms_with_manager(review_id):
     Marks an admin/owner-owned review as visible to the employee's department
     manager(s) via GET /api/manager/pms. Admin/owner only. One-way (no unshare).
     """
-    if request.user.get("role") not in ("admin", "owner"):
+    if request.user.get("role") not in ("admin", "owner") \
+            and not _has_module_grant(request.user, "pms", write=True):
         return jsonify({"message": "Unauthorized"}), 403
     try:
         review = pms_reviews_col.find_one({"_id": ObjectId(review_id)})
@@ -196,7 +205,8 @@ def get_admin_pms():
     NOT department-scoped like /api/manager/pms — deliberately org-wide, since
     Admin's page groups by department on the client instead.
     """
-    if request.user.get("role") not in ("admin", "owner"):
+    if request.user.get("role") not in ("admin", "owner") \
+            and not _has_module_grant(request.user, "pms"):
         return jsonify({"message": "Unauthorized"}), 403
 
     reviews = list(pms_reviews_col.find({
@@ -224,7 +234,8 @@ def get_admin_pms():
 @bp.route("/api/manager/pms-calibration", methods=["GET"])
 @token_required
 def pms_calibration():
-    if request.user.get("role") not in ("manager", "admin", "owner"):
+    if request.user.get("role") not in ("manager", "admin", "owner") \
+            and not _has_module_grant(request.user, "pms"):
         return jsonify({"message": "Unauthorized"}), 403
 
     month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
@@ -280,7 +291,8 @@ def pms_calibration():
 @bp.route("/api/manager/finalize-pms", methods=["POST"])
 @token_required
 def finalize_pms_review():
-    if request.user.get("role") not in ("manager", "admin", "owner"):
+    if request.user.get("role") not in ("manager", "admin", "owner") \
+            and not _has_module_grant(request.user, "pms", write=True):
         return jsonify({"message": "Unauthorized"}), 403
 
     data      = request.json
@@ -364,7 +376,8 @@ def acknowledge_pms_review():
 @bp.route("/api/admin/pms-dashboard", methods=["GET"])
 @token_required
 def pms_dashboard():
-    if request.user.get("role") not in ("admin", "owner", "manager"):
+    if request.user.get("role") not in ("admin", "owner", "manager") \
+            and not _has_module_grant(request.user, "pms"):
         return jsonify({"message": "Unauthorized"}), 403
 
     month          = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
@@ -422,7 +435,8 @@ def pms_dashboard():
 @bp.route("/api/admin/export-pms", methods=["GET"])
 @token_required
 def export_pms():
-    if request.user.get("role") not in ("admin", "owner", "manager"):
+    if request.user.get("role") not in ("admin", "owner", "manager") \
+            and not _has_module_grant(request.user, "pms"):
         return jsonify({"message": "Unauthorized"}), 403
 
     month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
