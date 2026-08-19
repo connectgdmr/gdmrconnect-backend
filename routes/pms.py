@@ -82,6 +82,20 @@ def submit_pms_review():
             owner_role = owner_user.get("role") if owner_user else None
         except Exception:
             pass
+    # A pms_templates_col document can only ever be created via
+    # POST /api/admin/pms-template, gated to role admin/owner/manager OR a
+    # delegated "pms" write grant — a delegate's real DB role is still
+    # "employee" though, so `owner_role` here would read "employee" for a
+    # template a delegate built with PMSWorkspace's scope="admin" UI. Any
+    # role outside admin/owner/manager reaching this point can only mean
+    # that delegate path, so treat it as admin-owned — otherwise
+    # get_admin_pms()'s `owner_role in ["admin","owner"]` filter (and this
+    # same check re-used for the delegate's own "Reviews" tab, which hits
+    # that identical endpoint) never matches and the review is invisible to
+    # everyone forever, with no manager anywhere in the loop to "Share with
+    # Admin" either.
+    if owner_role not in ("admin", "owner", "manager"):
+        owner_role = "admin"
 
     submission = {
         "user_id":                uid,
