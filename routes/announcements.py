@@ -312,7 +312,9 @@ def corrections_report():
     deliberately only shows requests routed to admin), this is a superset
     covering both manager-approved and admin-approved requests, with each
     employee's department resolved for the HR Reports filter/export."""
-    if not (_is_admin(request.user) or _has_module_grant(request.user, "attendance")):
+    if not (_is_admin(request.user)
+            or _has_module_grant(request.user, "attendance")
+            or _has_module_grant(request.user, "summary")):
         return jsonify({"message": "Unauthorized"}), 403
 
     month = request.args.get("month")

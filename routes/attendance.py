@@ -248,7 +248,9 @@ def late_checkins_report():
     stamped "Present (Late)" at check-in time itself (see checkin_photo()
     above), across all three shifts, so this is a direct query rather than
     a recomputation from raw check-in time-of-day."""
-    if not (_is_admin(request.user) or _has_module_grant(request.user, "attendance")):
+    if not (_is_admin(request.user)
+            or _has_module_grant(request.user, "attendance")
+            or _has_module_grant(request.user, "summary")):
         return jsonify({"message": "Unauthorized"}), 403
 
     month = request.args.get("month")

@@ -228,13 +228,16 @@ def list_employees():
     # "manager" — RegisterManager's Departments checklist (register + edit) reads
     # this to derive the full department list, same as "departments" below needs
     # it to sync its dropdown against every department actually in use, not just
-    # the formal departments_col rows.
+    # the formal departments_col rows. "summary" — AdminAttendanceSummary.jsx
+    # (View Reports) resolves employee names/departments for its Employees tab
+    # and every HR report.
     if not (_is_admin(request.user)
             or _has_module_grant(request.user, "employees")
             or _has_module_grant(request.user, "attendance")
             or _has_module_grant(request.user, "ats")
             or _has_module_grant(request.user, "manager")
-            or _has_module_grant(request.user, "departments")):
+            or _has_module_grant(request.user, "departments")
+            or _has_module_grant(request.user, "summary")):
         return jsonify({"message": "Unauthorized access."}), 403
 
     emp_query: dict = {"role": {"$in": ["employee", "manager", "owner"]}}

@@ -89,7 +89,13 @@ def today_stats():
 @bp.route("/api/admin/attendance-summary", methods=["GET"])
 @token_required
 def attendance_summary():
-    if not (_is_admin(request.user) or _has_module_grant(request.user, "attendance")):
+    # "summary" — AdminAttendanceSummary.jsx (the "View Reports" delegated
+    # module) is this endpoint's main consumer; without it here a
+    # summary-only delegate's whole Reports page reads as all-zero (every
+    # stat on that page is ultimately derived from this one call).
+    if not (_is_admin(request.user)
+            or _has_module_grant(request.user, "attendance")
+            or _has_module_grant(request.user, "summary")):
         return jsonify({"message": "Unauthorized"}), 403
 
     month_param = request.args.get("month")
