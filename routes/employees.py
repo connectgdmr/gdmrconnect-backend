@@ -230,14 +230,22 @@ def list_employees():
     # it to sync its dropdown against every department actually in use, not just
     # the formal departments_col rows. "summary" — AdminAttendanceSummary.jsx
     # (View Reports) resolves employee names/departments for its Employees tab
-    # and every HR report.
+    # and every HR report. "pms" — PMSWorkspace's "Assign to Employees" picker
+    # (and its Department filter, derived client-side from this same list) is
+    # driven entirely by the assignablePool prop, which for a delegate is this
+    # endpoint's response. "lms"/"payroll"/"career" — AdminLMS/AdminPayroll/
+    # AdminCareer's own employee-assignment dropdowns read the same prop.
     if not (_is_admin(request.user)
             or _has_module_grant(request.user, "employees")
             or _has_module_grant(request.user, "attendance")
             or _has_module_grant(request.user, "ats")
             or _has_module_grant(request.user, "manager")
             or _has_module_grant(request.user, "departments")
-            or _has_module_grant(request.user, "summary")):
+            or _has_module_grant(request.user, "summary")
+            or _has_module_grant(request.user, "pms")
+            or _has_module_grant(request.user, "lms")
+            or _has_module_grant(request.user, "payroll")
+            or _has_module_grant(request.user, "career")):
         return jsonify({"message": "Unauthorized access."}), 403
 
     emp_query: dict = {"role": {"$in": ["employee", "manager", "owner"]}}
