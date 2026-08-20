@@ -73,7 +73,14 @@ payroll_loans_col     = db["payroll_loans"]
 work_plans_col = db["work_plans"]
 
 # ── Clients ───────────────────────────────────────────────────────────────────
-clients_col = db["clients"]
+clients_col       = db["clients"]
+# Unified folders+files for a client's "Drive" — one collection so "list this
+# folder's contents" is a single query. type: "folder" | "file"; parent_id is
+# None for items at the client's root.
+client_drive_col   = db["client_drive"]
+# Manual "Post an Update" log on a client, separate from the auto-pulled Daily
+# Work Plan timeline (which reads work_plans_col directly, no storage of its own).
+client_updates_col = db["client_updates"]
 
 # ── ATS ───────────────────────────────────────────────────────────────────────
 ats_candidates_col = db["ats_candidates"]
@@ -121,6 +128,9 @@ try:
     work_plans_col.create_index([("date", 1), ("status", 1)], background=True)
     work_plans_col.create_index([("department", 1), ("date", 1)], background=True)
     clients_col.create_index("name", unique=True, background=True)
+    clients_col.create_index("departments", background=True)
+    client_drive_col.create_index([("client_id", 1), ("parent_id", 1)], background=True)
+    client_updates_col.create_index([("client_id", 1), ("posted_at", -1)], background=True)
     ats_candidates_col.create_index("email", background=True)
     ats_candidates_col.create_index("phone", background=True)
     ats_candidates_col.create_index("applicant_code", unique=True, sparse=True, background=True)
