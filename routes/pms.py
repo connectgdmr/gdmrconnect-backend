@@ -59,9 +59,25 @@ def save_pms_template():
 @token_required
 def get_pms_template():
     uid      = str(request.user["_id"])
-    template = pms_templates_col.find_one({"assigned_to": uid}, {"_id": 0})
+    template = pms_templates_col.find_one({"assigned_to": uid})
     if not template:
         return jsonify({"sessions": [], "message": "No active evaluations assigned to you."}), 200
+
+    # Already submitted a self-assessment against this exact template —
+    # without this check the assignment (and its now-blank form, since the
+    # frontend clears its local answers right after a successful submit)
+    # kept showing on the employee's screen forever instead of disappearing
+    # once completed.
+    already_submitted = pms_reviews_col.find_one(
+        {"user_id": uid, "template_id": str(template["_id"])}, {"_id": 1}
+    )
+    if already_submitted:
+        return jsonify({
+            "sessions": [], "already_submitted": True,
+            "message": "You've already submitted this evaluation — see PMS History below.",
+        }), 200
+
+    template.pop("_id", None)
     return jsonify(template), 200
 
 
