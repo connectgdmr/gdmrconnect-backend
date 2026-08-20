@@ -268,6 +268,24 @@ def _mgr_depts(user):
     return [d] if d else []
 
 
+def _managed_employee_ids(manager_user):
+    """All employee _ids (as strings) a manager can act on — department
+    overlap OR a direct manager_id assignment (routes/employees.py sets
+    this on every employee and keeps it current through promotions/
+    reassignments, so it's the authoritative "who reports to whom" field —
+    routes/leaves.py's admin_view_leaves() already uses manager_id alone
+    for the exact same purpose). Department-string equality alone is
+    fragile: a review/leave/etc. can carry a department value snapshotted
+    at submission time that later drifts out of sync with a rename, or an
+    employee can simply be managed cross-department. Matching on either
+    catches both cases instead of silently hiding a manager's own team."""
+    depts  = _mgr_depts(manager_user)
+    mgr_id = str(manager_user["_id"])
+    return {str(u["_id"]) for u in users_col.find(
+        {"$or": [{"department": {"$in": depts}}, {"manager_id": mgr_id}]}, {"_id": 1}
+    )}
+
+
 # ── Delegated (Grant Access) module permissions ─────────────────────────────
 # Canonical set of admin features that "Grant Access" can delegate, keyed the
 # same as the sidebar's view name so frontend/backend stay in sync. Excludes
