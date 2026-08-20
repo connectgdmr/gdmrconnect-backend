@@ -142,7 +142,11 @@ def delete_job(job_id):
 @bp.route("/api/admin/career/referrals", methods=["GET"])
 @token_required
 def admin_list_referrals():
-    if not (_is_admin(request.user) or _has_module_grant(request.user, "career")):
+    # Recruitment (the "ats" module) reads this list too, to auto-match a new
+    # candidate against an existing referral by email — so a delegate holding
+    # just the "ats" grant (not "career") needs read access here as well.
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "career")
+            or _has_module_grant(request.user, "ats")):
         return jsonify({"message": "Unauthorized"}), 403
     job_id = request.args.get("job_id")
     query  = {"job_id": job_id} if job_id else {}

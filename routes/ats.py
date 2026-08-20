@@ -465,17 +465,20 @@ def ats_list_candidates():
     candidates = list(ats_candidates_col.find(query).sort("applied_at", -1))
     serialized = [_serialize_ats(c) for c in candidates]
 
-    sourced_ids = list({c["sourced_by"] for c in serialized if c.get("sourced_by")})
-    sourced_map = {}
-    if sourced_ids:
+    sourced_ids  = {c["sourced_by"]  for c in serialized if c.get("sourced_by")}
+    referred_ids = {c["referred_by"] for c in serialized if c.get("referred_by")}
+    name_map = {}
+    all_ids  = sourced_ids | referred_ids
+    if all_ids:
         try:
-            obj_ids = [ObjectId(sid) for sid in sourced_ids]
+            obj_ids = [ObjectId(uid) for uid in all_ids]
             for u in users_col.find({"_id": {"$in": obj_ids}}, {"name": 1}):
-                sourced_map[str(u["_id"])] = u["name"]
+                name_map[str(u["_id"])] = u["name"]
         except Exception:
             pass
     for c in serialized:
-        c["sourced_by_name"] = sourced_map.get(c.get("sourced_by") or "")
+        c["sourced_by_name"]  = name_map.get(c.get("sourced_by") or "")
+        c["referred_by_name"] = name_map.get(c.get("referred_by") or "")
 
     return jsonify(serialized), 200
 
@@ -498,16 +501,17 @@ def ats_get_candidate(candidate_id):
     if scope and candidate.get("department") not in _mgr_depts(request.user):
         return jsonify({"message": "Access denied"}), 403
 
-    result     = _serialize_ats(candidate)
-    sourced_by = result.get("sourced_by")
-    if sourced_by:
-        try:
-            sourcer = users_col.find_one({"_id": ObjectId(sourced_by)}, {"name": 1})
-            result["sourced_by_name"] = sourcer["name"] if sourcer else None
-        except Exception:
-            result["sourced_by_name"] = None
-    else:
-        result["sourced_by_name"] = None
+    result = _serialize_ats(candidate)
+    for field, name_field in (("sourced_by", "sourced_by_name"), ("referred_by", "referred_by_name")):
+        val = result.get(field)
+        if val:
+            try:
+                person = users_col.find_one({"_id": ObjectId(val)}, {"name": 1})
+                result[name_field] = person["name"] if person else None
+            except Exception:
+                result[name_field] = None
+        else:
+            result[name_field] = None
     return jsonify(result), 200
 
 
@@ -549,12 +553,20 @@ def ats_create_candidate():
         except Exception:
             return jsonify({"message": "Invalid sourced_by employee ID"}), 400
 
+    referred_by = str(data.get("referred_by", "")).strip() or None
+    if referred_by:
+        try:
+            ObjectId(referred_by)
+        except Exception:
+            return jsonify({"message": "Invalid referred_by employee ID"}), 400
+
     now = datetime.now(timezone.utc)
     doc = {
         "applicant_code": _next_applicant_code(),
         "name":   name,
         "email":  email,
         "sourced_by": sourced_by,
+        "referred_by": referred_by,
         "status": "New Application",
         "skills": skills,
         "experience": data.get("experience"),
@@ -605,21 +617,27 @@ def ats_update_candidate(candidate_id):
     }):
         return jsonify({"message": "A candidate with this phone number already exists."}), 400
 
-    editable = ["name", "email", "skills", "experience", "source", *CANDIDATE_TEXT_FIELDS]
+    # "sourced_by"/"referred_by" must be in this list, not just handled below —
+    # the loop right after only copies fields that are IN `editable` into
+    # `update`, so a field validated-but-not-listed here silently never saves
+    # (this is exactly the CANDIDATE_TEXT_FIELDS drift bug described above,
+    # just for the two employee-reference fields instead of the text ones).
+    editable = ["name", "email", "skills", "experience", "source", "sourced_by", "referred_by", *CANDIDATE_TEXT_FIELDS]
     update = {"updated_at": datetime.now(timezone.utc)}
     for f in editable:
         if f in data:
             update[f] = data[f]
     if "skills" in update and isinstance(update["skills"], str):
         update["skills"] = [s.strip() for s in update["skills"].split(",") if s.strip()]
-    if "sourced_by" in update:
-        val = str(update["sourced_by"]).strip() if update["sourced_by"] else None
-        if val:
-            try:
-                ObjectId(val)
-            except Exception:
-                return jsonify({"message": "Invalid sourced_by employee ID"}), 400
-        update["sourced_by"] = val
+    for ref_field, label in (("sourced_by", "sourced_by"), ("referred_by", "referred_by")):
+        if ref_field in update:
+            val = str(update[ref_field]).strip() if update[ref_field] else None
+            if val:
+                try:
+                    ObjectId(val)
+                except Exception:
+                    return jsonify({"message": f"Invalid {label} employee ID"}), 400
+            update[ref_field] = val
 
     result = ats_candidates_col.update_one({"_id": obj}, {"$set": update})
     if result.matched_count == 0:
