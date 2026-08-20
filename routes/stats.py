@@ -155,6 +155,14 @@ def attendance_summary():
                 nci_ids.append(uid)
             elif status == "absent":
                 absent_ids.append(uid)
+                # A finalized no-show (day over, no checkin, no leave, not a
+                # weekend) is exactly what "not_checked_in" already meant
+                # while the day was still in progress — HR wants that kept
+                # visible here too, instead of collapsing to 0 the moment
+                # the day ends. Deliberately overlaps with Absent (still
+                # what LOP/payroll reads, unchanged) rather than being
+                # spun off into its own separate headcount bucket.
+                nci_ids.append(uid)
             # status is None: not yet joined / already offboarded / weekend with nothing recorded — no bucket
 
         def _names(ids):
