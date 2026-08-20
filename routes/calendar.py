@@ -20,9 +20,12 @@ differently:
   None + weekend             -> "weekly_off"       (spec: grey)
   None, not weekend          -> omitted entirely   (before DOJ / after LWD)
 
-Company holidays are intentionally not modeled here — src/data/holidays.js
-on the frontend is the single source of truth for those today, and the
-calendar UI merges them in client-side to grey out weekday holidays too.
+Company holidays (helpers.COMPANY_HOLIDAYS) are treated exactly like
+weekends here — excluded from "absent"/LOP the same way — so a weekday
+holiday with no check-ins shows as "weekly_off" (spec: grey) instead of
+LOP, and payroll's auto-LOP fill (routes/payroll.py's payroll_lop_preview,
+which calls _month_calendar_for_employee directly) stops deducting pay
+for them too.
 """
 from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify
@@ -31,7 +34,8 @@ from bson import ObjectId
 from database import attendance_col, leaves_col, users_col
 from decorators import token_required
 from helpers import (_is_admin, _has_module_grant, _mgr_depts,
-                      classify_attendance_day, _date_str, format_datetime_ist)
+                      classify_attendance_day, _date_str, format_datetime_ist,
+                      COMPANY_HOLIDAYS, COMPANY_HOLIDAY_DATES)
 from config import IST
 
 bp = Blueprint("calendar", __name__)
@@ -92,7 +96,7 @@ def _month_calendar_for_employee(uid, month_str):
         if lwd and day_str > lwd:
             continue
 
-        is_weekend   = datetime.strptime(day_str, "%Y-%m-%d").weekday() >= 5
+        is_weekend   = datetime.strptime(day_str, "%Y-%m-%d").weekday() >= 5 or day_str in COMPANY_HOLIDAY_DATES
         is_today     = day_str == today_str
         day_checkins = {uid} if day_str in checkin_times else set()
 
@@ -128,6 +132,16 @@ def _month_calendar_for_employee(uid, month_str):
         "days":          days,
         "summary":       counts,
     }
+
+
+@bp.route("/api/holidays", methods=["GET"])
+@token_required
+def list_holidays():
+    # Any authenticated role — the Holiday Calendar tab and the Attendance
+    # Calendar's grey-out overlay both read this same list, so they can
+    # never drift the way the old frontend-only static file and this
+    # backend's own LOP math implicitly did.
+    return jsonify(COMPANY_HOLIDAYS), 200
 
 
 @bp.route("/api/my/attendance/calendar", methods=["GET"])

@@ -10,7 +10,7 @@ from bson import ObjectId
 
 from database import (attendance_col, leaves_col, users_col)
 from decorators import token_required
-from helpers import _is_admin, _has_module_grant, classify_attendance_day
+from helpers import _is_admin, _has_module_grant, classify_attendance_day, COMPANY_HOLIDAY_DATES
 from config import IST
 
 bp = Blueprint("stats", __name__)
@@ -137,7 +137,7 @@ def attendance_summary():
         if day_str > today_str:
             continue
 
-        is_weekend   = datetime.strptime(day_str, "%Y-%m-%d").weekday() >= 5
+        is_weekend   = datetime.strptime(day_str, "%Y-%m-%d").weekday() >= 5 or day_str in COMPANY_HOLIDAY_DATES
         is_today     = day_str == today_str
         day_checkins = checkins_by_date.get(day_str, set())
 
@@ -180,6 +180,12 @@ def auto_mark_absent():
 
     today     = datetime.now(IST).date()
     today_str = str(today)
+    if today_str in COMPANY_HOLIDAY_DATES:
+        # Nobody is expected to check in on a declared company holiday —
+        # same reasoning as classify_attendance_day() below, just applied
+        # before this cron writes a permanent "absent" record instead of
+        # after the fact.
+        return jsonify({"message": "Skipped — today is a company holiday"}), 200
     all_users = users_col.find({"role": {"$in": ["employee", "manager"]}})
 
     for emp in all_users:
