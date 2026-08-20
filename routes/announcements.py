@@ -18,8 +18,10 @@ bp = Blueprint("announcements", __name__)
 
 def _apply_correction_attendance(correction, cid):
     """
-    Insert the attendance record an approved correction implies. Returns True
-    if a record was inserted, False if new_time couldn't be parsed.
+    Insert the attendance record an approved correction implies. Returns
+    (True, None) if a record was inserted, (False, reason) if it couldn't be
+    — the caller surfaces `reason` in the approve response instead of the
+    correction silently showing "Approved" while LOP never actually clears.
 
     `attendance_id` on a correction doc is a client-supplied hint, not a
     trustworthy ObjectId — both correction forms send the literal string
@@ -31,15 +33,23 @@ def _apply_correction_attendance(correction, cid):
     for every correction until this fix: the request would show "Approved"
     but the employee's day never actually left LOP/absent.
     """
+    new_time_str = correction.get("new_time")
+    if not new_time_str or not str(new_time_str).strip():
+        return False, "This correction has no requested time to apply."
+
     try:
-        new_time_str = correction["new_time"]
+        new_time_str = str(new_time_str).strip()
         if "T" in new_time_str and not new_time_str.endswith("Z") and "+" not in new_time_str:
             new_dt = datetime.fromisoformat(new_time_str)
         else:
             new_dt = datetime.fromisoformat(new_time_str.replace("Z", "+00:00"))
+    except (ValueError, TypeError) as e:
+        print("Error parsing correction new_time:", new_time_str, e)
+        return False, f"Couldn't understand the requested time \"{new_time_str}\"."
 
-        attendance_id    = correction.get("attendance_id")
-        original_record   = (
+    try:
+        attendance_id   = correction.get("attendance_id")
+        original_record = (
             attendance_col.find_one({"_id": ObjectId(attendance_id)})
             if attendance_id and ObjectId.is_valid(attendance_id) else None
         )
@@ -54,10 +64,10 @@ def _apply_correction_attendance(correction, cid):
             "status_indicator": "Corrected",
             "correction_ref":   cid,
         })
-        return True
+        return True, None
     except Exception as e:
         print("Error updating attendance log:", e)
-        return False
+        return False, "Unexpected error writing the attendance record — check server logs."
 
 
 # =============================================================================
@@ -213,12 +223,18 @@ def approve_correction():
     if not corr_owner or str(corr_owner.get("manager_id")) != str(request.user["_id"]):
         return jsonify({"message": "Unauthorized: employee is not in your team"}), 403
 
-    corrections_col.update_one({"_id": ObjectId(cid)}, {"$set": {"status": action}})
-
+    synced, sync_error = True, None
     if action == "Approved":
-        _apply_correction_attendance(correction, cid)
+        synced, sync_error = _apply_correction_attendance(correction, cid)
 
-    return jsonify({"message": f"Correction {action}"}), 200
+    corrections_col.update_one({"_id": ObjectId(cid)}, {"$set": {"status": action, "attendance_synced": synced}})
+
+    if not synced:
+        # Approved on paper, but the attendance record that would actually
+        # clear LOP for that day failed to write — say so instead of a bare
+        # "Approved" that looks identical to a correction that worked.
+        return jsonify({"message": f"Correction {action}, but the attendance record failed to sync: {sync_error}", "synced": False}), 200
+    return jsonify({"message": f"Correction {action}", "synced": True}), 200
 
 
 @bp.route("/api/admin/corrections", methods=["GET"])
@@ -261,12 +277,15 @@ def admin_approve_correction():
     if not correction:
         return jsonify({"message": "Not found"}), 404
 
-    corrections_col.update_one({"_id": ObjectId(cid)}, {"$set": {"status": action}})
-
+    synced, sync_error = True, None
     if action == "Approved":
-        _apply_correction_attendance(correction, cid)
+        synced, sync_error = _apply_correction_attendance(correction, cid)
 
-    return jsonify({"message": f"Correction {action}"}), 200
+    corrections_col.update_one({"_id": ObjectId(cid)}, {"$set": {"status": action, "attendance_synced": synced}})
+
+    if not synced:
+        return jsonify({"message": f"Correction {action}, but the attendance record failed to sync: {sync_error}", "synced": False}), 200
+    return jsonify({"message": f"Correction {action}", "synced": True}), 200
 
 
 @bp.route("/api/admin/corrections/backfill", methods=["POST"])
@@ -293,7 +312,8 @@ def backfill_approved_corrections():
         if attendance_col.find_one({"correction_ref": cid}):
             skipped += 1
             continue
-        if _apply_correction_attendance(correction, cid):
+        synced, _reason = _apply_correction_attendance(correction, cid)
+        if synced:
             fixed += 1
         else:
             skipped += 1
