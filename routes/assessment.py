@@ -38,11 +38,22 @@ def create_assessment():
     title = str(data.get("title", "")).strip()
     if not title:
         return jsonify({"message": "title is required"}), 400
+    # AdminAssessment.jsx's builder sends "duration"/"passing_score" (not
+    # "duration_minutes") — this endpoint only ever read the latter, so a
+    # freshly created assessment's Duration/Passing Score fields were
+    # silently discarded (duration_minutes always defaulted to 0, and
+    # passing_score was never stored at all). duration_minutes is kept as a
+    # duplicate for get_assessment_by_token()'s existing fallback read and
+    # the invite-email text below, which both already accept either key.
+    duration      = int(data.get("duration", data.get("duration_minutes", 30)) or 30)
+    passing_score = int(data.get("passing_score", 60) or 60)
     doc = {
         "title":            title,
         "description":      str(data.get("description", "")).strip(),
         "questions":        data.get("questions", []),
-        "duration_minutes": int(data.get("duration_minutes", 0)),
+        "duration":         duration,
+        "duration_minutes": duration,
+        "passing_score":    passing_score,
         "created_by":       str(request.user["_id"]),
         "created_at":       datetime.now(timezone.utc),
     }
@@ -62,9 +73,18 @@ def update_assessment(assessment_id):
         return jsonify({"message": "Invalid ID"}), 400
     data   = request.json or {}
     update = {"updated_at": datetime.now(timezone.utc)}
-    for k in ["title", "description", "questions", "duration_minutes"]:
+    for k in ["title", "description", "questions"]:
         if k in data:
             update[k] = data[k]
+    # Same field-name mismatch as create_assessment() above — the builder
+    # sends "duration"/"passing_score", never "duration_minutes", so this
+    # loop previously never touched either field on an edit.
+    if "duration" in data or "duration_minutes" in data:
+        duration = int(data.get("duration", data.get("duration_minutes", 30)) or 30)
+        update["duration"] = duration
+        update["duration_minutes"] = duration
+    if "passing_score" in data:
+        update["passing_score"] = int(data.get("passing_score", 60) or 60)
     result = assessments_col.update_one({"_id": obj}, {"$set": update})
     if result.matched_count == 0:
         return jsonify({"message": "Assessment not found"}), 404
@@ -197,9 +217,22 @@ def candidate_result(candidate_id):
 
 @bp.route("/api/assessment/<token>", methods=["GET"])
 def get_assessment_by_token(token):
+    """Safe-to-call-repeatedly preview: title/description/duration/question
+    COUNT only — never the actual question text/options, and never mutates
+    `status`. Deliberately idempotent: corporate email security scanners
+    (e.g. Microsoft Defender Safe Links) routinely pre-fetch every URL in an
+    inbound email the moment it arrives, before the candidate ever opens it —
+    if this endpoint marked the token "started" (as it used to), that
+    automated pre-fetch alone would burn the one-time attempt before the
+    real candidate ever saw the link. The actual one-shot "begin" transition
+    lives in POST .../start below instead."""
     invite = candidates_col.find_one({"token": token})
-    if not invite or invite.get("status") == "completed":
+    if not invite:
         return jsonify({"message": "Link is invalid or has already been used."}), 404
+    if invite.get("status") == "completed":
+        return jsonify({"message": "This assessment has already been submitted."}), 404
+    if invite.get("status") == "started":
+        return jsonify({"message": "This assessment was already started and can only be attempted once. Contact HR if you were disconnected."}), 404
 
     try:
         assessment = assessments_col.find_one({"_id": ObjectId(invite["assessment_id"])})
@@ -208,7 +241,49 @@ def get_assessment_by_token(token):
     if not assessment:
         return jsonify({"message": "Assessment not found."}), 404
 
-    candidates_col.update_one({"token": token}, {"$set": {"status": "started"}})
+    return jsonify({
+        "title":          assessment.get("title"),
+        "description":    assessment.get("description", ""),
+        "duration":       assessment.get("duration", assessment.get("duration_minutes", 30)),
+        "passing_score":  assessment.get("passing_score", 60),
+        "question_count": len(assessment.get("questions", [])),
+    }), 200
+
+
+@bp.route("/api/assessment/<token>/start", methods=["POST"])
+def start_assessment_by_token(token):
+    """The one-shot "Begin Assessment" action — the only place `status`
+    transitions to "started" and the only place the actual question
+    text/options are ever transmitted. Re-firing this (accidental
+    double-click, or the candidate closing the tab and reopening the same
+    link) is rejected once a first call has already succeeded, so the exam
+    can only genuinely be attempted once per invite."""
+    invite = candidates_col.find_one({"token": token})
+    if not invite:
+        return jsonify({"message": "Link is invalid or has already been used."}), 404
+    if invite.get("status") == "completed":
+        return jsonify({"message": "This assessment has already been submitted."}), 404
+    if invite.get("status") == "started":
+        return jsonify({"message": "This assessment was already started and can only be attempted once. Contact HR if you were disconnected."}), 404
+
+    try:
+        assessment = assessments_col.find_one({"_id": ObjectId(invite["assessment_id"])})
+    except Exception:
+        assessment = None
+    if not assessment:
+        return jsonify({"message": "Assessment not found."}), 404
+
+    # Atomic compare-and-set — only the request that actually flips
+    # "invited"/whatever-it-was -> "started" gets the questions back; a
+    # near-simultaneous second request (e.g. a fast double-click) matches
+    # zero documents here and falls through to the 409 below instead of
+    # both requests racing to read the question content.
+    result = candidates_col.update_one(
+        {"token": token, "status": {"$ne": "started"}},
+        {"$set": {"status": "started", "started_at": datetime.now(timezone.utc)}},
+    )
+    if result.modified_count == 0:
+        return jsonify({"message": "This assessment was already started and can only be attempted once. Contact HR if you were disconnected."}), 409
 
     questions = []
     for q in assessment.get("questions", []):
