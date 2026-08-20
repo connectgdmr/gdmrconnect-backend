@@ -58,8 +58,18 @@ def save_pms_template():
 @bp.route("/api/pms-template", methods=["GET"])
 @token_required
 def get_pms_template():
-    uid      = str(request.user["_id"])
-    template = pms_templates_col.find_one({"assigned_to": uid})
+    uid = str(request.user["_id"])
+    # An employee can be explicitly assigned by more than one creator at
+    # once — a manager and HR/admin both independently picking the same
+    # person in "Assign to Employees" is entirely normal, not a data error
+    # (a manager-owned template is keyed on created_by, an admin-owned one
+    # on department; nothing stops both from listing the same employee).
+    # An unsorted find_one() here would deterministically but silently
+    # resolve to whichever happened to win Mongo's natural order — often
+    # NOT the one the employee actually meant to fill out — so their
+    # response then only ever reached that same wrong owner, forever.
+    # Sorting by updated_at picks the most recently assigned/edited one.
+    template = pms_templates_col.find_one({"assigned_to": uid}, sort=[("updated_at", -1)])
     if not template:
         return jsonify({"sessions": [], "message": "No active evaluations assigned to you."}), 200
 
@@ -77,7 +87,10 @@ def get_pms_template():
             "message": "You've already submitted this evaluation — see PMS History below.",
         }), 200
 
-    template.pop("_id", None)
+    # _id now travels with the response (as a string) so the frontend can
+    # send it straight back on submit — see submit_pms_review()'s use of
+    # data.get("template_id") for why that round-trip matters.
+    template["_id"] = str(template["_id"])
     return jsonify(template), 200
 
 
@@ -88,7 +101,23 @@ def submit_pms_review():
     data  = request.json
     month = datetime.now(IST).strftime("%Y-%m")
 
-    template   = pms_templates_col.find_one({"assigned_to": uid})
+    # Use the exact template the employee was shown (GET /api/pms-template
+    # now sends its _id back for this reason) rather than re-querying fresh
+    # here — with more than one template possibly assigned to this employee
+    # at once, a second independent find_one() could resolve to a DIFFERENT
+    # one than what they actually filled out, misattributing the submission
+    # to the wrong creator. Falls back to the old lookup only if the
+    # frontend didn't send one (older cached build) or it's since been
+    # deleted/reassigned.
+    template = None
+    template_id = data.get("template_id") if data else None
+    if template_id:
+        try:
+            template = pms_templates_col.find_one({"_id": ObjectId(template_id), "assigned_to": uid})
+        except Exception:
+            template = None
+    if not template:
+        template = pms_templates_col.find_one({"assigned_to": uid}, sort=[("updated_at", -1)])
     cycle_name = template.get("cycle_name", "") if template else ""
     owner_id   = template.get("created_by") if template else None
     owner_role = None
