@@ -235,6 +235,9 @@ def list_employees():
     # driven entirely by the assignablePool prop, which for a delegate is this
     # endpoint's response. "lms"/"payroll"/"career" — AdminLMS/AdminPayroll/
     # AdminCareer's own employee-assignment dropdowns read the same prop.
+    # "clients" — ClientsWorkspace.jsx's admin-scope department-folder list
+    # merges departments_col with names only seen on the roster, same reason
+    # "departments" above needs it.
     if not (_is_admin(request.user)
             or _has_module_grant(request.user, "employees")
             or _has_module_grant(request.user, "attendance")
@@ -245,7 +248,8 @@ def list_employees():
             or _has_module_grant(request.user, "pms")
             or _has_module_grant(request.user, "lms")
             or _has_module_grant(request.user, "payroll")
-            or _has_module_grant(request.user, "career")):
+            or _has_module_grant(request.user, "career")
+            or _has_module_grant(request.user, "clients")):
         return jsonify({"message": "Unauthorized access."}), 403
 
     emp_query: dict = {"role": {"$in": ["employee", "manager", "owner"]}}
