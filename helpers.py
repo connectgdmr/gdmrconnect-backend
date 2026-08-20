@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timedelta
 from bson import ObjectId
 from config import IST
-from database import attendance_col, users_col, access_grants_col
+from database import attendance_col, users_col, access_grants_col, holidays_col
 
 
 # ── Timezone helpers ──────────────────────────────────────────────────────────
@@ -123,37 +123,19 @@ def is_offboarded(user_doc):
 
 
 # ── Company holidays ─────────────────────────────────────────────────────────
-# Single source of truth for the company holiday calendar — the frontend's
-# Holiday Calendar tab and Attendance Calendar both fetch GET /api/holidays
-# (routes/calendar.py) instead of each hardcoding their own copy, and
-# classify_attendance_day() below treats a holiday exactly like a weekend
-# (excluded from "absent"/LOP) so payroll's auto-LOP fill
-# (routes/payroll.py's payroll_lop_preview -> _month_calendar_for_employee)
-# stops silently deducting pay for days nobody was expected to work.
-# 2026 only — matches the single-year limitation this system already had
-# everywhere holidays showed up (the frontend's old src/data/holidays.js,
-# "Holiday Calendar 2026" heading) before this became the backend source
-# of truth; extending to future years is a separate, larger feature.
-COMPANY_HOLIDAYS = [
-    {"id": 1,  "date": "2026-01-01", "day": "Thursday",  "name": "New Year"},
-    {"id": 2,  "date": "2026-01-26", "day": "Monday",    "name": "Republic Day"},
-    {"id": 3,  "date": "2026-02-15", "day": "Sunday",    "name": "Shivaratri"},
-    {"id": 4,  "date": "2026-03-04", "day": "Wednesday", "name": "Holi"},
-    {"id": 5,  "date": "2026-03-21", "day": "Saturday",  "name": "Eid-ul-Fitr"},
-    {"id": 6,  "date": "2026-04-03", "day": "Friday",    "name": "Good Friday"},
-    {"id": 7,  "date": "2026-04-05", "day": "Sunday",    "name": "Easter"},
-    {"id": 8,  "date": "2026-05-01", "day": "Friday",    "name": "Labour Day"},
-    {"id": 9,  "date": "2026-05-27", "day": "Wednesday", "name": "Bakrid"},
-    {"id": 10, "date": "2026-06-26", "day": "Friday",    "name": "Muharram"},
-    {"id": 11, "date": "2026-08-15", "day": "Saturday",  "name": "Independence Day"},
-    {"id": 12, "date": "2026-08-26", "day": "Wednesday", "name": "Thiruvonam"},
-    {"id": 13, "date": "2026-09-04", "day": "Friday",    "name": "Janmashtami"},
-    {"id": 14, "date": "2026-10-02", "day": "Friday",    "name": "Gandhi Jayanti"},
-    {"id": 15, "date": "2026-10-20", "day": "Tuesday",   "name": "Vijayadashami"},
-    {"id": 16, "date": "2026-11-08", "day": "Sunday",    "name": "Diwali"},
-    {"id": 17, "date": "2026-12-25", "day": "Friday",    "name": "Christmas"},
-]
-COMPANY_HOLIDAY_DATES = {h["date"] for h in COMPANY_HOLIDAYS}
+# Single source of truth for the company holiday calendar — holidays_col
+# (database.py), managed via GET/POST/DELETE /api/holidays (routes/
+# calendar.py). The Holiday Calendar tab, the Attendance Calendar's
+# grey-out overlay, and classify_attendance_day() below (which treats a
+# holiday exactly like a weekend — excluded from "absent"/LOP, so
+# payroll's auto-LOP fill via routes/payroll.py's payroll_lop_preview ->
+# _month_calendar_for_employee stops silently deducting pay for a holiday)
+# all read from the same collection, so none of them can drift out of
+# sync with each other or with what an admin actually added/removed.
+def get_company_holiday_dates():
+    """{"YYYY-MM-DD", ...} for every stored holiday — call once per request
+    (not per day in a loop) and reuse the returned set."""
+    return {h["date"] for h in holidays_col.find({}, {"date": 1}) if h.get("date")}
 
 
 # ── Attendance day classification ───────────────────────────────────────────

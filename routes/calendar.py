@@ -20,25 +20,36 @@ differently:
   None + weekend             -> "weekly_off"       (spec: grey)
   None, not weekend          -> omitted entirely   (before DOJ / after LWD)
 
-Company holidays (helpers.COMPANY_HOLIDAYS) are treated exactly like
-weekends here — excluded from "absent"/LOP the same way — so a weekday
-holiday with no check-ins shows as "weekly_off" (spec: grey) instead of
-LOP, and payroll's auto-LOP fill (routes/payroll.py's payroll_lop_preview,
-which calls _month_calendar_for_employee directly) stops deducting pay
-for them too.
+Company holidays (database.holidays_col) are treated exactly like weekends
+here — excluded from "absent"/LOP the same way — so a weekday holiday with
+no check-ins shows as "weekly_off" (spec: grey) instead of LOP, and
+payroll's auto-LOP fill (routes/payroll.py's payroll_lop_preview, which
+calls _month_calendar_for_employee directly) stops deducting pay for them
+too.
 """
+import re
 from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
+from bson.errors import InvalidId
+from pymongo.errors import DuplicateKeyError
 
-from database import attendance_col, leaves_col, users_col
+from database import attendance_col, leaves_col, users_col, holidays_col
 from decorators import token_required
 from helpers import (_is_admin, _has_module_grant, _mgr_depts,
                       classify_attendance_day, _date_str, format_datetime_ist,
-                      COMPANY_HOLIDAYS, COMPANY_HOLIDAY_DATES)
+                      get_company_holiday_dates)
 from config import IST
 
 bp = Blueprint("calendar", __name__)
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _holiday_allowed(user, write=False):
+    # Holidays don't have their own grantable module — they're an
+    # attendance-adjacent concept (they change how attendance/LOP is
+    # computed), so the existing "attendance" grant covers managing them too.
+    return _is_admin(user) or _has_module_grant(user, "attendance", write=write)
 
 
 def _month_calendar_for_employee(uid, month_str):
@@ -80,6 +91,7 @@ def _month_calendar_for_employee(uid, month_str):
     joined      = _date_str(emp.get("doj"))
     resignation = emp.get("resignation") or {}
     lwd         = _date_str(resignation.get("last_working_day"))
+    holiday_dates = get_company_holiday_dates()  # one query for the whole month, not per-day
 
     days: dict = {}
     counts = {"present": 0, "approved_leave": 0, "lop": 0, "weekly_off": 0}
@@ -96,7 +108,7 @@ def _month_calendar_for_employee(uid, month_str):
         if lwd and day_str > lwd:
             continue
 
-        is_weekend   = datetime.strptime(day_str, "%Y-%m-%d").weekday() >= 5 or day_str in COMPANY_HOLIDAY_DATES
+        is_weekend   = datetime.strptime(day_str, "%Y-%m-%d").weekday() >= 5 or day_str in holiday_dates
         is_today     = day_str == today_str
         day_checkins = {uid} if day_str in checkin_times else set()
 
@@ -141,7 +153,52 @@ def list_holidays():
     # Calendar's grey-out overlay both read this same list, so they can
     # never drift the way the old frontend-only static file and this
     # backend's own LOP math implicitly did.
-    return jsonify(COMPANY_HOLIDAYS), 200
+    rows = list(holidays_col.find().sort("date", 1))
+    for h in rows:
+        h["_id"] = str(h["_id"])
+    return jsonify(rows), 200
+
+
+@bp.route("/api/admin/holidays", methods=["POST"])
+@token_required
+def add_holiday():
+    if not _holiday_allowed(request.user, write=True):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data = request.json or {}
+    date = str(data.get("date", "")).strip()
+    name = str(data.get("name", "")).strip()
+    if not DATE_RE.match(date):
+        return jsonify({"message": "date must be in YYYY-MM-DD format"}), 400
+    if not name:
+        return jsonify({"message": "Holiday name is required"}), 400
+    try:
+        day_name = datetime.strptime(date, "%Y-%m-%d").strftime("%A")
+    except ValueError:
+        return jsonify({"message": "Invalid date"}), 400
+
+    doc = {"date": date, "day": day_name, "name": name}
+    try:
+        res = holidays_col.insert_one(doc)
+    except DuplicateKeyError:
+        return jsonify({"message": "A holiday is already set on this date."}), 400
+    doc["_id"] = str(res.inserted_id)
+    return jsonify(doc), 201
+
+
+@bp.route("/api/admin/holidays/<holiday_id>", methods=["DELETE"])
+@token_required
+def delete_holiday(holiday_id):
+    if not _holiday_allowed(request.user, write=True):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(holiday_id)
+    except InvalidId:
+        return jsonify({"message": "Invalid holiday ID"}), 400
+    result = holidays_col.delete_one({"_id": obj})
+    if result.deleted_count == 0:
+        return jsonify({"message": "Holiday not found"}), 404
+    return jsonify({"message": "Holiday deleted."}), 200
 
 
 @bp.route("/api/my/attendance/calendar", methods=["GET"])

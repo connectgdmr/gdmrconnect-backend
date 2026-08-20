@@ -95,6 +95,14 @@ messages_col      = db["messages"]
 # ── Achievements ──────────────────────────────────────────────────────────────
 achievements_col = db["achievements"]
 
+# ── Company Holidays ────────────────────────────────────────────────────────
+# {date: "YYYY-MM-DD", day: "Thursday", name: "New Year"} — admin-managed via
+# routes/calendar.py (GET/POST/DELETE /api/holidays), the single source of
+# truth for the Holiday Calendar tab, the Attendance Calendar's grey-out
+# overlay, and payroll's LOP auto-fill (all three read/derive from this
+# collection so none of them can drift out of sync with each other again).
+holidays_col = db["holidays"]
+
 # ── Indexes (background=True — no write-lock) ─────────────────────────────────
 try:
     users_col.create_index("email", background=True)
@@ -145,6 +153,7 @@ try:
     conversations_col.create_index([("type", 1), ("members", 1)], background=True)
     messages_col.create_index([("conversation_id", 1), ("created_at", 1)], background=True)
     messages_col.create_index([("conversation_id", 1), ("read_by", 1)], background=True)
+    holidays_col.create_index("date", unique=True, background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
@@ -169,3 +178,37 @@ try:
         print(f"Startup migration: added lockout fields to {_lk_count} user(s).")
 except Exception as _lk_err:
     print(f"Warning: lockout migration failed: {_lk_err}")
+
+try:
+    # One-time: holidays used to be a hardcoded list (helpers.py / the
+    # frontend's src/data/holidays.js) with no admin UI at all — seed the
+    # real collection with that same 2026 list so nothing is lost the first
+    # time this runs against an empty holidays_col. Never overwrites once
+    # any holiday exists (including if an admin has since deleted all of
+    # them on purpose — count stays 0 either way, so this would reseed;
+    # acceptable since "delete everything" isn't a realistic real-world state
+    # for a company holiday calendar, unlike "haven't been touched yet").
+    if holidays_col.count_documents({}) == 0:
+        _seed_holidays = [
+            {"date": "2026-01-01", "day": "Thursday",  "name": "New Year"},
+            {"date": "2026-01-26", "day": "Monday",    "name": "Republic Day"},
+            {"date": "2026-02-15", "day": "Sunday",    "name": "Shivaratri"},
+            {"date": "2026-03-04", "day": "Wednesday", "name": "Holi"},
+            {"date": "2026-03-21", "day": "Saturday",  "name": "Eid-ul-Fitr"},
+            {"date": "2026-04-03", "day": "Friday",    "name": "Good Friday"},
+            {"date": "2026-04-05", "day": "Sunday",    "name": "Easter"},
+            {"date": "2026-05-01", "day": "Friday",    "name": "Labour Day"},
+            {"date": "2026-05-27", "day": "Wednesday", "name": "Bakrid"},
+            {"date": "2026-06-26", "day": "Friday",    "name": "Muharram"},
+            {"date": "2026-08-15", "day": "Saturday",  "name": "Independence Day"},
+            {"date": "2026-08-26", "day": "Wednesday", "name": "Thiruvonam"},
+            {"date": "2026-09-04", "day": "Friday",    "name": "Janmashtami"},
+            {"date": "2026-10-02", "day": "Friday",    "name": "Gandhi Jayanti"},
+            {"date": "2026-10-20", "day": "Tuesday",   "name": "Vijayadashami"},
+            {"date": "2026-11-08", "day": "Sunday",    "name": "Diwali"},
+            {"date": "2026-12-25", "day": "Friday",    "name": "Christmas"},
+        ]
+        holidays_col.insert_many(_seed_holidays)
+        print(f"Startup migration: seeded {len(_seed_holidays)} company holiday(s).")
+except Exception as _hol_err:
+    print(f"Warning: holiday seed migration failed: {_hol_err}")
