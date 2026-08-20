@@ -326,12 +326,16 @@ def list_departments():
     # without it here the dropdown silently renders with zero options (404s
     # under the hood, EmployeeDashboard's loadDelegatedDepartments() swallows
     # the failure and just leaves the list empty). "manager" — RegisterManager's
-    # Departments checklist needs it too, for the same reason.
+    # Departments checklist needs it too, for the same reason. "clients" —
+    # ClientsWorkspace.jsx's admin-scope view uses this to show every
+    # department as a folder (even ones with zero clients yet), not just
+    # departments derived from clients that already exist.
     if not (_is_admin(request.user)
             or _has_module_grant(request.user, "departments")
             or _has_module_grant(request.user, "ats")
             or _has_module_grant(request.user, "employees")
-            or _has_module_grant(request.user, "manager")):
+            or _has_module_grant(request.user, "manager")
+            or _has_module_grant(request.user, "clients")):
         return jsonify({"message": "Unauthorized"}), 403
     depts = []
     for d in departments_col.find().sort("name", 1):
