@@ -17,7 +17,7 @@ from database import (
 )
 from decorators import token_required
 from extensions import bcrypt
-from helpers import _is_admin, _mgr_depts, _serialize_emp_status, parse_employment_type, _has_module_grant
+from helpers import _is_admin, _mgr_depts, _serialize_emp_status, parse_employment_type, _has_module_grant, is_offboarded
 from utils import send_email, generate_random_password
 from config import IST
 
@@ -289,8 +289,14 @@ def list_managers():
             or _has_module_grant(request.user, "manager")
             or _has_module_grant(request.user, "employees")):
         return jsonify({"message": "Unauthorized"}), 403
+    # Excludes off-boarded managers/owners — this list feeds selection
+    # dropdowns (EmployeeForm's Assigned Manager picker, etc.) and the
+    # Managers List page, and there's no legitimate reason to assign
+    # someone to, or list as active, a manager who's already left.
     managers = []
     for m in users_col.find({"role": {"$in": ["manager", "owner"]}}, {"password": 0}):
+        if is_offboarded(m):
+            continue
         m["_id"] = str(m["_id"])
         managers.append(m)
     return jsonify(managers), 200

@@ -12,7 +12,7 @@ from bson import ObjectId
 
 from database import conversations_col, messages_col, users_col
 from decorators import token_required
-from helpers import _is_admin
+from helpers import _is_admin, is_offboarded
 
 bp = Blueprint("chat", __name__)
 
@@ -51,13 +51,17 @@ def _refresh_conv_preview(conv_id_str):
 @bp.route("/api/chat/users", methods=["GET"])
 @token_required
 def chat_users():
-    """All staff the caller may message, excluding themselves."""
+    """All staff the caller may message, excluding themselves and anyone
+    off-boarded — an ex-employee showing up as a messageable contact isn't
+    useful, and existing DMs with them still work fine without this."""
     uid  = str(request.user["_id"])
     rows = []
     for u in users_col.find(
         {"_id": {"$ne": ObjectId(uid)}},
-        {"name": 1, "role": 1, "department": 1, "position": 1, "email": 1, "phone": 1, "location": 1}
+        {"name": 1, "role": 1, "department": 1, "position": 1, "email": 1, "phone": 1, "location": 1, "resignation": 1}
     ):
+        if is_offboarded(u):
+            continue
         dept = u.get("department") or ""
         if isinstance(dept, list):
             dept = ", ".join(d for d in dept if d)
