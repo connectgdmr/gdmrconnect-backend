@@ -143,14 +143,13 @@ def create_app():
     from routes.achievements  import bp as achievements_bp
     from routes.chat          import bp as chat_bp
     from routes.calendar      import bp as calendar_bp
-    from routes.mail          import bp as mail_bp
 
     for bp in (
         auth_bp, employees_bp, access_bp, pms_bp, attendance_bp,
         leaves_bp, assistant_bp, assets_bp, announcements_bp,
         notifications_bp, stats_bp, assessment_bp, lms_bp,
         career_bp, payroll_bp, work_plans_bp, clients_bp,
-        ats_bp, achievements_bp, chat_bp, calendar_bp, mail_bp,
+        ats_bp, achievements_bp, chat_bp, calendar_bp,
     ):
         app.register_blueprint(bp)
 

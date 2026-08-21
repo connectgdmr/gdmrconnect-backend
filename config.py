@@ -30,15 +30,6 @@ CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-# ── Personal Gmail integration (routes/mail.py) ──────────────────────────────
-# Encrypts each user's Gmail App Password at rest (Fernet — symmetric,
-# reversible, unlike the one-way bcrypt hashing used for login passwords;
-# this one has to be decrypted again to actually authenticate to Gmail's
-# IMAP/SMTP). Must be a valid Fernet key (Fernet.generate_key() output) —
-# routes/mail.py refuses to start a connect/inbox/send call without it
-# rather than silently failing partway through.
-MAIL_ENCRYPTION_KEY = os.getenv("MAIL_ENCRYPTION_KEY")
-
 # ── Company constants ─────────────────────────────────────────────────────────
 # Owners always receive org-wide work-plan digests and leave notifications.
 OWNER_EMAILS  = ["gina.gdmr@gmail.com", "githi@gdmrfoundation.com"]
