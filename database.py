@@ -103,6 +103,13 @@ achievements_col = db["achievements"]
 # collection so none of them can drift out of sync with each other again).
 holidays_col = db["holidays"]
 
+# ── Personal Mail (Gmail App Password) ───────────────────────────────────────
+# One document per user: {user_id, email, app_password_enc, connected_at}.
+# app_password_enc is Fernet-encrypted (utils_mail.py) — never returned to
+# the frontend once saved. Purely personal (routes/mail.py) — every route is
+# scoped to request.user["_id"], no admin/delegated-access angle at all.
+mail_accounts_col = db["mail_accounts"]
+
 # ── Indexes (background=True — no write-lock) ─────────────────────────────────
 try:
     users_col.create_index("email", background=True)
@@ -154,6 +161,7 @@ try:
     messages_col.create_index([("conversation_id", 1), ("created_at", 1)], background=True)
     messages_col.create_index([("conversation_id", 1), ("read_by", 1)], background=True)
     holidays_col.create_index("date", unique=True, background=True)
+    mail_accounts_col.create_index("user_id", unique=True, background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
