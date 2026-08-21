@@ -58,6 +58,8 @@ def mail_connect():
         return jsonify({"message": str(e)}), 503
     except MailAuthError as e:
         return jsonify({"message": str(e)}), 400
+    except Exception as e:
+        return jsonify({"message": f"Unexpected error connecting to Gmail: {e}"}), 500
 
     mail_accounts_col.update_one(
         {"user_id": uid},
@@ -101,6 +103,8 @@ def mail_inbox():
         return jsonify({"message": str(e)}), 503
     except MailAuthError as e:
         return jsonify({"message": str(e)}), 400
+    except Exception as e:
+        return jsonify({"message": f"Unexpected error loading inbox: {e}"}), 500
 
     return jsonify(result), 200
 
@@ -120,6 +124,8 @@ def mail_message(uid_param):
         return jsonify({"message": str(e)}), 503
     except MailAuthError as e:
         return jsonify({"message": str(e)}), 400
+    except Exception as e:
+        return jsonify({"message": f"Unexpected error loading message: {e}"}), 500
 
     if not message:
         return jsonify({"message": "Message not found"}), 404

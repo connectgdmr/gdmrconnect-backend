@@ -14,6 +14,8 @@ below so a failure is actionable instead of a bare "login failed".
 """
 import imaplib
 import smtplib
+import socket
+import ssl
 import email
 import email.utils
 import email.header
@@ -33,6 +35,20 @@ _GMAIL_HELP = (
     "2-Step Verification is on for this Google account, the App Password "
     "was copied correctly (no spaces), and IMAP is enabled in Gmail's "
     "Settings → \"See all settings\" → Forwarding and POP/IMAP."
+)
+
+# Connection-level failures (DNS/timeout/refused/TLS) are NOT imaplib.IMAP4.error
+# or smtplib.SMTPAuthenticationError — they're plain socket/ssl errors. Without
+# catching these too, they escape as an unhandled 500 with no JSON body, which
+# the frontend can't show a reason for. Caught separately so the message is
+# honest about "can't reach Gmail's servers" vs. "Gmail rejected the login".
+_NETWORK_ERRORS = (socket.timeout, socket.gaierror, OSError, ssl.SSLError)
+_NETWORK_HELP = (
+    "Couldn't reach Gmail's mail servers ({host}:{port}) from the server. "
+    "This isn't a wrong-password issue — either the network blocked the "
+    "connection or Gmail's servers didn't respond. Try again in a moment; "
+    "if it keeps happening, this server's outbound network may be blocking "
+    "IMAP/SMTP ports."
 )
 
 
@@ -79,19 +95,29 @@ def decrypt_secret(token: str) -> str:
 def imap_connect(email_addr: str, app_password: str):
     try:
         conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    except _NETWORK_ERRORS as e:
+        raise MailConfigError(_NETWORK_HELP.format(host=IMAP_HOST, port=IMAP_PORT) + f" ({e})")
+    try:
         conn.login(email_addr, app_password)
         return conn
     except imaplib.IMAP4.error:
         raise MailAuthError(_GMAIL_HELP)
+    except _NETWORK_ERRORS as e:
+        raise MailConfigError(_NETWORK_HELP.format(host=IMAP_HOST, port=IMAP_PORT) + f" ({e})")
 
 
 def smtp_connect(email_addr: str, app_password: str):
     try:
         conn = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
+    except _NETWORK_ERRORS as e:
+        raise MailConfigError(_NETWORK_HELP.format(host=SMTP_HOST, port=SMTP_PORT) + f" ({e})")
+    try:
         conn.login(email_addr, app_password)
         return conn
     except smtplib.SMTPAuthenticationError:
         raise MailAuthError(_GMAIL_HELP)
+    except _NETWORK_ERRORS as e:
+        raise MailConfigError(_NETWORK_HELP.format(host=SMTP_HOST, port=SMTP_PORT) + f" ({e})")
 
 
 def test_login(email_addr: str, app_password: str):
