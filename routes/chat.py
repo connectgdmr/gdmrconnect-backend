@@ -56,7 +56,7 @@ def chat_users():
     rows = []
     for u in users_col.find(
         {"_id": {"$ne": ObjectId(uid)}},
-        {"name": 1, "role": 1, "department": 1}
+        {"name": 1, "role": 1, "department": 1, "position": 1, "email": 1, "phone": 1, "location": 1}
     ):
         dept = u.get("department") or ""
         if isinstance(dept, list):
@@ -66,6 +66,10 @@ def chat_users():
             "name":       u.get("name") or "",
             "role":       u.get("role") or "",
             "department": dept,
+            "position":   u.get("position") or "",
+            "email":      u.get("email") or "",
+            "phone":      u.get("phone") or "",
+            "location":   u.get("location") or "",
         })
     return jsonify({"users": rows}), 200
 
