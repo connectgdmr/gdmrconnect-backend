@@ -6,6 +6,7 @@ Announcements CRUD, attendance corrections, user profile.
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
+import cloudinary.uploader
 
 from database import (announcements_col, corrections_col, attendance_col,
                       users_col)
@@ -370,8 +371,53 @@ def get_my_profile():
         "birthday":   birthday.strftime("%Y-%m-%d") if isinstance(birthday, datetime) else birthday,
         "phone":      user.get("phone"),
         "bio":        user.get("bio"),
+        "photo_url":  user.get("photo_url"),
         "offboarded": is_offboarded(user),
     }), 200
+
+
+# Self-service profile picture — every user uploads/replaces their own,
+# scoped to request.user["_id"] only (no admin angle, this isn't the
+# admin-managed employee-documents flow above). Reuses the same Cloudinary
+# SDK already configured for that flow (see app_new.py's cloudinary.config()
+# call and routes/employees.py's document uploads) — no new credentials or
+# dependency needed, this account is already wired in.
+_PROFILE_PIC_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+
+@bp.route("/api/my/profile-picture", methods=["POST"])
+@token_required
+def upload_my_profile_picture():
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"message": "file is required"}), 400
+    if file.mimetype not in _PROFILE_PIC_TYPES:
+        return jsonify({"message": "Please upload a JPEG, PNG, WEBP, or GIF image."}), 400
+
+    file.seek(0, 2)
+    if file.tell() > 5 * 1024 * 1024:
+        return jsonify({"message": "Image too large (max 5 MB)"}), 400
+    file.seek(0)
+
+    uid = str(request.user["_id"])
+    try:
+        res = cloudinary.uploader.upload(
+            file, resource_type="image", folder=f"gdmr/profile_pictures/{uid}",
+            use_filename=False, unique_filename=True, overwrite=True,
+            transformation=[{"width": 400, "height": 400, "crop": "fill", "gravity": "face"}],
+        )
+        url = res.get("secure_url")
+    except Exception as e:
+        return jsonify({"message": f"Upload failed: {str(e)}"}), 500
+
+    users_col.update_one({"_id": request.user["_id"]}, {"$set": {"photo_url": url}})
+    return jsonify({"photo_url": url}), 200
+
+
+@bp.route("/api/my/profile-picture", methods=["DELETE"])
+@token_required
+def remove_my_profile_picture():
+    users_col.update_one({"_id": request.user["_id"]}, {"$unset": {"photo_url": ""}})
+    return jsonify({"message": "Profile picture removed."}), 200
 
 
 @bp.route("/api/my/profile", methods=["PUT"])
