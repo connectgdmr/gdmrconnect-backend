@@ -103,6 +103,7 @@ def login():
             "email":      user.get("email"),
             "role":       user.get("role", "employee"),
             "department": user.get("department", ""),
+            "photo_url":  user.get("photo_url"),
         },
     }), 200
 

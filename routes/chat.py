@@ -58,7 +58,7 @@ def chat_users():
     rows = []
     for u in users_col.find(
         {"_id": {"$ne": ObjectId(uid)}},
-        {"name": 1, "role": 1, "department": 1, "position": 1, "email": 1, "phone": 1, "location": 1, "resignation": 1}
+        {"name": 1, "role": 1, "department": 1, "position": 1, "email": 1, "phone": 1, "location": 1, "resignation": 1, "photo_url": 1}
     ):
         if is_offboarded(u):
             continue
@@ -73,6 +73,7 @@ def chat_users():
             "position":   u.get("position") or "",
             "email":      u.get("email") or "",
             "phone":      u.get("phone") or "",
+            "photo_url":  u.get("photo_url"),
             "location":   u.get("location") or "",
         })
     return jsonify({"users": rows}), 200
