@@ -635,9 +635,14 @@ def my_lms_courses():
         try: course_ids.append(ObjectId(r["course_id"]))
         except Exception: pass
 
+    # No not_expired filter here on purpose — this hydrates every course the
+    # user already has a progress record for (direct assignment or
+    # department-wide), and a course expiring after assignment shouldn't make
+    # it silently vanish from "my courses" with zero explanation. not_expired
+    # only gates which NEW department-wide courses get auto-discovered above.
     courses = {
         str(c["_id"]): c
-        for c in lms_courses_col.find({"_id": {"$in": course_ids}, **not_expired})
+        for c in lms_courses_col.find({"_id": {"$in": course_ids}})
     }
 
     result = []
