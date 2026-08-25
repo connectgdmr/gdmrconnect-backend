@@ -23,6 +23,15 @@ def request_asset():
     data       = request.json
     asset_name = data.get("asset_name")
     reason     = data.get("reason")
+    # "New Asset" (default, backward-compatible with every existing request
+    # that predates this field) or "Damage/Service" — a report that a
+    # device the requester already has needs repair/servicing, not a
+    # request for new hardware. Reuses the exact same dual-approval +
+    # notify-office pipeline either way; only the label/urgency reads
+    # differently to whoever's approving it.
+    request_type = data.get("request_type") or "New Asset"
+    if request_type not in ("New Asset", "Damage/Service"):
+        request_type = "New Asset"
 
     if not asset_name or not reason:
         return jsonify({"message": "Asset name and reason are strictly required."}), 400
@@ -33,6 +42,7 @@ def request_asset():
         "department":    request.user.get("department"),
         "asset_name":    asset_name,
         "reason":        reason,
+        "request_type":  request_type,
         "manager_status": "Pending",
         "admin_status":  "Pending",
         "status":        "Pending",
