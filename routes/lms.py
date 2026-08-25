@@ -240,6 +240,7 @@ def assign_course(course_id):
     now = datetime.now(timezone.utc)
     assigned = skipped = 0
     newly_assigned_ids = []
+    failed = []  # [uid] — any upsert that actually errored, previously swallowed silently
     for uid in employee_ids:
         try:
             result = lms_progress_col.update_one(
@@ -261,7 +262,11 @@ def assign_course(course_id):
             else:
                 skipped += 1
         except Exception:
-            pass
+            # Previously silent — a per-user failure here (e.g. a bad ID)
+            # meant that one person just never got assigned, with the admin
+            # seeing a normal-looking "assigned to N" success message and no
+            # way to know someone was missing. Now surfaced in the response.
+            failed.append(uid)
 
     _notify_course_assigned(newly_assigned_ids, course_doc.get("title", "this course"),
                              course_doc.get("expiry_date"), scheduled_at)
@@ -269,6 +274,8 @@ def assign_course(course_id):
     msg = f"Course assigned to {assigned} employee(s)"
     if skipped:
         msg += f" ({skipped} already assigned, skipped)"
+    if failed:
+        msg += f" — {len(failed)} failed to assign, please retry for them"
     return jsonify({"message": msg, "assigned": assigned, "skipped": skipped}), 200
 
 
