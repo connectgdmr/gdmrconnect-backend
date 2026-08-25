@@ -386,8 +386,17 @@ def update_leave(leave_id):
     try:
         user = users_col.find_one({"_id": ObjectId(leave["user_id"])})
         if user:
+            # Show the real, current stage-by-stage status here — not just the
+            # final outcome — so the employee can see e.g. "Manager: Approved,
+            # Admin: Pending" instead of a flat "Pending" that looks stuck.
+            body = (
+                f"Your leave request status has been updated.\n\n"
+                f"Manager Status: {ms}\n"
+                f"Admin Status:   {as_}\n"
+                f"Final Status:   {final_status}"
+            )
             threading.Thread(target=send_email,
-                             args=(user["email"], "Leave Update", f"Your leave status is now: {final_status}"),
+                             args=(user["email"], "Leave Update", body),
                              daemon=True).start()
     except Exception as e:
         print("Email notification error:", e)
