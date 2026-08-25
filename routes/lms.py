@@ -574,7 +574,12 @@ def manager_lms_progress():
 @token_required
 def my_lms_courses():
     uid       = str(request.user["_id"])
-    dept      = request.user.get("department")
+    # A manager can oversee more than one department, so their own
+    # `department` field is sometimes a list rather than a single string
+    # (same reason _mgr_depts() exists) — an exact-match query against the
+    # raw field silently matched nothing for any such manager, which is
+    # why a department-wide-assigned course never showed up for them here.
+    depts     = _mgr_depts(request.user)
     now_utc   = datetime.now(timezone.utc)
     today_iso = _today_ist().isoformat()
     not_expired = {"$or": [
@@ -595,8 +600,8 @@ def my_lms_courses():
     progress_records = [r for r in progress_records if _is_available(r.get("scheduled_at"))]
 
     assigned_course_ids = {r["course_id"] for r in progress_records}
-    if dept:
-        for c in lms_courses_col.find({"assigned_departments": dept, **not_expired}, {"_id": 1, "dept_scheduled_at": 1}):
+    if depts:
+        for c in lms_courses_col.find({"assigned_departments": {"$in": depts}, **not_expired}, {"_id": 1, "dept_scheduled_at": 1}):
             cid = str(c["_id"])
             if cid in assigned_course_ids:
                 continue
