@@ -156,6 +156,11 @@ def assign_asset_to_office_admin(asset_id):
     if not (_is_admin(request.user) or _has_module_grant(request.user, "assets", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
 
+    try:
+        obj = ObjectId(asset_id)
+    except Exception:
+        return jsonify({"message": "Invalid asset ID"}), 400
+
     data   = request.json or {}
     emails = data.get("emails", [])
     asset  = data.get("asset", {})
@@ -176,6 +181,19 @@ def assign_asset_to_office_admin(asset_id):
     )
     for email in emails:
         threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
+
+    # This route never actually recorded the assignment — only the manager
+    # version below did — so an asset assigned from Admin looked identical
+    # to an unassigned one everywhere in the UI (there was nothing to show
+    # a persisted "Assigned to ..." status from). Record it the same way.
+    assets_col.update_one(
+        {"_id": obj},
+        {"$set": {
+            "assigned_at":        datetime.now(timezone.utc),
+            "assigned_by":        str(request.user["_id"]),
+            "assigned_to_emails": emails,
+        }}
+    )
     return jsonify({"message": "Assignment emails sent successfully."}), 200
 
 
