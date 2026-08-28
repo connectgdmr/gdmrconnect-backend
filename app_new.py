@@ -154,11 +154,12 @@ def create_app():
         app.register_blueprint(bp)
 
     # ── Background scheduler ──────────────────────────────────────────────────
-    # Guard: don't start the scheduler during testing or when Flask reloader
-    # spawns a child process (which would create duplicate cron jobs).
-    if not app.testing and os.environ.get("WERKZEUG_RUN_MAIN") != "false":
-        from jobs.scheduler import start_scheduler
-        start_scheduler()
+    # NOT started here anymore — create_app() now runs once per gunicorn
+    # worker process, and starting the scheduler per-worker would fire every
+    # cron job (reminder/digest emails) once per worker. In production,
+    # gunicorn.conf.py's when_ready hook starts it exactly once, in the
+    # master process, before any workers are forked. The dev-server entry
+    # point below starts it directly since gunicorn isn't in the picture then.
 
     return app
 
@@ -167,5 +168,12 @@ def create_app():
 app = create_app()
 
 if __name__ == "__main__":
+    # Dev server only (`python app_new.py`) — production uses gunicorn,
+    # which starts the scheduler itself via gunicorn.conf.py's when_ready.
+    # WERKZEUG_RUN_MAIN guards against Flask's reloader spawning a child
+    # process and starting a second, duplicate scheduler.
+    if os.environ.get("WERKZEUG_RUN_MAIN") != "false":
+        from jobs.scheduler import start_scheduler
+        start_scheduler()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
