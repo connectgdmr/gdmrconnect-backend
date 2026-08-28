@@ -642,8 +642,18 @@ def replace_employee_document(emp_id, doc_id):
         return jsonify({"message": f"Upload failed: {str(e)}"}), 500
 
     now = datetime.now(timezone.utc)
-    expiry_raw  = request.form.get("expiry_date")
-    expiry_date = str(expiry_raw)[:10] if expiry_raw else old_doc.get("expiry_date")
+    # A blank expiry field here is ambiguous by itself — it could mean "the
+    # admin didn't touch this field" or "the admin deliberately cleared it".
+    # The frontend always sends the key on replace (even as ""), so presence
+    # of the key is what signals intent: key sent -> use it (empty clears the
+    # expiry); key genuinely absent (e.g. an older client) -> leave untouched.
+    # Previously this always fell back to the old value on any blank input,
+    # which meant an expiry date could never actually be cleared once set.
+    if "expiry_date" in request.form:
+        expiry_raw  = request.form.get("expiry_date")
+        expiry_date = str(expiry_raw)[:10] if expiry_raw else None
+    else:
+        expiry_date = old_doc.get("expiry_date")
 
     prior_version = {
         "url":         old_doc.get("url"),
