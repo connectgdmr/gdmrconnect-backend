@@ -135,16 +135,21 @@ def _month_calendar_for_employee(uid, month_str):
         if day_str > today_str:
             # Future day: whether the employee will be present/on leave
             # isn't knowable yet, so classify_attendance_day() doesn't apply
-            # — but a weekend/holiday IS known in advance. Show just that
-            # (and let it be clicked) instead of leaving the whole rest of
-            # the month blank and unclickable; a future regular working day
-            # stays omitted since there's genuinely nothing to show yet.
+            # — but a weekend/holiday IS known in advance, shown the same as
+            # a past one. A future regular working day still can't say what
+            # will happen, but it's given a lightweight "future" entry (not
+            # counted in any summary bucket) purely so it's clickable —
+            # applying for leave ahead of time is a normal thing to want to
+            # do from here, unlike a correction, which only ever makes sense
+            # after the day is already over.
             if is_weekend:
                 entry = {"status": "weekly_off"}
                 if holiday_names.get(day_str):
                     entry["holiday_name"] = holiday_names[day_str]
                 counts["weekly_off"] += 1
-                days[day_str] = entry
+            else:
+                entry = {"status": "future"}
+            days[day_str] = entry
             continue
 
         is_today     = day_str == today_str
