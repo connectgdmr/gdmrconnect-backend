@@ -109,6 +109,13 @@ def _month_calendar_for_employee(uid, month_str):
     resignation = emp.get("resignation") or {}
     lwd         = _date_str(resignation.get("last_working_day"))
     holiday_dates = get_company_holiday_dates()  # one query for the whole month, not per-day
+    # Named holidays specifically (a plain Sat/Sun has no name) — so a
+    # "weekly_off" day on the calendar can show which holiday it actually
+    # was, not just a generic "Off", the same name the Holiday Calendar
+    # tab already shows for it.
+    holiday_names = {h["date"]: h.get("name") for h in holidays_col.find(
+        {"date": {"$in": list(holiday_dates)}}, {"date": 1, "name": 1}
+    )}
 
     days: dict = {}
     counts = {"present": 0, "approved_leave": 0, "lop": 0, "weekly_off": 0}
@@ -150,6 +157,8 @@ def _month_calendar_for_employee(uid, month_str):
             counts["weekly_off"] += 1
 
         entry = {"status": display}
+        if display == "weekly_off" and holiday_names.get(day_str):
+            entry["holiday_name"] = holiday_names[day_str]
         if display == "present":
             if checkin_times.get(day_str):
                 entry["checkin_time"] = format_datetime_ist(checkin_times[day_str])
