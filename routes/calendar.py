@@ -34,7 +34,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from pymongo.errors import DuplicateKeyError
 
-from database import attendance_col, leaves_col, users_col, holidays_col
+from database import attendance_col, leaves_col, users_col, holidays_col, corrections_col
 from decorators import token_required
 from helpers import (_is_admin, _has_module_grant, _mgr_depts,
                       classify_attendance_day, _date_str, format_datetime_ist,
@@ -73,12 +73,13 @@ def _month_calendar_for_employee(uid, month_str):
     end_str   = (end - timedelta(days=1)).date().isoformat()
     today_str = str(datetime.now(IST).date())
 
-    checkin_times = {}
+    checkin_times  = {}
+    checkout_times = {}
     for rec in attendance_col.find(
-        {"user_id": uid, "type": "checkin", "date": {"$regex": f"^{month_str}"}},
-        {"date": 1, "time": 1}
+        {"user_id": uid, "type": {"$in": ["checkin", "checkout"]}, "date": {"$regex": f"^{month_str}"}},
+        {"date": 1, "time": 1, "type": 1}
     ):
-        checkin_times[rec["date"]] = rec.get("time")
+        (checkin_times if rec["type"] == "checkin" else checkout_times)[rec["date"]] = rec.get("time")
 
     leaves = list(leaves_col.find({
         "user_id":   uid,
@@ -87,6 +88,22 @@ def _month_calendar_for_employee(uid, month_str):
         "status":    {"$nin": ["Rejected", "Cancelled"]},
     }))
     leaves_by_uid = {uid: leaves}
+
+    # Correction requests filed this month, keyed by the calendar day they
+    # target (new_time is "YYYY-MM-DDTHH:MM") — a day can carry its
+    # correction's status even when it's also present/LOP, so the calendar
+    # click-through can show "you requested a correction here" regardless
+    # of what the day otherwise displays as.
+    corrections_by_day = {}
+    for c in corrections_col.find({"user_id": uid, "month": month_str}):
+        new_time = c.get("new_time") or ""
+        if len(new_time) < 10:
+            continue
+        corrections_by_day.setdefault(new_time[:10], []).append({
+            "status":    c.get("status", "Pending"),
+            "new_time":  new_time,
+            "reason":    c.get("reason"),
+        })
 
     joined      = _date_str(emp.get("doj"))
     resignation = emp.get("resignation") or {}
@@ -133,8 +150,21 @@ def _month_calendar_for_employee(uid, month_str):
             counts["weekly_off"] += 1
 
         entry = {"status": display}
-        if display == "present" and checkin_times.get(day_str):
-            entry["checkin_time"] = format_datetime_ist(checkin_times[day_str])
+        if display == "present":
+            if checkin_times.get(day_str):
+                entry["checkin_time"] = format_datetime_ist(checkin_times[day_str])
+            if checkout_times.get(day_str):
+                entry["checkout_time"] = format_datetime_ist(checkout_times[day_str])
+        elif display == "approved_leave":
+            # Find the specific leave covering this day (leaves is normally
+            # a handful of rows, not worth indexing for a per-day loop).
+            lv = next((l for l in leaves if l.get("from_date", "") <= day_str <= l.get("to_date", "")), None)
+            if lv:
+                entry["leave_type"]   = lv.get("type", "full")
+                entry["leave_period"] = lv.get("period")
+                entry["leave_reason"] = lv.get("reason")
+        if day_str in corrections_by_day:
+            entry["corrections"] = corrections_by_day[day_str]
         days[day_str] = entry
 
     return {
