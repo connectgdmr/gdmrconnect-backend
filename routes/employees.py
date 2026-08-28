@@ -14,6 +14,7 @@ from bson import ObjectId
 from database import (
     users_col, access_grants_col, attendance_col, leaves_col,
     pms_reviews_col, corrections_col, departments_col, ats_candidates_col,
+    assets_col, pms_templates_col, lms_courses_col, clients_col,
 )
 from decorators import token_required
 from extensions import bcrypt
@@ -356,6 +357,64 @@ def list_departments():
     return jsonify(depts), 200
 
 
+def _cascade_department_rename(old_name, new_name):
+    """
+    Every place a department NAME (not departments_col's _id) gets copied
+    onto another document as a live, ongoing pointer — kept in sync here so
+    a rename or legacy-formalize doesn't silently break whichever feature
+    stored the old string. Shared by create_department() (formalizing a
+    legacy department) and update_department() (renaming a real one), so
+    the two can never drift apart on which collections they touch.
+
+    Deliberately NOT touched here: pms_reviews_col and work_plans_col store
+    department as a point-in-time historical fact (which department someone
+    was in for that month's review / that day's work plan) — rewriting
+    those would falsify the record, the same reason a payslip keeps
+    whatever department it was generated under.
+    """
+    name_re = {"$regex": f"^{re.escape(old_name)}$", "$options": "i"}
+
+    def _replace_in_value(dv):
+        if isinstance(dv, list):
+            return [new_name if isinstance(d, str) and d.strip().lower() == old_name.strip().lower() else d for d in dv]
+        return new_name
+
+    # Employees/managers — department can be a plain string or a list
+    # (multi-department managers) — replace only the matching element so a
+    # manager's OTHER departments aren't dropped.
+    for u in users_col.find({"department": name_re}, {"department": 1}):
+        users_col.update_one({"_id": u["_id"]}, {"$set": {"department": _replace_in_value(u.get("department"))}})
+
+    # ATS candidates — otherwise editing one later (for any unrelated
+    # reason) re-syncs the stale department right back onto their linked
+    # employee record via _sync_candidate_to_employee.
+    ats_candidates_col.update_many({"department": name_re}, {"$set": {"department": new_name}})
+
+    # Asset requests — so a pending request stays visible to whichever
+    # manager now owns that department, and department-filtered reports
+    # don't silently drop it.
+    assets_col.update_many({"department": name_re}, {"$set": {"department": new_name}})
+
+    # PMS templates — department can be "All", a single dept string, or a
+    # list (manager-created templates use _mgr_depts()).
+    for t in pms_templates_col.find({"department": name_re}, {"department": 1}):
+        pms_templates_col.update_one({"_id": t["_id"]}, {"$set": {"department": _replace_in_value(t.get("department"))}})
+
+    # LMS courses (assigned_departments) and Clients (departments) both
+    # store a set-like array of department names — pull the old name and
+    # add the new one rather than overwriting the array, so a doc that
+    # already also targets the new name doesn't end up with a duplicate.
+    lms_ids = [c["_id"] for c in lms_courses_col.find({"assigned_departments": name_re}, {"_id": 1})]
+    if lms_ids:
+        lms_courses_col.update_many({"_id": {"$in": lms_ids}}, {"$pull": {"assigned_departments": name_re}})
+        lms_courses_col.update_many({"_id": {"$in": lms_ids}}, {"$addToSet": {"assigned_departments": new_name}})
+
+    client_ids = [c["_id"] for c in clients_col.find({"departments": name_re}, {"_id": 1})]
+    if client_ids:
+        clients_col.update_many({"_id": {"$in": client_ids}}, {"$pull": {"departments": name_re}})
+        clients_col.update_many({"_id": {"$in": client_ids}}, {"$addToSet": {"departments": new_name}})
+
+
 @bp.route("/api/admin/departments", methods=["POST"])
 @token_required
 def create_department():
@@ -384,21 +443,11 @@ def create_department():
     # string on employee records, never as its own departments_col document
     # (AdminDepartments.jsx synthesizes a card for these, keyed by the name
     # itself instead of a real _id). Editing one of these sends legacy_name
-    # so employees currently carrying that raw string get moved onto this
-    # new record — same case-insensitive, list-safe rename cascade
-    # update_department() uses for a normal rename, just sourced from the
-    # legacy name instead of an existing document's old name.
+    # so every live pointer currently carrying that raw string gets moved
+    # onto this new record — same cascade a normal rename uses.
     legacy_name = str(data.get("legacy_name", "")).strip()
     if legacy_name and legacy_name.strip().lower() != name.strip().lower():
-        name_re = {"$regex": f"^{re.escape(legacy_name)}$", "$options": "i"}
-        for u in users_col.find({"department": name_re}, {"department": 1}):
-            dv = u.get("department")
-            if isinstance(dv, list):
-                new_dv = [name if isinstance(d, str) and d.strip().lower() == legacy_name.strip().lower() else d for d in dv]
-            else:
-                new_dv = name
-            users_col.update_one({"_id": u["_id"]}, {"$set": {"department": new_dv}})
-        ats_candidates_col.update_many({"department": name_re}, {"$set": {"department": name}})
+        _cascade_department_rename(legacy_name, name)
 
     return jsonify(doc), 201
 
@@ -431,28 +480,7 @@ def update_department(dept_id):
         old_name       = dept["name"]
         update["name"] = new_name
         if old_name != new_name:
-            # Propagate the rename to every affected employee/manager.
-            # department can be a plain string OR a list (managers of
-            # multiple departments) — a bare update_many($set) would match
-            # array fields too (Mongo's regex-on-array semantics) but then
-            # overwrite the WHOLE array with a single string, silently
-            # dropping their other departments. Match case/whitespace-
-            # tolerantly (same rule create/rename already use for name
-            # clashes) and replace only the matching element per document.
-            name_re = {"$regex": f"^{re.escape(old_name)}$", "$options": "i"}
-            for u in users_col.find({"department": name_re}, {"department": 1}):
-                dv = u.get("department")
-                if isinstance(dv, list):
-                    new_dv = [new_name if isinstance(d, str) and d.strip().lower() == old_name.strip().lower() else d for d in dv]
-                else:
-                    new_dv = new_name
-                users_col.update_one({"_id": u["_id"]}, {"$set": {"department": new_dv}})
-
-            # Also update any ATS candidate still carrying the old name —
-            # otherwise editing that candidate later (for any unrelated
-            # reason) re-syncs the stale department right back onto their
-            # linked employee record via _sync_candidate_to_employee.
-            ats_candidates_col.update_many({"department": name_re}, {"$set": {"department": new_name}})
+            _cascade_department_rename(old_name, new_name)
 
     if "description" in data:
         update["description"] = str(data["description"]).strip()
