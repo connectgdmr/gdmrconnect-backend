@@ -123,8 +123,6 @@ def _month_calendar_for_employee(uid, month_str):
     while curr < end:
         day_str = curr.date().isoformat()
         curr   += timedelta(days=1)
-        if day_str > today_str:
-            continue
         # Outside the employment window entirely — omit rather than mis-render
         # as a weekly-off/LOP day that never applied to this employee.
         if joined and day_str < joined:
@@ -132,7 +130,23 @@ def _month_calendar_for_employee(uid, month_str):
         if lwd and day_str > lwd:
             continue
 
-        is_weekend   = is_weekend_day(day_str, holiday_dates)
+        is_weekend = is_weekend_day(day_str, holiday_dates)
+
+        if day_str > today_str:
+            # Future day: whether the employee will be present/on leave
+            # isn't knowable yet, so classify_attendance_day() doesn't apply
+            # — but a weekend/holiday IS known in advance. Show just that
+            # (and let it be clicked) instead of leaving the whole rest of
+            # the month blank and unclickable; a future regular working day
+            # stays omitted since there's genuinely nothing to show yet.
+            if is_weekend:
+                entry = {"status": "weekly_off"}
+                if holiday_names.get(day_str):
+                    entry["holiday_name"] = holiday_names[day_str]
+                counts["weekly_off"] += 1
+                days[day_str] = entry
+            continue
+
         is_today     = day_str == today_str
         day_checkins = {uid} if day_str in checkin_times else set()
 
