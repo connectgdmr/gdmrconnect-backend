@@ -221,6 +221,39 @@ def my_attendance():
     return jsonify(rows), 200
 
 
+@bp.route("/api/admin/attendance", methods=["GET"])
+@token_required
+def admin_all_attendance():
+    """Master attendance log across every employee — backs AdminAttendancePage.jsx's
+    'Complete Logs' tab. Was missing entirely (frontend called this exact path,
+    api.jsx's adminAttendance(), and got a 404 every time), so that tab has
+    likely been silently broken since it was built.
+
+    Offboarded employees are excluded, per the standing admin-table convention
+    (see feedback_admin_table_design) — their historical logs still exist and
+    remain reachable via the per-employee endpoint below if ever needed, they
+    just don't clutter the day-to-day master log.
+    """
+    if not (_is_admin(request.user) or _has_module_grant(request.user, "attendance")):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    active_by_id = {
+        str(u["_id"]): u
+        for u in users_col.find({}, {"name": 1, "email": 1, "resignation": 1})
+        if not is_offboarded(u)
+    }
+
+    records = []
+    for a in attendance_col.find({"user_id": {"$in": list(active_by_id.keys())}}).sort("time", -1):
+        emp = active_by_id.get(a["user_id"])
+        a["_id"]            = str(a["_id"])
+        a["time"]           = format_datetime_ist(a["time"])
+        a["employee_name"]  = emp.get("name")  if emp else "Unknown"
+        a["employee_email"] = emp.get("email") if emp else None
+        records.append(a)
+    return jsonify(records), 200
+
+
 @bp.route("/api/admin/attendance/<emp_id>", methods=["GET"])
 @token_required
 def admin_employee_attendance(emp_id):
