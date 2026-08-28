@@ -379,6 +379,27 @@ def create_department():
     doc["_id"] = str(res.inserted_id)
     if doc.get("head_id"):
         doc["head_id"] = str(doc["head_id"])
+
+    # "Formalizing" a legacy department — one that only ever existed as a
+    # string on employee records, never as its own departments_col document
+    # (AdminDepartments.jsx synthesizes a card for these, keyed by the name
+    # itself instead of a real _id). Editing one of these sends legacy_name
+    # so employees currently carrying that raw string get moved onto this
+    # new record — same case-insensitive, list-safe rename cascade
+    # update_department() uses for a normal rename, just sourced from the
+    # legacy name instead of an existing document's old name.
+    legacy_name = str(data.get("legacy_name", "")).strip()
+    if legacy_name and legacy_name.strip().lower() != name.strip().lower():
+        name_re = {"$regex": f"^{re.escape(legacy_name)}$", "$options": "i"}
+        for u in users_col.find({"department": name_re}, {"department": 1}):
+            dv = u.get("department")
+            if isinstance(dv, list):
+                new_dv = [name if isinstance(d, str) and d.strip().lower() == legacy_name.strip().lower() else d for d in dv]
+            else:
+                new_dv = name
+            users_col.update_one({"_id": u["_id"]}, {"$set": {"department": new_dv}})
+        ats_candidates_col.update_many({"department": name_re}, {"$set": {"department": name}})
+
     return jsonify(doc), 201
 
 
