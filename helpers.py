@@ -140,6 +140,27 @@ def get_company_holiday_dates():
 
 # ── Attendance day classification ───────────────────────────────────────────
 
+def is_weekend_day(day_str, holiday_dates):
+    """
+    Single source of truth for "is this day a non-working day" — a company
+    holiday, any Sunday, or a Saturday EXCEPT the LAST Saturday of its
+    month (company policy: the last Saturday is a regular working day,
+    every other Saturday is not). Used by both routes/calendar.py and
+    routes/stats.py so the two can't classify the same Saturday
+    differently from each other.
+    """
+    if day_str in holiday_dates:
+        return True
+    d  = datetime.strptime(day_str, "%Y-%m-%d")
+    wd = d.weekday()  # Monday=0 ... Saturday=5, Sunday=6
+    if wd == 6:
+        return True
+    if wd == 5:
+        # Last Saturday of the month: adding 7 days rolls into next month.
+        return (d + timedelta(days=7)).month == d.month
+    return False
+
+
 def _date_str(val):
     """Normalize a Mongo date value (datetime or already-a-string) to 'YYYY-MM-DD', or None."""
     if val is None:

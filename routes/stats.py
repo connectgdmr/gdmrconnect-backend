@@ -10,7 +10,7 @@ from bson import ObjectId
 
 from database import (attendance_col, leaves_col, users_col)
 from decorators import token_required
-from helpers import _is_admin, _has_module_grant, classify_attendance_day, get_company_holiday_dates
+from helpers import _is_admin, _has_module_grant, classify_attendance_day, get_company_holiday_dates, is_weekend_day
 from config import IST
 
 bp = Blueprint("stats", __name__)
@@ -138,7 +138,7 @@ def attendance_summary():
         if day_str > today_str:
             continue
 
-        is_weekend   = datetime.strptime(day_str, "%Y-%m-%d").weekday() >= 5 or day_str in holiday_dates
+        is_weekend   = is_weekend_day(day_str, holiday_dates)
         is_today     = day_str == today_str
         day_checkins = checkins_by_date.get(day_str, set())
 

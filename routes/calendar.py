@@ -38,7 +38,7 @@ from database import attendance_col, leaves_col, users_col, holidays_col, correc
 from decorators import token_required
 from helpers import (_is_admin, _has_module_grant, _mgr_depts,
                       classify_attendance_day, _date_str, format_datetime_ist,
-                      get_company_holiday_dates)
+                      get_company_holiday_dates, is_weekend_day)
 from config import IST
 
 bp = Blueprint("calendar", __name__)
@@ -132,7 +132,7 @@ def _month_calendar_for_employee(uid, month_str):
         if lwd and day_str > lwd:
             continue
 
-        is_weekend   = datetime.strptime(day_str, "%Y-%m-%d").weekday() >= 5 or day_str in holiday_dates
+        is_weekend   = is_weekend_day(day_str, holiday_dates)
         is_today     = day_str == today_str
         day_checkins = {uid} if day_str in checkin_times else set()
 
