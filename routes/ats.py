@@ -866,10 +866,11 @@ def _auto_onboard_employee(candidate: dict, actor_id: str):
         }],
     }
 
-    # Only Permanent hires get portal login credentials — Contract hires are
-    # stored as records only (no password, no welcome email).
+    # Only Contract hires are stored as records only (no password, no
+    # welcome email) — Permanent and Internship both get portal login
+    # credentials.
     password = None
-    if employment_type == "Permanent":
+    if employment_type != "Contract":
         password = generate_random_password()
         user_doc["password"] = bcrypt.generate_password_hash(password).decode("utf-8")
 
@@ -880,7 +881,7 @@ def _auto_onboard_employee(candidate: dict, actor_id: str):
         {"$set": {"onboarded_employee_id": str(res.inserted_id)}},
     )
 
-    if employment_type == "Permanent":
+    if employment_type != "Contract":
         subject = "Welcome to GDMR Connect: Your New Account Credentials"
         body    = (
             f"Dear {name},\n\n"

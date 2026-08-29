@@ -186,16 +186,16 @@ def add_employee():
         "employment_type": employment_type, "contract_months": contract_months,
     }
 
-    # Only Permanent employees get portal login credentials — Contract
-    # employees are stored as records only (no password, no welcome email).
+    # Only Contract is stored as a record only (no password, no welcome
+    # email) — Permanent and Internship both get portal login credentials.
     password = None
-    if employment_type == "Permanent":
+    if employment_type != "Contract":
         password = generate_random_password()
         user_doc["password"] = bcrypt.generate_password_hash(password).decode("utf-8")
 
     res = users_col.insert_one(user_doc)
 
-    if employment_type == "Permanent":
+    if employment_type != "Contract":
         subject = "Welcome to GDMR Connect: Your New Account Credentials"
         body    = (
             f"Dear {name},\n\n"

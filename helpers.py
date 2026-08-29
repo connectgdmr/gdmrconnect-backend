@@ -235,13 +235,13 @@ def parse_employment_type(data):
     Add Employee form and ATS auto-onboarding.
 
     Returns (employment_type, contract_months, error_message) —
-    error_message is None on success. Only Permanent employees get portal
-    login credentials; Contract employees are stored as records only
-    (no password / no welcome email).
+    error_message is None on success. Only Contract is stored as a record
+    only (no password / no welcome email) — Permanent and Internship both
+    get full portal login credentials.
     """
     employment_type = data.get("employment_type") or "Permanent"
-    if employment_type not in ("Permanent", "Contract"):
-        return None, None, "employment_type must be 'Permanent' or 'Contract'."
+    if employment_type not in ("Permanent", "Contract", "Internship"):
+        return None, None, "employment_type must be 'Permanent', 'Contract' or 'Internship'."
 
     contract_months = None
     if employment_type == "Contract":
