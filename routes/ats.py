@@ -17,7 +17,7 @@ from pymongo import ReturnDocument
 from database import ats_candidates_col, users_col, counters_col
 from decorators import token_required
 from extensions import bcrypt
-from helpers import _is_admin, _mgr_depts, parse_employment_type, _has_module_grant
+from helpers import _is_admin, _mgr_depts, parse_employment_type, _has_module_grant, _dept_list
 from utils import send_email, generate_random_password
 from config import IST
 
@@ -80,8 +80,8 @@ def _ats_allowed(user, write=False):
     role = user.get("role")
     if role in ("admin", "owner"):
         return True
-    dept = (user.get("department") or "").strip().lower()
-    if "hr" in dept or "human resource" in dept:
+    depts = _dept_list(user.get("department"))
+    if any("hr" in d or "human resource" in d for d in depts):
         return True
     if role == "manager":
         return True

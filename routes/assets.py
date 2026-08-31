@@ -10,7 +10,7 @@ from bson import ObjectId
 
 from database import assets_col, users_col
 from decorators import token_required
-from helpers import _is_admin, _mgr_depts, _has_module_grant
+from helpers import _is_admin, _mgr_depts, _has_module_grant, _dept_list
 from utils import send_email
 
 bp = Blueprint("assets", __name__)
@@ -95,9 +95,9 @@ def manager_update_asset(asset_id):
         return jsonify({"message": "Asset request not found in database."}), 404
 
     if request.user.get("role") == "manager":
-        asset_dept = (asset.get("department") or "").strip().lower()
-        mgr_depts  = [d.strip().lower() for d in _mgr_depts(request.user)]
-        if mgr_depts and asset_dept and asset_dept not in mgr_depts:
+        asset_depts = _dept_list(asset.get("department"))
+        mgr_depts   = [d.strip().lower() for d in _mgr_depts(request.user)]
+        if mgr_depts and asset_depts and not (set(asset_depts) & set(mgr_depts)):
             return jsonify({"message": "Unauthorized: asset belongs to a different department"}), 403
 
     update_data = {"manager_status": manager_status}
@@ -219,9 +219,9 @@ def manager_assign_asset(asset_id):
         return jsonify({"message": "Asset not found"}), 404
 
     if role == "manager":
-        mgr_depts  = [d.strip().lower() for d in _mgr_depts(request.user)]
-        asset_dept = (asset.get("department") or "").strip().lower()
-        if mgr_depts and asset_dept and asset_dept not in mgr_depts:
+        mgr_depts   = [d.strip().lower() for d in _mgr_depts(request.user)]
+        asset_depts = _dept_list(asset.get("department"))
+        if mgr_depts and asset_depts and not (set(asset_depts) & set(mgr_depts)):
             return jsonify({"message": "You can only assign assets for your own department"}), 403
 
     subject = f"Asset Request Approved — {asset.get('asset_name', 'Asset')}"

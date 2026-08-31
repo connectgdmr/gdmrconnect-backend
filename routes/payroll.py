@@ -15,7 +15,7 @@ from bson import ObjectId
 
 from database import (salary_structures_col, payslips_col, payroll_loans_col, users_col)
 from decorators import token_required
-from helpers import _is_admin, _to_money, _has_module_grant
+from helpers import _is_admin, _to_money, _has_module_grant, _dept_list
 from routes.calendar import _month_calendar_for_employee
 
 bp = Blueprint("payroll", __name__)
@@ -36,8 +36,7 @@ def _payroll_allowed(user, write=False):
         return True
     if _has_module_grant(user, "payroll", write=write):
         return True
-    dept = (user.get("department") or "").strip().lower()
-    return dept.startswith("accounts")
+    return any(d.startswith("accounts") for d in _dept_list(user.get("department")))
 
 
 # ── Salary structures ─────────────────────────────────────────────────────────

@@ -262,9 +262,22 @@ def _is_admin(user):
     return user.get("role") in ("admin", "owner")
 
 
+def _dept_list(val):
+    """Normalize a raw department field value (plain string, OR a list for
+    a manager who heads more than one department) into a flat, non-empty
+    list of stripped/lowercased names — the one shape every department
+    comparison should use. Calling .strip() directly on a department field
+    that turns out to be a list (any multi-department manager) throws
+    AttributeError outright; this replaces several call sites that each
+    used to risk exactly that."""
+    d = [val] if not isinstance(val, list) else val
+    return [str(x).strip().lower() for x in d if x]
+
+
 def _mgr_depts(user):
-    """Return a manager's departments as a flat non-empty list.
-    Handles both string and list department field values."""
+    """Return a manager's departments as a flat non-empty list (original
+    case, not lowercased — most callers display these). Handles both
+    string and list department field values."""
     d = user.get("department")
     if isinstance(d, list):
         return [x for x in d if x]

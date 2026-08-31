@@ -71,9 +71,15 @@ def today_stats():
     manager_count   = sum(1 for u in active_users if u.get("role") == "manager")
     by_department: dict = {}
     for u in active_users:
-        dept = (u.get("department") or "").strip()
-        if dept:
-            by_department[dept] = by_department.get(dept, 0) + 1
+        # department is a plain string for most staff, but a LIST for a
+        # manager who heads more than one department — .strip() on a list
+        # crashed this endpoint outright for any company that has one.
+        raw_dept = u.get("department")
+        depts = raw_dept if isinstance(raw_dept, list) else [raw_dept]
+        for dept in depts:
+            dept = (dept or "").strip()
+            if dept:
+                by_department[dept] = by_department.get(dept, 0) + 1
 
     return jsonify({
         "present":         present_count,

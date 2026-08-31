@@ -174,7 +174,8 @@ def share_work_plan():
     if not plan or not plan.get("tasks"):
         return jsonify({"message": "No work plan found for that date"}), 404
 
-    dept = (request.user.get("department") or "").strip()
+    raw_dept = request.user.get("department")
+    dept = ", ".join(raw_dept) if isinstance(raw_dept, list) else (raw_dept or "").strip()
 
     def _build_body(plan_doc, date_s):
         lines  = [
