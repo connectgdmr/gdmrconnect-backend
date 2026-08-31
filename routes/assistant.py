@@ -87,6 +87,14 @@ def _call_groq(messages, temperature=0.4, max_tokens=700):
         json={
             "model": GROQ_MODEL, "messages": messages, "tools": TOOL_SCHEMAS,
             "tool_choice": "auto", "temperature": temperature, "max_tokens": max_tokens,
+            # gpt-oss-120b does not support calling several tools at once
+            # (confirmed in Groq's own model comparison) — without telling
+            # the API that explicitly, a compound question that naturally
+            # wants two tools in one turn (e.g. "both Akshays") can hit a
+            # request-shape mismatch instead of just falling back to
+            # sequential calls the way the orchestrator loop already
+            # handles fine.
+            "parallel_tool_calls": False,
         },
         # gpt-oss-120b reasons before it answers, and a compound question
         # (comparing two people, chaining several tool calls) genuinely
