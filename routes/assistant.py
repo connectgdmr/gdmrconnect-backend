@@ -84,6 +84,12 @@ def _call_groq(messages, temperature=0.4, max_tokens=400):
         },
         timeout=15,
     )
+    if not resp.ok:
+        # Log Groq's actual rejection reason server-side (invalid message
+        # shape, bad schema, etc.) instead of only the generic HTTPError —
+        # that detail is what actually explains a failure, and raise_for_status()
+        # alone throws it away.
+        print(f"[assistant] Groq returned {resp.status_code}: {resp.text[:1000]}")
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]
 
@@ -113,7 +119,22 @@ def run_orchestrator(user, message, history=None, extra_system=""):
         if not tool_calls:
             return (msg.get("content") or "").strip() or "I'm not sure how to answer that yet."
 
-        messages.append(msg)
+        # Re-add a minimal, spec-shaped version of the assistant's tool-call
+        # turn rather than echoing the raw response back verbatim — some
+        # models (gpt-oss included) attach extra fields to their response
+        # (e.g. reasoning content) that aren't valid to send back as input
+        # on the next call, and would otherwise silently break every
+        # question that needs a SECOND round of tool calls to answer.
+        messages.append({
+            "role": "assistant", "content": msg.get("content"),
+            "tool_calls": [
+                {"id": tc.get("id"), "type": "function", "function": {
+                    "name": tc.get("function", {}).get("name"),
+                    "arguments": tc.get("function", {}).get("arguments") or "{}",
+                }}
+                for tc in tool_calls
+            ],
+        })
         for tc in tool_calls:
             name = tc.get("function", {}).get("name")
             raw_args = tc.get("function", {}).get("arguments") or "{}"
@@ -133,7 +154,7 @@ def run_orchestrator(user, message, history=None, extra_system=""):
                     print(f"[assistant] tool {name} failed:", e)
                     result = {"error": "That lookup failed unexpectedly."}
             messages.append({
-                "role": "tool", "tool_call_id": tc.get("id"), "name": name,
+                "role": "tool", "tool_call_id": tc.get("id"),
                 "content": json.dumps(result, default=str),
             })
 
