@@ -26,6 +26,7 @@ MANAGER has approved it — it doesn't wait for Admin's final sign-off too,
 per how HR actually treats it day to day (see _leave_is_approved below).
 """
 import calendar
+import csv
 import io
 from datetime import datetime, timezone
 
@@ -267,6 +268,36 @@ def monthly_attendance_pdf():
     return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=filename)
 
 
+def _render_monthly_report_csv(rows, day_headers):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Employee ID", "Employee Name", "Department", "Status", "Total Leaves"] + day_headers)
+    for r in rows:
+        w.writerow([r["employee_code"], r["name"], r["department"], r["status"], f'{r["total_leaves"]:g}'] + r["cells"])
+    out = io.BytesIO(buf.getvalue().encode("utf-8-sig"))  # BOM so Excel opens it without mangling names
+    out.seek(0)
+    return out
+
+
+@bp.route("/api/admin/reports/monthly-attendance-csv", methods=["GET"])
+@token_required
+def monthly_attendance_csv():
+    if not _reports_allowed(request.user):
+        return "Unauthorized", 403
+    try:
+        month = int(request.args.get("month"))
+        year  = int(request.args.get("year"))
+    except (TypeError, ValueError):
+        return "month (1-12) and year are required", 400
+    if not (1 <= month <= 12) or year < 2000:
+        return "Invalid month or year", 400
+
+    rows, day_headers, _dow, _off = _build_monthly_report_rows(month, year)
+    buf = _render_monthly_report_csv(rows, day_headers)
+    filename = f"Monthly_Attendance_Report_{calendar.month_name[month]}_{year}.csv"
+    return send_file(buf, mimetype="text/csv", as_attachment=True, download_name=filename)
+
+
 # ── Master Tracker (yearly) ─────────────────────────────────────────────────
 
 def _month_working_stats(uid, year, month, holiday_dates, leaves_for_emp, joined, lwd):
@@ -435,3 +466,46 @@ def master_tracker_pdf():
     buf  = _render_master_tracker_pdf(rows, year)
     filename = f"Attendance_Master_Tracker_{year}.pdf"
     return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=filename)
+
+
+def _render_master_tracker_csv(rows):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    header = ["Employee ID", "Employee Name", "Department"]
+    for m in range(1, 13):
+        name = calendar.month_abbr[m]
+        header += [f"{name} Total", f"{name} Attended", f"{name} Leaves", f"{name} %"]
+    header.append("Total %")
+    w.writerow(header)
+    for r in rows:
+        row = [r["employee_code"], r["name"], r["department"]]
+        for mo in r["months"]:
+            row += [
+                f'{mo["total"]:g}' if mo["total"] else "",
+                f'{mo["attended"]:g}' if mo["total"] else "",
+                f'{mo["leaves"]:g}' if mo["total"] else "",
+                mo["pct"] if mo["pct"] is not None else "",
+            ]
+        row.append(r["year_pct"] if r["year_pct"] is not None else "")
+        w.writerow(row)
+    out = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+    out.seek(0)
+    return out
+
+
+@bp.route("/api/admin/reports/master-tracker-csv", methods=["GET"])
+@token_required
+def master_tracker_csv():
+    if not _reports_allowed(request.user):
+        return "Unauthorized", 403
+    try:
+        year = int(request.args.get("year"))
+    except (TypeError, ValueError):
+        return "year is required", 400
+    if year < 2000:
+        return "Invalid year", 400
+
+    rows = _build_master_tracker_rows(year)
+    buf  = _render_master_tracker_csv(rows)
+    filename = f"Attendance_Master_Tracker_{year}.csv"
+    return send_file(buf, mimetype="text/csv", as_attachment=True, download_name=filename)
