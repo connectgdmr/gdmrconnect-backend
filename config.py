@@ -28,7 +28,12 @@ CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 
 # ── Groq LLM (optional) ───────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# llama-3.3-70b-versatile was decommissioned by Groq (announced 2026-06-17,
+# stopped serving entirely by August 2026) -- every assistant call was
+# silently failing against a dead model until this was caught. Groq's own
+# migration guidance points to gpt-oss-120b, which also supports tool use
+# (required for the assistant's tool-calling orchestrator).
+GROQ_MODEL   = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # ── Company constants ─────────────────────────────────────────────────────────
 # Owners always receive org-wide work-plan digests and leave notifications.
