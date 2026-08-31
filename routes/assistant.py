@@ -21,11 +21,15 @@ is tone (voice replies are short and TTS-friendly) and which language.
 RBAC comes entirely from who's asking, enforced inside each tool, not
 from which route was hit.
 """
+import io
 import json
+import re
+import wave
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import requests
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, Response
 
 from database import access_grants_col
 from decorators import token_required
@@ -37,6 +41,12 @@ bp = Blueprint("assistant", __name__)
 
 MAX_TOOL_ITERATIONS = 5
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+TTS_URL   = "https://api.groq.com/openai/v1/audio/speech"
+TTS_MODEL = "canopylabs/orpheus-v1-english"
+# The six Orpheus voice personas Groq actually serves for this model —
+# an unrecognized voice name is a hard 400 from Groq, so this list is the
+# real validation, not just a UI convenience.
+TTS_VOICES = ("hannah", "autumn", "diana", "austin", "daniel", "troy")
 
 BASE_SYSTEM_PROMPT = """You are Rexor, the AI assistant built into GDMR Connect, an internal \
 company ERP. You are not a search box or a report generator — you are a sharp, warm colleague \
@@ -261,3 +271,105 @@ def assistant_voice():
     )
     reply = run_orchestrator(request.user, message, history, extra_system=extra)
     return jsonify({"reply": reply, "lang": lang}), 200
+
+
+# ── Text-to-speech (real neural voice, not the browser's built-in one) ──────
+#
+# Groq's Orpheus model caps each request at ~200 characters, so a normal
+# multi-sentence reply has to be split into pieces, spoken separately, and
+# stitched back into one clip — the chunks are fetched in parallel (they're
+# independent requests) and concatenated in order once every piece is back,
+# so the client only ever deals with one audio file. English only —
+# Orpheus has no Malayalam voice, so the Malayalam side of voice mode keeps
+# using the browser's own speechSynthesis, which the frontend already falls
+# back to on any failure here too.
+
+def _chunk_text_for_tts(text, limit=180):
+    """Break text into pieces at sentence boundaries wherever possible,
+    each safely under Orpheus's per-request character cap; falls back to
+    a hard word-wrap for any single sentence that's still too long."""
+    text = text.strip()
+    if not text:
+        return []
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks, current = [], ""
+
+    def flush():
+        nonlocal current
+        if current:
+            chunks.append(current)
+            current = ""
+
+    for s in sentences:
+        if len(s) > limit:
+            for word in s.split(" "):
+                if len(current) + len(word) + 1 > limit:
+                    flush()
+                current = f"{current} {word}".strip()
+            continue
+        if len(current) + len(s) + 1 > limit:
+            flush()
+        current = f"{current} {s}".strip()
+    flush()
+    return chunks
+
+
+def _fetch_tts_chunk(text, voice):
+    resp = requests.post(
+        TTS_URL,
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        json={"model": TTS_MODEL, "input": text, "voice": voice, "response_format": "wav"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+def _merge_wavs(parts):
+    """Concatenate several WAV clips from the SAME model/voice/format into
+    one — safe because they all share sample rate/width/channels, so this
+    is just stitching PCM frames together under one shared header rather
+    than a real audio re-encode."""
+    if len(parts) == 1:
+        return parts[0]
+    out_buf = io.BytesIO()
+    out_wav = wave.open(out_buf, "wb")
+    params_set = False
+    for p in parts:
+        in_wav = wave.open(io.BytesIO(p), "rb")
+        if not params_set:
+            out_wav.setparams(in_wav.getparams())
+            params_set = True
+        out_wav.writeframes(in_wav.readframes(in_wav.getnframes()))
+        in_wav.close()
+    out_wav.close()
+    out_buf.seek(0)
+    return out_buf.getvalue()
+
+
+@bp.route("/api/assistant/speak", methods=["POST"])
+@token_required
+@limiter.limit("30 per minute")
+def assistant_speak():
+    if not GROQ_API_KEY:
+        return jsonify({"message": "Voice not configured."}), 503
+
+    data  = request.get_json(silent=True) or {}
+    text  = (data.get("text") or "").strip()[:4000]
+    voice = data.get("voice") if data.get("voice") in TTS_VOICES else "hannah"
+    if not text:
+        return jsonify({"message": "text is required."}), 400
+
+    chunks = _chunk_text_for_tts(text)
+    if not chunks:
+        return jsonify({"message": "Nothing to speak."}), 400
+
+    try:
+        with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as pool:
+            parts = list(pool.map(lambda c: _fetch_tts_chunk(c, voice), chunks))
+    except Exception as e:
+        print("[assistant] TTS failed:", e)
+        return jsonify({"message": "Voice generation failed."}), 502
+
+    audio = _merge_wavs(parts)
+    return Response(audio, mimetype="audio/wav")
