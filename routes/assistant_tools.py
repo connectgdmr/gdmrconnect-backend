@@ -21,6 +21,7 @@ Visibility rule used throughout (`_can_view_detail`):
     the app (Team Leaves/attendance detail are manager+ only) rather than
     inventing a new, broader data-exposure rule through the assistant.
 """
+import difflib
 from datetime import datetime
 
 from bson import ObjectId
@@ -105,6 +106,19 @@ def find_person(caller, name):
         return {"match": _person_brief(partial[0])}
     if len(partial) > 1:
         return {"ambiguous": [_person_brief(u) for u in partial], "note": "More than one person matches — ask which one before answering."}
+
+    # Nothing matched literally — voice transcription and typos routinely
+    # mangle names ("Naveen Nawaz" for "Navin Navas"), so fall back to a
+    # similarity match against full names before giving up. difflib is
+    # forgiving of exactly this kind of near-miss.
+    names   = [u.get("name") or "" for u in roster]
+    by_name = {u.get("name"): u for u in roster}
+    close = difflib.get_close_matches(name.strip(), names, n=3, cutoff=0.6)
+    if len(close) == 1:
+        return {"match": _person_brief(by_name[close[0]])}
+    if len(close) > 1:
+        return {"ambiguous": [_person_brief(by_name[n]) for n in close],
+                "note": f"No exact match for '{name}', but these are close — confirm which one before answering."}
     return {"not_found": True, "note": f"No active employee named '{name}' found."}
 
 

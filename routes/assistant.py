@@ -48,7 +48,13 @@ number — if a tool doesn't give you something, say plainly that you don't have
 it up.
 - When the user names someone, call find_person first to resolve exactly who they mean before \
 looking anything else up. If find_person returns more than one match, ask which person they mean \
-instead of picking one.
+instead of picking one. Names are frequently mangled by voice transcription or typos — if \
+find_person can't find an exact match, before telling the user it doesn't exist, check whether it's \
+a garbled version of a name already mentioned earlier in this conversation (e.g. someone you just \
+listed as on leave) and try find_person again with that name.
+- If the user refers to more than one person in one message (e.g. "both of them", naming two \
+people), call find_person / get_person_today separately for each one and answer about all of them \
+together, not just one.
 - Chain tools when a question genuinely needs more than one fact — e.g. "why is X absent" may \
 need their leave status AND a correction request AND their check-in record before you can give a \
 real answer, not just the first thing you found.
@@ -74,7 +80,7 @@ can see plainly and note the rest needs their manager or admin — don't apologi
 """
 
 
-def _call_groq(messages, temperature=0.4, max_tokens=400):
+def _call_groq(messages, temperature=0.4, max_tokens=700):
     resp = requests.post(
         GROQ_URL,
         headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
@@ -82,7 +88,11 @@ def _call_groq(messages, temperature=0.4, max_tokens=400):
             "model": GROQ_MODEL, "messages": messages, "tools": TOOL_SCHEMAS,
             "tool_choice": "auto", "temperature": temperature, "max_tokens": max_tokens,
         },
-        timeout=15,
+        # gpt-oss-120b reasons before it answers, and a compound question
+        # (comparing two people, chaining several tool calls) genuinely
+        # takes longer than a plain one-shot reply — 15s was cutting that
+        # off mid-request on exactly the questions that need it most.
+        timeout=30,
     )
     if not resp.ok:
         # Log Groq's actual rejection reason server-side (invalid message
@@ -92,6 +102,17 @@ def _call_groq(messages, temperature=0.4, max_tokens=400):
         print(f"[assistant] Groq returned {resp.status_code}: {resp.text[:1000]}")
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]
+
+
+def _call_groq_with_retry(messages):
+    """One silent retry on a transient network hiccup or timeout — the
+    first attempt failing outright shouldn't mean the whole turn dies with
+    a generic error when trying again a second later would likely work."""
+    try:
+        return _call_groq(messages)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        print("[assistant] Groq call failed, retrying once:", e)
+        return _call_groq(messages)
 
 
 def run_orchestrator(user, message, history=None, extra_system=""):
@@ -110,9 +131,9 @@ def run_orchestrator(user, message, history=None, extra_system=""):
 
     for _ in range(MAX_TOOL_ITERATIONS):
         try:
-            msg = _call_groq(messages)
+            msg = _call_groq_with_retry(messages)
         except Exception as e:
-            print("[assistant] Groq call failed:", e)
+            print("[assistant] Groq call failed after retry:", e)
             return "I'm having trouble reaching the assistant service right now — try again in a moment."
 
         tool_calls = msg.get("tool_calls")
