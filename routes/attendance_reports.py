@@ -378,26 +378,185 @@ def _build_master_tracker_rows(year):
     return rows
 
 
-def _render_master_tracker_pdf(rows, year):
+# The Master Tracker download is a four-part report that mirrors the tabs of
+# the HR team's manual spreadsheet:
+#   1. Master Sheet     — Total / Attended / Leaves / % per month (the original)
+#   2. Dep wise         — monthly attendance % per employee, grouped by
+#                         department, with per-department Average % / Quarter %
+#   3. Leave Monitoring — per month, per employee: Monday-leave / Friday-leave /
+#                         HD / Early-leaving / WFH / Late-coming counts
+#   4. Late Coming      — the actual dates each employee checked in late, by
+#                         month, plus a yearly count
+# The PDF puts each on its own (very wide) page; the Excel export puts each on
+# its own worksheet. Neither adds any data model — everything comes from
+# attendance_col.status_indicator / day_type and approved leaves.
+
+
+def _dept_wise_blocks_from_tracker(tracker_rows):
+    """Regroup the already-computed Master-Sheet rows by department. Each block:
+    {department, employees:[{employee_code, name, pcts:[12]}], average:[12], quarter:[12]}
+    where `quarter` carries the Q1..Q4 mean of the department's monthly averages
+    in the Jan/Apr/Jul/Oct slots (blank elsewhere), matching the reference sheet."""
+    groups = {}
+    for r in tracker_rows:
+        groups.setdefault(r["department"], []).append(r)
+
+    blocks = []
+    for dept in sorted(groups):
+        emp_rows = [
+            {"employee_code": r["employee_code"], "name": r["name"],
+             "pcts": [mo["pct"] for mo in r["months"]]}
+            for r in sorted(groups[dept], key=lambda r: r["name"].lower())
+        ]
+        average = []
+        for mi in range(12):
+            vals = [er["pcts"][mi] for er in emp_rows if er["pcts"][mi] is not None]
+            average.append(round(sum(vals) / len(vals), 1) if vals else None)
+        quarter = [None] * 12
+        for qi in range(4):
+            qv = [average[qi * 3 + k] for k in range(3) if average[qi * 3 + k] is not None]
+            quarter[qi * 3] = round(sum(qv) / len(qv), 1) if qv else None
+        blocks.append({"department": dept, "employees": emp_rows,
+                       "average": average, "quarter": quarter})
+    return blocks
+
+
+def _build_leave_monitoring_rows(year):
+    """One row per employee; per month a dict of pattern counts:
+    monday / friday (approved-leave days landing on a Mon/Fri), hd (half-day
+    leaves + half-day check-ins), early (Early check-outs), wfh (not tracked —
+    always None), late (Present (Late) check-ins)."""
+    employees = _active_employees()
+    uids      = [str(e["_id"]) for e in employees]
+    year_start = f"{year:04d}-01-01"
+    year_end   = f"{year:04d}-12-31"
+
+    leaves_by_uid = {}
+    for lv in leaves_col.find({
+        "user_id": {"$in": uids},
+        "from_date": {"$lte": year_end}, "to_date": {"$gte": year_start},
+        "status": {"$nin": ["Rejected", "Cancelled"]},
+    }):
+        if _leave_is_approved(lv):
+            leaves_by_uid.setdefault(lv["user_id"], []).append(lv)
+
+    def _month_counts(indicator=None, day_type=None, rec_type="checkin"):
+        q = {"user_id": {"$in": uids}, "type": rec_type,
+             "date": {"$gte": year_start, "$lte": year_end}}
+        if indicator:
+            q["status_indicator"] = indicator
+        if day_type:
+            q["day_type"] = day_type
+        out = {}
+        for rec in attendance_col.find(q, {"user_id": 1, "date": 1}):
+            m = int(rec["date"][5:7])
+            out.setdefault(rec["user_id"], {}).setdefault(m, 0)
+            out[rec["user_id"]][m] += 1
+        return out
+
+    late_by_uid     = _month_counts(indicator="Present (Late)")
+    early_by_uid    = _month_counts(indicator="Early", rec_type="checkout")
+    hd_ci_by_uid    = _month_counts(day_type="half-day")
+
+    rows = []
+    for emp in sorted(employees, key=lambda e: (e.get("name") or "").lower()):
+        uid = str(emp["_id"])
+        emp_leaves = leaves_by_uid.get(uid, [])
+        months = []
+        for m in range(1, 13):
+            days_in_month = calendar.monthrange(year, m)[1]
+            mon = fri = hd = 0
+            for lv in emp_leaves:
+                is_half = lv.get("type") == "half"
+                fd, td = lv.get("from_date", ""), lv.get("to_date", "")
+                for d in range(1, days_in_month + 1):
+                    ds = f"{year:04d}-{m:02d}-{d:02d}"
+                    if not (fd <= ds <= td):
+                        continue
+                    wd = datetime(year, m, d).weekday()  # Mon=0 .. Sun=6
+                    if is_half:
+                        hd += 1
+                    if wd == 0:
+                        mon += 1
+                    elif wd == 4:
+                        fri += 1
+            hd += hd_ci_by_uid.get(uid, {}).get(m, 0)
+            months.append({
+                "monday": mon, "friday": fri, "hd": hd,
+                "early": early_by_uid.get(uid, {}).get(m, 0),
+                "wfh": None,
+                "late": late_by_uid.get(uid, {}).get(m, 0),
+            })
+        rows.append({
+            "employee_code": emp.get("employee_code") or "—",
+            "name":          emp.get("name") or "",
+            "department":    _dept_of(emp),
+            "months":        months,
+        })
+    return rows
+
+
+def _build_late_coming_rows(year):
+    """One row per employee: a yearly `count` and, per month, the list of
+    dd/mm/yy dates the employee was stamped 'Present (Late)' at check-in."""
+    employees = _active_employees()
+    uids      = [str(e["_id"]) for e in employees]
+    year_start = f"{year:04d}-01-01"
+    year_end   = f"{year:04d}-12-31"
+
+    by_uid = {}
+    for rec in attendance_col.find({
+        "user_id": {"$in": uids}, "type": "checkin",
+        "status_indicator": "Present (Late)",
+        "date": {"$gte": year_start, "$lte": year_end},
+    }, {"user_id": 1, "date": 1}).sort("date", 1):
+        m = int(rec["date"][5:7])
+        by_uid.setdefault(rec["user_id"], {}).setdefault(m, []).append(rec["date"])
+
+    rows = []
+    for emp in sorted(employees, key=lambda e: (e.get("name") or "").lower()):
+        uid = str(emp["_id"])
+        mdict = by_uid.get(uid, {})
+        months, total = [], 0
+        for m in range(1, 13):
+            dates = mdict.get(m, [])
+            total += len(dates)
+            months.append([f"{d[8:10]}/{d[5:7]}/{d[2:4]}" for d in dates])
+        rows.append({
+            "employee_code": emp.get("employee_code") or "—",
+            "name":          emp.get("name") or "",
+            "department":    _dept_of(emp),
+            "count":         total,
+            "months":        months,
+        })
+    return rows
+
+
+# ── Master Tracker PDF (4 sections) ─────────────────────────────────────────
+
+_PDF_PAGE_W_MM = max(
+    30 * 3 + 15 * 12 * 4 + 22,   # Master Sheet
+    38 * 3 + 24 * 12 + 20,       # Dep wise
+    30 * 3 + 9 * 12 * 6 + 20,    # Leave Monitoring
+    40 * 4 + 26 * 12 + 20,       # Late Coming
+)
+
+_BASE_TABLE_STYLE = [
+    ("ALIGN",  (0, 0), (-1, -1), "CENTER"),
+    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+    ("LEFTPADDING", (0, 0), (-1, -1), 1.5), ("RIGHTPADDING", (0, 0), (-1, -1), 1.5),
+]
+
+
+def _master_tracker_flowables(rows, year, doc):
     from reportlab.lib import colors as rl_colors
-    from reportlab.lib.units import mm
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+    from reportlab.platypus import Table, TableStyle, Paragraph
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
     sub_labels = ["Total", "Attended", "Leaves", "%"]
-    n_months = 12
-    page_w = (30 * 3 + 15 * n_months * 4 + 22) * mm
-    page_h = 297 * mm
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buf, pagesize=(page_w, page_h),
-        leftMargin=6 * mm, rightMargin=6 * mm, topMargin=8 * mm, bottomMargin=8 * mm,
-    )
-
     fixed_labels  = ["Employee ID", "Employee Name", "Department"]
-    fixed_weights = [1.0, 1.8, 1.5]
-    sub_weight    = 0.6
-    weights = fixed_weights + [sub_weight] * (n_months * 4) + [1.0]
+    weights = [1.0, 1.8, 1.5] + [0.6] * (12 * 4) + [1.0]
     total_weight = sum(weights)
     col_widths = [doc.width * (w / total_weight) for w in weights]
 
@@ -409,11 +568,7 @@ def _render_master_tracker_pdf(rows, year):
 
     body_rows = []
     for r in rows:
-        row = [
-            Paragraph(r["employee_code"], cell_style),
-            Paragraph(r["name"], cell_style),
-            Paragraph(r["department"], cell_style),
-        ]
+        row = [Paragraph(r["employee_code"], cell_style), Paragraph(r["name"], cell_style), Paragraph(r["department"], cell_style)]
         for mo in r["months"]:
             row.append(Paragraph(f'{mo["total"]:g}' if mo["total"] else "", cell_style))
             row.append(Paragraph(f'{mo["attended"]:g}' if mo["total"] else "", cell_style))
@@ -425,29 +580,184 @@ def _render_master_tracker_pdf(rows, year):
         row.append(Paragraph(f'{r["year_pct"]}' if r["year_pct"] is not None else "", ParagraphStyle("yr", parent=cell_style, fontName="Helvetica-Bold")))
         body_rows.append(row)
 
-    title = Paragraph(f"<b>Attendance Master Tracker — {year}</b>", getSampleStyleSheet()["Heading3"])
     table = Table([row1, row2] + body_rows, colWidths=col_widths, repeatRows=2)
-
-    style = [
-        ("ALIGN",  (0, 0), (-1, -1), "CENTER"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    style = list(_BASE_TABLE_STYLE) + [
         ("GRID",   (0, 0), (-1, -1), 0.3, rl_colors.HexColor("#cbd5e1")),
         ("BACKGROUND", (0, 0), (-1, 1), rl_colors.HexColor("#1e293b")),
         ("TEXTCOLOR",  (0, 0), (-1, 1), rl_colors.white),
         ("ROWBACKGROUNDS", (0, 2), (-1, -1), [rl_colors.white, rl_colors.HexColor("#f8fafc")]),
-        ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
-        ("LEFTPADDING", (0, 0), (-1, -1), 1.5), ("RIGHTPADDING", (0, 0), (-1, -1), 1.5),
-        ("SPAN", (0, 0), (0, 1)), ("SPAN", (1, 0), (1, 1)), ("SPAN", (2, 0), (2, 1)),
-        ("SPAN", (-1, 0), (-1, 1)),
+        ("SPAN", (0, 0), (0, 1)), ("SPAN", (1, 0), (1, 1)), ("SPAN", (2, 0), (2, 1)), ("SPAN", (-1, 0), (-1, 1)),
     ]
     for m in range(12):
         start = 3 + m * 4
         style.append(("SPAN", (start, 0), (start + 3, 0)))
     table.setStyle(TableStyle(style))
 
-    doc.build([title, table])
+    title = Paragraph(f"<b>Attendance Master Tracker — {year}</b>", getSampleStyleSheet()["Heading3"])
+    return [title, table]
+
+
+def _dept_wise_flowables(blocks, year, doc):
+    from reportlab.lib import colors as rl_colors
+    from reportlab.platypus import Table, TableStyle, Paragraph
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    weights = [0.7, 1.2, 2.2] + [1.0] * 12
+    total_weight = sum(weights)
+    col_widths = [doc.width * (w / total_weight) for w in weights]
+
+    hdr_style  = ParagraphStyle("dhdr", fontSize=7, leading=8, alignment=1, fontName="Helvetica-Bold")
+    cell_style = ParagraphStyle("dcell", fontSize=6.5, leading=7.5, alignment=1)
+    sec_style  = ParagraphStyle("dsec", fontSize=7.5, leading=9, alignment=0, fontName="Helvetica-Bold", textColor=rl_colors.white)
+    agg_style  = ParagraphStyle("dagg", parent=cell_style, fontName="Helvetica-Bold")
+
+    header = [Paragraph("Sl No", hdr_style), Paragraph("Employee ID", hdr_style), Paragraph("Name", hdr_style)] + \
+             [Paragraph(f"{calendar.month_abbr[m]} %", hdr_style) for m in range(1, 13)]
+    data = [header]
+    section_rows, agg_rows = [], []
+
+    for block in blocks:
+        section_rows.append(len(data))
+        data.append([Paragraph(block["department"].upper(), sec_style)] + [""] * 14)
+        for i, e in enumerate(block["employees"], 1):
+            data.append([Paragraph(str(i), cell_style), Paragraph(e["employee_code"], cell_style), Paragraph(e["name"], cell_style)] +
+                        [Paragraph(f'{p:g}' if p is not None else "", cell_style) for p in e["pcts"]])
+        agg_rows.append(len(data))
+        data.append([Paragraph("", agg_style), Paragraph("", agg_style), Paragraph("Average %", agg_style)] +
+                    [Paragraph(f'{a:g}' if a is not None else "", agg_style) for a in block["average"]])
+        agg_rows.append(len(data))
+        data.append([Paragraph("", agg_style), Paragraph("", agg_style), Paragraph("Quarter %", agg_style)] +
+                    [Paragraph(f'{q:g}' if q is not None else "", agg_style) for q in block["quarter"]])
+
+    table = Table(data, colWidths=col_widths, repeatRows=1)
+    style = list(_BASE_TABLE_STYLE) + [
+        ("GRID", (0, 0), (-1, -1), 0.3, rl_colors.HexColor("#cbd5e1")),
+        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#1e293b")),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), rl_colors.white),
+    ]
+    for sr in section_rows:
+        style.append(("BACKGROUND", (0, sr), (-1, sr), rl_colors.HexColor("#b8860b")))
+        style.append(("SPAN", (0, sr), (-1, sr)))
+        style.append(("ALIGN", (0, sr), (0, sr), "LEFT"))
+    for ar in agg_rows:
+        style.append(("BACKGROUND", (0, ar), (-1, ar), rl_colors.HexColor("#e2e8f0")))
+    table.setStyle(TableStyle(style))
+
+    title = Paragraph(f"<b>Department-wise Attendance % — {year}</b>", getSampleStyleSheet()["Heading3"])
+    return [title, table]
+
+
+def _leave_monitoring_flowables(rows, year, doc):
+    from reportlab.lib import colors as rl_colors
+    from reportlab.platypus import Table, TableStyle, Paragraph
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    subs = ["Mon\nLeave", "Fri\nLeave", "HD", "Early\nLeaving", "WFH", "Late\nComing"]
+    weights = [1.0, 1.8, 1.4] + [0.6] * (12 * 6)
+    total_weight = sum(weights)
+    col_widths = [doc.width * (w / total_weight) for w in weights]
+
+    hdr_style  = ParagraphStyle("lhdr", fontSize=5.5, leading=6, alignment=1, fontName="Helvetica-Bold")
+    cell_style = ParagraphStyle("lcell", fontSize=5.5, leading=6.5, alignment=1)
+
+    row1 = [""] * 3 + sum(([Paragraph(calendar.month_name[m], hdr_style)] + [""] * 5 for m in range(1, 13)), [])
+    row2 = [Paragraph(l, hdr_style) for l in ["Employee ID", "Name", "Department"]] + \
+           [Paragraph(s.replace("\n", " "), hdr_style) for _ in range(12) for s in subs]
+
+    body_rows = []
+    for r in rows:
+        row = [Paragraph(r["employee_code"], cell_style), Paragraph(r["name"], cell_style), Paragraph(r["department"], cell_style)]
+        for mo in r["months"]:
+            for key in ("monday", "friday", "hd", "early", "wfh", "late"):
+                v = mo[key]
+                row.append(Paragraph("" if not v else f"{v:g}", cell_style))
+        body_rows.append(row)
+
+    table = Table([row1, row2] + body_rows, colWidths=col_widths, repeatRows=2)
+    style = list(_BASE_TABLE_STYLE) + [
+        ("GRID", (0, 0), (-1, -1), 0.3, rl_colors.HexColor("#cbd5e1")),
+        ("BACKGROUND", (0, 0), (-1, 1), rl_colors.HexColor("#1e293b")),
+        ("TEXTCOLOR",  (0, 0), (-1, 1), rl_colors.white),
+        ("ROWBACKGROUNDS", (0, 2), (-1, -1), [rl_colors.white, rl_colors.HexColor("#f8fafc")]),
+        ("SPAN", (0, 0), (0, 1)), ("SPAN", (1, 0), (1, 1)), ("SPAN", (2, 0), (2, 1)),
+    ]
+    for m in range(12):
+        start = 3 + m * 6
+        style.append(("SPAN", (start, 0), (start + 5, 0)))
+    table.setStyle(TableStyle(style))
+
+    title = Paragraph(f"<b>Leave Pattern Monitoring — {year}</b>", getSampleStyleSheet()["Heading3"])
+    return [title, table]
+
+
+def _late_coming_flowables(rows, year, doc):
+    from reportlab.lib import colors as rl_colors
+    from reportlab.platypus import Table, TableStyle, Paragraph
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    weights = [1.0, 1.8, 1.4, 0.7] + [1.6] * 12
+    total_weight = sum(weights)
+    col_widths = [doc.width * (w / total_weight) for w in weights]
+
+    hdr_style  = ParagraphStyle("xhdr", fontSize=6.5, leading=7.5, alignment=1, fontName="Helvetica-Bold")
+    cell_style = ParagraphStyle("xcell", fontSize=5.5, leading=7, alignment=1)
+
+    header = [Paragraph(l, hdr_style) for l in ["Employee ID", "Name", "Department", "Count"]] + \
+             [Paragraph(calendar.month_abbr[m], hdr_style) for m in range(1, 13)]
+    body_rows = []
+    for r in rows:
+        row = [Paragraph(r["employee_code"], cell_style), Paragraph(r["name"], cell_style),
+               Paragraph(r["department"], cell_style),
+               Paragraph(str(r["count"]) if r["count"] else "", ParagraphStyle("xc", parent=cell_style, fontName="Helvetica-Bold"))]
+        for dates in r["months"]:
+            row.append(Paragraph("<br/>".join(dates), cell_style))
+        body_rows.append(row)
+
+    table = Table([header] + body_rows, colWidths=col_widths, repeatRows=1)
+    style = list(_BASE_TABLE_STYLE) + [
+        ("GRID", (0, 0), (-1, -1), 0.3, rl_colors.HexColor("#cbd5e1")),
+        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#1e293b")),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), rl_colors.white),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#f8fafc")]),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]
+    table.setStyle(TableStyle(style))
+
+    title = Paragraph(f"<b>Late Coming — {year}</b>", getSampleStyleSheet()["Heading3"])
+    return [title, table]
+
+
+def _render_master_tracker_pdf(tracker_rows, dept_blocks, leave_rows, late_rows, year):
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, PageBreak
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=(_PDF_PAGE_W_MM * mm, 297 * mm),
+        leftMargin=6 * mm, rightMargin=6 * mm, topMargin=8 * mm, bottomMargin=8 * mm,
+    )
+    story = []
+    story += _master_tracker_flowables(tracker_rows, year, doc)
+    story.append(PageBreak())
+    story += _dept_wise_flowables(dept_blocks, year, doc)
+    story.append(PageBreak())
+    story += _leave_monitoring_flowables(leave_rows, year, doc)
+    story.append(PageBreak())
+    story += _late_coming_flowables(late_rows, year, doc)
+    doc.build(story)
     buf.seek(0)
     return buf
+
+
+def _build_master_tracker_bundle(year):
+    """All four sections of the Master Tracker report in one call."""
+    tracker_rows = _build_master_tracker_rows(year)
+    return {
+        "tracker": tracker_rows,
+        "dept":    _dept_wise_blocks_from_tracker(tracker_rows),
+        "leave":   _build_leave_monitoring_rows(year),
+        "late":    _build_late_coming_rows(year),
+    }
 
 
 @bp.route("/api/admin/reports/master-tracker-pdf", methods=["GET"])
@@ -462,8 +772,8 @@ def master_tracker_pdf():
     if year < 2000:
         return "Invalid year", 400
 
-    rows = _build_master_tracker_rows(year)
-    buf  = _render_master_tracker_pdf(rows, year)
+    b = _build_master_tracker_bundle(year)
+    buf = _render_master_tracker_pdf(b["tracker"], b["dept"], b["leave"], b["late"], year)
     filename = f"Attendance_Master_Tracker_{year}.pdf"
     return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=filename)
 
@@ -509,3 +819,151 @@ def master_tracker_csv():
     buf  = _render_master_tracker_csv(rows)
     filename = f"Attendance_Master_Tracker_{year}.csv"
     return send_file(buf, mimetype="text/csv", as_attachment=True, download_name=filename)
+
+
+# ── Master Tracker Excel (.xlsx, one worksheet per section) ─────────────────
+
+def _render_master_tracker_xlsx(bundle, year):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    HDR_FONT = Font(bold=True, color="FFFFFF")
+    HDR_FILL = PatternFill("solid", fgColor="1E293B")
+    SEC_FILL = PatternFill("solid", fgColor="B8860B")
+    AGG_FILL = PatternFill("solid", fgColor="E2E8F0")
+    CENTER   = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ABBR     = [calendar.month_abbr[m] for m in range(1, 13)]
+    NAMES    = [calendar.month_name[m] for m in range(1, 13)]
+
+    def num(v):
+        return "" if v in (None, 0) else v
+
+    def style_row(ws, r, fill=HDR_FILL, font=HDR_FONT):
+        for cell in ws[r]:
+            cell.font = font
+            cell.fill = fill
+            cell.alignment = CENTER
+
+    def autofit(ws, cap=34):
+        for col in ws.columns:
+            first = col[0]
+            if not hasattr(first, "column"):
+                continue
+            longest = 0
+            for c in col:
+                for line in str(c.value or "").split("\n"):
+                    longest = max(longest, len(line))
+            ws.column_dimensions[get_column_letter(first.column)].width = min(max(longest + 2, 9), cap)
+
+    wb = Workbook()
+
+    # ── Sheet 1 — Master Sheet ──────────────────────────────────────────────
+    ws = wb.active
+    ws.title = "Master Sheet"
+    header = ["Employee ID", "Employee Name", "Department"]
+    for name in ABBR:
+        header += [f"{name} Total", f"{name} Attended", f"{name} Leaves", f"{name} %"]
+    header.append("Total %")
+    ws.append(header)
+    for r in bundle["tracker"]:
+        row = [r["employee_code"], r["name"], r["department"]]
+        for mo in r["months"]:
+            row += [
+                num(mo["total"]), num(mo["attended"]), num(mo["leaves"]),
+                mo["pct"] if mo["pct"] is not None else "",
+            ]
+        row.append(r["year_pct"] if r["year_pct"] is not None else "")
+        ws.append(row)
+    style_row(ws, 1)
+    ws.freeze_panes = "D2"
+    autofit(ws)
+
+    # ── Sheet 2 — Dep wise ─────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Dep wise")
+    head2 = ["Sl No", "Employee ID", "Name"] + [f"{a} %" for a in ABBR]
+    ws2.append(head2)
+    style_row(ws2, 1)
+    for block in bundle["dept"]:
+        ws2.append([block["department"].upper()] + [""] * (len(head2) - 1))
+        r_sec = ws2.max_row
+        ws2.merge_cells(start_row=r_sec, start_column=1, end_row=r_sec, end_column=len(head2))
+        style_row(ws2, r_sec, fill=SEC_FILL)
+        for i, e in enumerate(block["employees"], 1):
+            ws2.append([i, e["employee_code"], e["name"]] +
+                       [p if p is not None else "" for p in e["pcts"]])
+        ws2.append(["", "", "Average %"] + [a if a is not None else "" for a in block["average"]])
+        style_row(ws2, ws2.max_row, fill=AGG_FILL, font=Font(bold=True))
+        ws2.append(["", "", "Quarter %"] + [q if q is not None else "" for q in block["quarter"]])
+        style_row(ws2, ws2.max_row, fill=AGG_FILL, font=Font(bold=True))
+        ws2.append([])
+    ws2.freeze_panes = "D2"
+    autofit(ws2)
+
+    # ── Sheet 3 — Leave Monitoring ────────────────────────────────────────
+    ws3 = wb.create_sheet("Leave Monitoring")
+    SUBS = ["Monday Leave", "Friday Leave", "HD", "Early Leaving", "WFH", "Late Coming"]
+    row1 = ["Employee ID", "Name", "Department"]
+    row2 = ["", "", ""]
+    for name in NAMES:
+        row1 += [name] + [""] * (len(SUBS) - 1)
+        row2 += SUBS
+    ws3.append(row1)
+    ws3.append(row2)
+    col = 4
+    for _ in range(12):
+        ws3.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + len(SUBS) - 1)
+        col += len(SUBS)
+    for c in ("A", "B", "C"):
+        ws3.merge_cells(f"{c}1:{c}2")
+    for r in bundle["leave"]:
+        row = [r["employee_code"], r["name"], r["department"]]
+        for mo in r["months"]:
+            row += [num(mo["monday"]), num(mo["friday"]), num(mo["hd"]),
+                    num(mo["early"]), "", num(mo["late"])]
+        ws3.append(row)
+    style_row(ws3, 1)
+    style_row(ws3, 2)
+    ws3.freeze_panes = "D3"
+    autofit(ws3, cap=16)
+
+    # ── Sheet 4 — Late Coming ────────────────────────────────────────────
+    ws4 = wb.create_sheet("Late Coming")
+    head4 = ["Employee ID", "Name", "Department", "Count"] + ABBR
+    ws4.append(head4)
+    style_row(ws4, 1)
+    for r in bundle["late"]:
+        ws4.append([r["employee_code"], r["name"], r["department"], num(r["count"])] +
+                   ["\n".join(dates) for dates in r["months"]])
+    for row in ws4.iter_rows(min_row=2, min_col=5):
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top", horizontal="center")
+    ws4.freeze_panes = "E2"
+    autofit(ws4, cap=18)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+@bp.route("/api/admin/reports/master-tracker-xlsx", methods=["GET"])
+@token_required
+def master_tracker_xlsx():
+    if not _reports_allowed(request.user):
+        return "Unauthorized", 403
+    try:
+        year = int(request.args.get("year"))
+    except (TypeError, ValueError):
+        return "year is required", 400
+    if year < 2000:
+        return "Invalid year", 400
+
+    bundle = _build_master_tracker_bundle(year)
+    buf = _render_master_tracker_xlsx(bundle, year)
+    filename = f"Attendance_Master_Tracker_{year}.xlsx"
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True, download_name=filename,
+    )
