@@ -195,8 +195,8 @@ def _render_monthly_report_pdf(rows, day_headers, dow_headers, day_is_off, month
 
     # Header cells are Paragraph flowables, so the TableStyle TEXTCOLOR command
     # does NOT reach them — the white-on-navy has to be set on the style itself.
-    hdr_style   = ParagraphStyle("hdr", fontSize=6.5, leading=7.5, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
-    cell_style  = ParagraphStyle("cell", fontSize=5.5, leading=6.5, alignment=1)
+    hdr_style   = ParagraphStyle("hdr", fontSize=9, leading=11, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
+    cell_style  = ParagraphStyle("cell", fontSize=6, leading=7, alignment=1)
 
     # Fixed-column labels go in row1, NOT row2: cols 0-4 are SPAN-merged across
     # both header rows and reportlab renders the span from the TOP-LEFT cell,
@@ -238,6 +238,8 @@ def _render_monthly_report_pdf(rows, day_headers, dow_headers, day_is_off, month
         ("ROWBACKGROUNDS", (0, 2), (-1, -1), [rl_colors.white, rl_colors.HexColor("#f8fafc")]),
         ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
         ("LEFTPADDING", (0, 0), (-1, -1), 1.5), ("RIGHTPADDING", (0, 0), (-1, -1), 1.5),
+        # Roomier header rows so the bigger white label text isn't cramped.
+        ("TOPPADDING", (0, 0), (-1, 1), 6), ("BOTTOMPADDING", (0, 0), (-1, 1), 6),
         ("SPAN", (0, 0), (0, 1)), ("SPAN", (1, 0), (1, 1)), ("SPAN", (2, 0), (2, 1)),
         ("SPAN", (3, 0), (3, 1)), ("SPAN", (4, 0), (4, 1)),
     ]
@@ -565,8 +567,8 @@ def _master_tracker_flowables(rows, year, doc):
     total_weight = sum(weights)
     col_widths = [doc.width * (w / total_weight) for w in weights]
 
-    hdr_style  = ParagraphStyle("hdr", fontSize=6, leading=7, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
-    cell_style = ParagraphStyle("cell", fontSize=5.5, leading=6.5, alignment=1)
+    hdr_style  = ParagraphStyle("hdr", fontSize=8, leading=10, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
+    cell_style = ParagraphStyle("cell", fontSize=6, leading=7, alignment=1)
 
     # Fixed-column labels sit in row1 (cols 0-2 and the last col are SPAN-merged
     # across both header rows; reportlab draws a span from its top-left cell).
@@ -593,6 +595,7 @@ def _master_tracker_flowables(rows, year, doc):
         ("BACKGROUND", (0, 0), (-1, 1), rl_colors.HexColor("#1e293b")),
         ("TEXTCOLOR",  (0, 0), (-1, 1), rl_colors.white),
         ("ROWBACKGROUNDS", (0, 2), (-1, -1), [rl_colors.white, rl_colors.HexColor("#f8fafc")]),
+        ("TOPPADDING", (0, 0), (-1, 1), 5), ("BOTTOMPADDING", (0, 0), (-1, 1), 5),
         ("SPAN", (0, 0), (0, 1)), ("SPAN", (1, 0), (1, 1)), ("SPAN", (2, 0), (2, 1)), ("SPAN", (-1, 0), (-1, 1)),
     ]
     for m in range(12):
@@ -613,9 +616,9 @@ def _dept_wise_flowables(blocks, year, doc):
     total_weight = sum(weights)
     col_widths = [doc.width * (w / total_weight) for w in weights]
 
-    hdr_style  = ParagraphStyle("dhdr", fontSize=7, leading=8, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
-    cell_style = ParagraphStyle("dcell", fontSize=6.5, leading=7.5, alignment=1)
-    sec_style  = ParagraphStyle("dsec", fontSize=7.5, leading=9, alignment=0, fontName="Helvetica-Bold", textColor=rl_colors.white)
+    hdr_style  = ParagraphStyle("dhdr", fontSize=9, leading=11, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
+    cell_style = ParagraphStyle("dcell", fontSize=7, leading=8, alignment=1)
+    sec_style  = ParagraphStyle("dsec", fontSize=9, leading=11, alignment=0, fontName="Helvetica-Bold", textColor=rl_colors.white)
     agg_style  = ParagraphStyle("dagg", parent=cell_style, fontName="Helvetica-Bold")
 
     header = [Paragraph("Sl No", hdr_style), Paragraph("Employee ID", hdr_style), Paragraph("Name", hdr_style)] + \
@@ -641,6 +644,7 @@ def _dept_wise_flowables(blocks, year, doc):
         ("GRID", (0, 0), (-1, -1), 0.3, rl_colors.HexColor("#cbd5e1")),
         ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#1e293b")),
         ("TEXTCOLOR",  (0, 0), (-1, 0), rl_colors.white),
+        ("TOPPADDING", (0, 0), (-1, 0), 5), ("BOTTOMPADDING", (0, 0), (-1, 0), 5),
     ]
     for sr in section_rows:
         style.append(("BACKGROUND", (0, sr), (-1, sr), rl_colors.HexColor("#b8860b")))
@@ -664,14 +668,15 @@ def _leave_monitoring_flowables(rows, year, doc):
     total_weight = sum(weights)
     col_widths = [doc.width * (w / total_weight) for w in weights]
 
-    hdr_style  = ParagraphStyle("lhdr", fontSize=5.5, leading=6, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
-    cell_style = ParagraphStyle("lcell", fontSize=5.5, leading=6.5, alignment=1)
+    hdr_style  = ParagraphStyle("lhdr", fontSize=8, leading=10, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
+    sub_style  = ParagraphStyle("lsub", fontSize=6.5, leading=7.5, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
+    cell_style = ParagraphStyle("lcell", fontSize=6, leading=7, alignment=1)
 
     # Fixed-column labels in row1 (cols 0-2 are SPAN-merged across both header
     # rows; reportlab renders a span from its top-left cell).
     row1 = [Paragraph(l, hdr_style) for l in ["Employee ID", "Name", "Department"]] + \
            sum(([Paragraph(calendar.month_name[m], hdr_style)] + [""] * 5 for m in range(1, 13)), [])
-    row2 = [""] * 3 + [Paragraph(s.replace("\n", " "), hdr_style) for _ in range(12) for s in subs]
+    row2 = [""] * 3 + [Paragraph(s.replace("\n", " "), sub_style) for _ in range(12) for s in subs]
 
     body_rows = []
     for r in rows:
@@ -688,6 +693,7 @@ def _leave_monitoring_flowables(rows, year, doc):
         ("BACKGROUND", (0, 0), (-1, 1), rl_colors.HexColor("#1e293b")),
         ("TEXTCOLOR",  (0, 0), (-1, 1), rl_colors.white),
         ("ROWBACKGROUNDS", (0, 2), (-1, -1), [rl_colors.white, rl_colors.HexColor("#f8fafc")]),
+        ("TOPPADDING", (0, 0), (-1, 1), 4), ("BOTTOMPADDING", (0, 0), (-1, 1), 4),
         ("SPAN", (0, 0), (0, 1)), ("SPAN", (1, 0), (1, 1)), ("SPAN", (2, 0), (2, 1)),
     ]
     for m in range(12):
@@ -708,8 +714,8 @@ def _late_coming_flowables(rows, year, doc):
     total_weight = sum(weights)
     col_widths = [doc.width * (w / total_weight) for w in weights]
 
-    hdr_style  = ParagraphStyle("xhdr", fontSize=6.5, leading=7.5, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
-    cell_style = ParagraphStyle("xcell", fontSize=5.5, leading=7, alignment=1)
+    hdr_style  = ParagraphStyle("xhdr", fontSize=9, leading=11, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
+    cell_style = ParagraphStyle("xcell", fontSize=6, leading=7.5, alignment=1)
 
     header = [Paragraph(l, hdr_style) for l in ["Employee ID", "Name", "Department", "Count"]] + \
              [Paragraph(calendar.month_abbr[m], hdr_style) for m in range(1, 13)]
@@ -727,6 +733,7 @@ def _late_coming_flowables(rows, year, doc):
         ("GRID", (0, 0), (-1, -1), 0.3, rl_colors.HexColor("#cbd5e1")),
         ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#1e293b")),
         ("TEXTCOLOR",  (0, 0), (-1, 0), rl_colors.white),
+        ("TOPPADDING", (0, 0), (-1, 0), 5), ("BOTTOMPADDING", (0, 0), (-1, 0), 5),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.white, rl_colors.HexColor("#f8fafc")]),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]
