@@ -343,6 +343,99 @@ def monthly_attendance_csv():
     return send_file(buf, mimetype="text/csv", as_attachment=True, download_name=filename)
 
 
+def _render_monthly_report_xlsx(rows, day_headers, dow_headers, day_is_off, month, year):
+    """Same layout as the Monthly Report PDF, as a real .xlsx (openpyxl):
+    5 fixed columns + one column per day (number over weekday), weekend /
+    holiday columns tinted, status words coloured."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    HDR_FONT   = Font(bold=True, color="FFFFFF")
+    HDR_FILL   = PatternFill("solid", fgColor="1E293B")
+    OFF_FILL   = PatternFill("solid", fgColor="FEF9C3")
+    CENTER     = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    CENTER_S   = Alignment(horizontal="center", vertical="center")
+    STATUS_FONT = {
+        "Present":        Font(bold=True, color="16A34A"),
+        "PL":             Font(bold=True, color="D97706"),
+        "HD":             Font(bold=True, color="D97706"),
+        "LOP":            Font(bold=True, color="DC2626"),
+        "Not Checked In": Font(color="94A3B8"),
+    }
+    FIXED = ["Employee ID", "Employee Name", "Department", "Status", "Total Leaves"]
+    nf = len(FIXED)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"{calendar.month_abbr[month]} {year}"
+
+    ws.append(FIXED + [str(d) for d in day_headers])
+    ws.append([""] * nf + list(dow_headers))
+    for i in range(nf):
+        c = get_column_letter(i + 1)
+        ws.merge_cells(f"{c}1:{c}2")
+    for r in (1, 2):
+        for cell in ws[r]:
+            cell.font = HDR_FONT
+            cell.fill = HDR_FILL
+            cell.alignment = CENTER
+
+    for row in rows:
+        cells = list(row.get("cells") or [])
+        line  = [row.get("employee_code"), row.get("name"), row.get("department"),
+                 row.get("status"), row.get("total_leaves") or 0] + cells
+        ws.append(["" if v is None else v for v in line])
+        r = ws.max_row
+        for j, c in enumerate(cells):
+            cell = ws.cell(row=r, column=nf + 1 + j)
+            cell.alignment = CENTER_S
+            if STATUS_FONT.get(c):
+                cell.font = STATUS_FONT[c]
+
+    for j, off in enumerate(day_is_off):
+        if not off:
+            continue
+        col = nf + 1 + j
+        for r in range(3, ws.max_row + 1):
+            ws.cell(row=r, column=col).fill = OFF_FILL
+
+    ws.freeze_panes = ws.cell(row=3, column=nf + 1).coordinate
+    for i in range(1, ws.max_column + 1):
+        ws.column_dimensions[get_column_letter(i)].width = (
+            24 if i == 2 else 18 if i <= nf else 6.5
+        )
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+@bp.route("/api/admin/reports/monthly-attendance-xlsx", methods=["GET"])
+@token_required
+@_catch_report_errors
+def monthly_attendance_xlsx():
+    if not _reports_allowed(request.user):
+        return "Unauthorized", 403
+    try:
+        month = int(request.args.get("month"))
+        year  = int(request.args.get("year"))
+    except (TypeError, ValueError):
+        return "month (1-12) and year are required", 400
+    if not (1 <= month <= 12) or year < 2000:
+        return "Invalid month or year", 400
+
+    rows, day_headers, dow_headers, day_is_off = _build_monthly_report_rows(month, year)
+    buf = _render_monthly_report_xlsx(rows, day_headers, dow_headers, day_is_off, month, year)
+    filename = f"Monthly_Attendance_Report_{calendar.month_name[month]}_{year}.xlsx"
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True, download_name=filename,
+    )
+
+
 # ── Master Tracker (yearly) ─────────────────────────────────────────────────
 
 def _month_working_stats(checkin_dates, year, month, holiday_dates, leaves_for_emp, joined, lwd):
