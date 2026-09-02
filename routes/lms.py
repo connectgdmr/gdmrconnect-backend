@@ -18,6 +18,39 @@ from utils import send_email
 bp = Blueprint("lms", __name__)
 
 
+def _parse_due(raw):
+    """A per-assignment due date -> 'YYYY-MM-DD' string, or None."""
+    return str(raw)[:10] if raw else None
+
+
+def _parse_schedule(raw):
+    """'YYYY-MM-DDTHH:MM' (IST, from a datetime-local input) -> aware UTC datetime, or None."""
+    if not raw:
+        return None
+    try:
+        return IST.localize(datetime.strptime(str(raw)[:16], "%Y-%m-%dT%H:%M")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _assignment_state(prog, pct):
+    """The lifecycle state shown in the progress tables:
+    Completed / Scheduled (not yet available) / Overdue (past due, unfinished)
+    / In Progress / Not Started."""
+    if pct >= 100 or prog.get("status") == "Completed" or prog.get("completed_at"):
+        return "Completed"
+    sched = prog.get("scheduled_at")
+    if sched:
+        if sched.tzinfo is None:
+            sched = sched.replace(tzinfo=timezone.utc)
+        if sched > datetime.now(timezone.utc):
+            return "Scheduled"
+    due = prog.get("due_date")
+    if due and str(due)[:10] < _today_ist().isoformat():
+        return "Overdue"
+    return "In Progress" if pct > 0 else "Not Started"
+
+
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
 def _get_lms_grant(user):
@@ -207,14 +240,8 @@ def assign_course(course_id):
     employee_ids     = list(data.get("employee_ids") or [])
     scheduled_at_raw = data.get("scheduled_at")
 
-    scheduled_at = None
-    if scheduled_at_raw:
-        try:
-            scheduled_at = IST.localize(
-                datetime.strptime(scheduled_at_raw[:16], "%Y-%m-%dT%H:%M")
-            ).astimezone(timezone.utc)
-        except Exception:
-            pass
+    scheduled_at = _parse_schedule(scheduled_at_raw)
+    due_date     = _parse_due(data.get("due_date"))
 
     departments = list(data.get("departments") or [])
     single_dept = data.get("department")
@@ -230,8 +257,13 @@ def assign_course(course_id):
         employee_ids = list({*employee_ids, *dept_emp_ids})
 
         dept_update: dict = {"$addToSet": {"assigned_departments": {"$each": departments}}}
+        set_fields = {}
         if scheduled_at:
-            dept_update["$set"] = {"dept_scheduled_at": scheduled_at}
+            set_fields["dept_scheduled_at"] = scheduled_at
+        if due_date:
+            set_fields["dept_due_date"] = due_date
+        if set_fields:
+            dept_update["$set"] = set_fields
         lms_courses_col.update_one({"_id": course_obj}, dept_update)
 
     if not employee_ids:
@@ -252,6 +284,7 @@ def assign_course(course_id):
                     "progress_pct": 0,
                     "assigned_at":  now,
                     "scheduled_at": scheduled_at,
+                    "due_date":     due_date,
                     "completed_at": None,
                 }},
                 upsert=True
@@ -328,11 +361,59 @@ def lms_progress():
             "completed_lessons": done,
             "percent_complete":  pct,
             "status":            r.get("status", "Assigned"),
+            "state":             _assignment_state(r, pct),
             "last_activity":     r.get("last_activity"),
             "assigned_at":       r.get("assigned_at"),
+            "scheduled_at":      r.get("scheduled_at"),
+            "due_date":          r.get("due_date"),
             "completed_at":      r.get("completed_at"),
         })
     return jsonify(result), 200
+
+
+def _update_assignment(progress_id, data):
+    """Shared by the admin + manager edit routes: change a single
+    assignment's due date and/or schedule. Returns (json, status)."""
+    try:
+        obj = ObjectId(progress_id)
+    except Exception:
+        return {"message": "Invalid assignment ID"}, 400
+    update = {}
+    if "due_date" in data:
+        update["due_date"] = _parse_due(data.get("due_date"))
+    if "scheduled_at" in data:
+        raw = data.get("scheduled_at")
+        update["scheduled_at"] = _parse_schedule(raw) if raw else None
+    if not update:
+        return {"message": "Nothing to update — send due_date and/or scheduled_at."}, 400
+    res = lms_progress_col.update_one({"_id": obj}, {"$set": update})
+    if res.matched_count == 0:
+        return {"message": "Assignment not found"}, 404
+    return {"message": "Assignment updated"}, 200
+
+
+@bp.route("/api/admin/lms/progress/<progress_id>", methods=["PUT", "PATCH"])
+@token_required
+def admin_update_assignment(progress_id):
+    _, err = _require_lms(request.user, write=True)
+    if err: return err
+    body, status = _update_assignment(progress_id, request.json or {})
+    return jsonify(body), status
+
+
+@bp.route("/api/admin/lms/progress/<progress_id>", methods=["DELETE"])
+@token_required
+def admin_delete_assignment(progress_id):
+    _, err = _require_lms(request.user, write=True)
+    if err: return err
+    try:
+        obj = ObjectId(progress_id)
+    except Exception:
+        return jsonify({"message": "Invalid assignment ID"}), 400
+    res = lms_progress_col.delete_one({"_id": obj})
+    if res.deleted_count == 0:
+        return jsonify({"message": "Assignment not found"}), 404
+    return jsonify({"message": "Assignment removed"}), 200
 
 
 # ── Manager endpoints ────────────────────────────────────────────────────────
@@ -465,15 +546,8 @@ def manager_assign_course(course_id):
     if invalid:
         return jsonify({"message": f"Employees not in your department: {', '.join(invalid)}"}), 400
 
-    scheduled_at_raw = data.get("scheduled_at")
-    scheduled_at = None
-    if scheduled_at_raw:
-        try:
-            scheduled_at = IST.localize(
-                datetime.strptime(scheduled_at_raw[:16], "%Y-%m-%dT%H:%M")
-            ).astimezone(timezone.utc)
-        except Exception:
-            pass
+    scheduled_at = _parse_schedule(data.get("scheduled_at"))
+    due_date     = _parse_due(data.get("due_date"))
 
     now = datetime.now(timezone.utc)
     assigned = skipped = 0
@@ -489,6 +563,7 @@ def manager_assign_course(course_id):
                     "progress_pct": 0,
                     "assigned_at":  now,
                     "scheduled_at": scheduled_at,
+                    "due_date":     due_date,
                     "completed_at": None,
                 }},
                 upsert=True
@@ -568,11 +643,52 @@ def manager_lms_progress():
             "completed_lessons": done,
             "percent_complete":  pct,
             "status":            r.get("status", "Assigned"),
+            "state":             _assignment_state(r, pct),
             "last_activity":     r.get("last_activity"),
             "assigned_at":       r.get("assigned_at"),
+            "scheduled_at":      r.get("scheduled_at"),
+            "due_date":          r.get("due_date"),
             "completed_at":      r.get("completed_at"),
         })
     return jsonify(result), 200
+
+
+def _manager_owns_assignment(request_user, progress_id):
+    """The assignment's employee must be in one of the manager's departments."""
+    try:
+        prog = lms_progress_col.find_one({"_id": ObjectId(progress_id)}, {"user_id": 1})
+    except Exception:
+        return False, None
+    if not prog:
+        return False, None
+    emp = users_col.find_one({"_id": ObjectId(prog["user_id"])}, {"department": 1}) if prog.get("user_id") else None
+    emp_depts = emp.get("department") if emp else None
+    emp_depts = emp_depts if isinstance(emp_depts, list) else ([emp_depts] if emp_depts else [])
+    return bool(set(emp_depts) & set(_mgr_depts(request_user))), prog
+
+
+@bp.route("/api/manager/lms/progress/<progress_id>", methods=["PUT", "PATCH"])
+@token_required
+def manager_update_assignment(progress_id):
+    if request.user.get("role") != "manager":
+        return jsonify({"message": "Unauthorized"}), 403
+    ok, _ = _manager_owns_assignment(request.user, progress_id)
+    if not ok:
+        return jsonify({"message": "That assignment isn't for someone on your team."}), 403
+    body, status = _update_assignment(progress_id, request.json or {})
+    return jsonify(body), status
+
+
+@bp.route("/api/manager/lms/progress/<progress_id>", methods=["DELETE"])
+@token_required
+def manager_delete_assignment(progress_id):
+    if request.user.get("role") != "manager":
+        return jsonify({"message": "Unauthorized"}), 403
+    ok, _ = _manager_owns_assignment(request.user, progress_id)
+    if not ok:
+        return jsonify({"message": "That assignment isn't for someone on your team."}), 403
+    lms_progress_col.delete_one({"_id": ObjectId(progress_id)})
+    return jsonify({"message": "Assignment removed"}), 200
 
 
 # ── Employee endpoints ────────────────────────────────────────────────────────
@@ -608,7 +724,7 @@ def my_lms_courses():
 
     assigned_course_ids = {r["course_id"] for r in progress_records}
     if depts:
-        for c in lms_courses_col.find({"assigned_departments": {"$in": depts}, **not_expired}, {"_id": 1, "dept_scheduled_at": 1}):
+        for c in lms_courses_col.find({"assigned_departments": {"$in": depts}, **not_expired}, {"_id": 1, "dept_scheduled_at": 1, "dept_due_date": 1}):
             cid = str(c["_id"])
             if cid in assigned_course_ids:
                 continue
@@ -623,6 +739,7 @@ def my_lms_courses():
                 "completed_lessons": [],
                 "assigned_at":       None,
                 "scheduled_at":      dept_sched,
+                "due_date":          c.get("dept_due_date"),
                 "completed_at":      None,
                 "last_activity":     None,
             })
@@ -690,9 +807,11 @@ def my_lms_courses():
             "completed_lessons": completed_count,
             "percent_complete":  pct,
             "status":            prog.get("status", "Assigned"),
+            "state":             _assignment_state(prog, pct),
             "last_activity":     prog.get("last_activity"),
             "assigned_at":       prog.get("assigned_at"),
             "scheduled_at":      prog.get("scheduled_at"),
+            "due_date":          prog.get("due_date"),
             "completed_at":      prog.get("completed_at"),
         })
 
