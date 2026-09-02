@@ -28,6 +28,8 @@ per how HR actually treats it day to day (see _leave_is_approved below).
 import calendar
 import csv
 import io
+import traceback
+from functools import wraps
 from datetime import datetime, timezone
 
 from flask import Blueprint, request, send_file
@@ -45,6 +47,28 @@ bp = Blueprint("attendance_reports", __name__)
 
 def _reports_allowed(user):
     return _is_admin(user) or _has_module_grant(user, "attendance") or _has_module_grant(user, "summary")
+
+
+def _catch_report_errors(fn):
+    """Any unhandled exception while building a report becomes a logged 500
+    with a readable message instead of a bare stack trace / silent failure —
+    the frontend only ever shows "Failed to generate the report", so without
+    this the real cause never reaches anyone."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — deliberately broad, it's a report endpoint
+            traceback.print_exc()
+            return f"Report generation failed: {type(exc).__name__}: {exc}", 500
+    return wrapper
+
+
+def _csv_bytes(string_buf):
+    """UTF-8 (with BOM for Excel) bytes of a csv.writer StringIO buffer.
+    errors='replace' so a single stray/un-encodable character in an employee
+    or holiday name can't take down the whole download."""
+    return io.BytesIO(string_buf.getvalue().encode("utf-8-sig", errors="replace"))
 
 
 def _leave_is_approved(leave):
@@ -136,7 +160,7 @@ def _build_monthly_report_rows(month, year):
         for d in range(1, days_in_month + 1):
             day_str = f"{month_str}-{d:02d}"
             if day_is_off[d - 1]:
-                cells.append(holiday_names.get(day_str, ""))
+                cells.append(holiday_names.get(day_str) or "")
                 continue
             if (joined and day_str < joined) or (lwd and day_str > lwd):
                 cells.append("")
@@ -258,6 +282,7 @@ def _render_monthly_report_pdf(rows, day_headers, dow_headers, day_is_off, month
 
 @bp.route("/api/admin/reports/monthly-attendance-pdf", methods=["GET"])
 @token_required
+@_catch_report_errors
 def monthly_attendance_pdf():
     if not _reports_allowed(request.user):
         return "Unauthorized", 403
@@ -281,13 +306,14 @@ def _render_monthly_report_csv(rows, day_headers):
     w.writerow(["Employee ID", "Employee Name", "Department", "Status", "Total Leaves"] + day_headers)
     for r in rows:
         w.writerow([r["employee_code"], r["name"], r["department"], r["status"], f'{r["total_leaves"]:g}'] + r["cells"])
-    out = io.BytesIO(buf.getvalue().encode("utf-8-sig"))  # BOM so Excel opens it without mangling names
+    out = _csv_bytes(buf)
     out.seek(0)
     return out
 
 
 @bp.route("/api/admin/reports/monthly-attendance-csv", methods=["GET"])
 @token_required
+@_catch_report_errors
 def monthly_attendance_csv():
     if not _reports_allowed(request.user):
         return "Unauthorized", 403
@@ -778,6 +804,7 @@ def _build_master_tracker_bundle(year):
 
 @bp.route("/api/admin/reports/master-tracker-pdf", methods=["GET"])
 @token_required
+@_catch_report_errors
 def master_tracker_pdf():
     if not _reports_allowed(request.user):
         return "Unauthorized", 403
@@ -814,13 +841,14 @@ def _render_master_tracker_csv(rows):
             ]
         row.append(r["year_pct"] if r["year_pct"] is not None else "")
         w.writerow(row)
-    out = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+    out = _csv_bytes(buf)
     out.seek(0)
     return out
 
 
 @bp.route("/api/admin/reports/master-tracker-csv", methods=["GET"])
 @token_required
+@_catch_report_errors
 def master_tracker_csv():
     if not _reports_allowed(request.user):
         return "Unauthorized", 403
@@ -862,15 +890,20 @@ def _render_master_tracker_xlsx(bundle, year):
             cell.alignment = CENTER
 
     def autofit(ws, cap=34):
-        for col in ws.columns:
-            first = col[0]
-            if not hasattr(first, "column"):
-                continue
-            longest = 0
-            for c in col:
-                for line in str(c.value or "").split("\n"):
-                    longest = max(longest, len(line))
-            ws.column_dimensions[get_column_letter(first.column)].width = min(max(longest + 2, 9), cap)
+        # Purely cosmetic column widths — never let a width calc abort the
+        # download (merged cells make .columns iteration version-sensitive).
+        try:
+            for col in ws.columns:
+                first = col[0]
+                if not hasattr(first, "column"):
+                    continue
+                longest = 0
+                for c in col:
+                    for line in str(c.value or "").split("\n"):
+                        longest = max(longest, len(line))
+                ws.column_dimensions[get_column_letter(first.column)].width = min(max(longest + 2, 9), cap)
+        except Exception:
+            traceback.print_exc()
 
     wb = Workbook()
 
@@ -965,6 +998,7 @@ def _render_master_tracker_xlsx(bundle, year):
 
 @bp.route("/api/admin/reports/master-tracker-xlsx", methods=["GET"])
 @token_required
+@_catch_report_errors
 def master_tracker_xlsx():
     if not _reports_allowed(request.user):
         return "Unauthorized", 403
