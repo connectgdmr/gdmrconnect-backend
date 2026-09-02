@@ -401,6 +401,61 @@ def finalize_pms_review():
     return jsonify({"message": "PMS Evaluation Review Completed successfully!"}), 200
 
 
+@bp.route("/api/admin/pms-templates", methods=["GET"])
+@token_required
+def list_pms_templates():
+    """Every PMS form the current user has created/assigned, newest first —
+    backs the "Active PMS Forms" list in PMSWorkspace's builder tab. Nothing
+    surfaced an assigned template before: the Reviews tab only ever shows
+    self-assessments employees have actually submitted, so a freshly built
+    form looked like it had vanished."""
+    role = request.user.get("role")
+    if role not in ("admin", "owner", "manager") and not _has_module_grant(request.user, "pms"):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    # A manager only ever owns one template (keyed on created_by); admin /
+    # owner / delegate see the whole org's set.
+    query = {"created_by": str(request.user["_id"])} if role == "manager" else {}
+    templates = list(pms_templates_col.find(query).sort("updated_at", -1))
+
+    all_uids = set()
+    for t in templates:
+        all_uids.update(t.get("assigned_to", []) or [])
+    oids = []
+    for u in all_uids:
+        try:
+            oids.append(ObjectId(u))
+        except Exception:
+            pass
+    name_map = {str(u["_id"]): u.get("name", "Unknown")
+                for u in users_col.find({"_id": {"$in": oids}}, {"name": 1})}
+
+    out = []
+    for t in templates:
+        tid       = str(t["_id"])
+        assigned  = t.get("assigned_to", []) or []
+        submitted = set(pms_reviews_col.distinct("user_id", {"template_id": tid}))
+        sessions  = t.get("sessions", []) or []
+        updated   = t.get("updated_at")
+        out.append({
+            "_id":            tid,
+            "cycle_name":     t.get("cycle_name", ""),
+            "department":     t.get("department", ""),
+            "due_date":       t.get("due_date", ""),
+            "updated_at":     updated.isoformat() if hasattr(updated, "isoformat") else (updated or ""),
+            "created_by":     t.get("created_by"),
+            "section_count":  len(sessions),
+            "question_count": sum(len(s.get("questions", []) or []) for s in sessions),
+            "assigned_count": len(assigned),
+            "submitted_count": len([u for u in assigned if u in submitted]),
+            "assignees": [
+                {"id": u, "name": name_map.get(u, "Unknown"), "submitted": u in submitted}
+                for u in assigned
+            ],
+        })
+    return jsonify(out), 200
+
+
 @bp.route("/api/my/pms", methods=["GET"])
 @token_required
 def my_pms():
