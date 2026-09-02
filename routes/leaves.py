@@ -11,9 +11,9 @@ from datetime import datetime, timezone, timedelta
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
 
-from database import leaves_col, users_col, comp_off_col
+from database import leaves_col, users_col, comp_off_col, departments_col
 from decorators import token_required
-from helpers import _is_admin, _has_module_grant
+from helpers import _is_admin, _has_module_grant, _managed_employee_ids, _mgr_depts
 from config import IST, HR_EMAIL, DASHBOARD_URL
 from utils import send_email
 
@@ -75,17 +75,44 @@ def _refund_comp_off_leave(leave):
                     reason="Comp-off leave not taken", ref_leave_id=lid)
 
 
+def _dept_head_dept_names(user_id):
+    """Names of departments this user heads (departments_col.head_ids array,
+    or the legacy single head_id). A department head is treated as a manager
+    of that department for comp-off."""
+    try:
+        oid = ObjectId(user_id)
+    except Exception:
+        return []
+    names = []
+    for d in departments_col.find(
+        {"$or": [{"head_ids": oid}, {"head_id": oid}]}, {"name": 1}
+    ):
+        if d.get("name"):
+            names.append(d["name"])
+    return names
+
+
+def _comp_off_team_ids(user):
+    """Employee _ids (strings) a manager / department head may grant to and
+    see balances for: their department(s) + direct reports + any department
+    they head."""
+    ids = set(_managed_employee_ids(user))
+    head_depts = _dept_head_dept_names(str(user["_id"]))
+    if head_depts:
+        ids |= {str(u["_id"]) for u in users_col.find(
+            {"department": {"$in": head_depts}}, {"_id": 1}
+        )}
+    ids.discard(str(user["_id"]))  # not oneself
+    return ids
+
+
 def _can_grant_comp_off(user, target_uid):
     role = user.get("role")
     if role in ("admin", "owner") or _has_module_grant(user, "leaves", write=True):
         return True
-    if role == "manager":
-        try:
-            tgt = users_col.find_one({"_id": ObjectId(target_uid)}, {"manager_id": 1})
-        except Exception:
-            return False
-        return bool(tgt) and str(tgt.get("manager_id")) == str(user["_id"])
-    return False
+    if str(target_uid) == str(user["_id"]):
+        return False
+    return str(target_uid) in _comp_off_team_ids(user)
 
 
 @bp.route("/api/my/comp-off", methods=["GET"])
@@ -107,47 +134,47 @@ def grant_comp_off():
             and not _has_module_grant(request.user, "leaves", write=True):
         return jsonify({"message": "Unauthorized"}), 403
 
-    data   = request.json or {}
-    emp_id = data.get("employee_id")
-    reason = (data.get("reason") or "").strip()
+    data    = request.json or {}
+    reason  = (data.get("reason") or "").strip()
+    emp_ids = data.get("employee_ids") or ([data["employee_id"]] if data.get("employee_id") else [])
+    emp_ids = [e for e in dict.fromkeys(emp_ids) if e]  # de-dup, drop blanks
     try:
         days = float(data.get("days"))
     except (TypeError, ValueError):
         return jsonify({"message": "days must be a number"}), 400
-    if not emp_id or days <= 0:
-        return jsonify({"message": "Pick an employee and a positive number of days."}), 400
+    if not emp_ids or days <= 0:
+        return jsonify({"message": "Pick at least one employee and a positive number of days."}), 400
     if days > 60:
         return jsonify({"message": "That grant looks too large — please split it into smaller ones."}), 400
 
-    try:
-        target = users_col.find_one({"_id": ObjectId(emp_id)}, {"name": 1})
-    except Exception:
-        return jsonify({"message": "Invalid employee id"}), 400
-    if not target:
-        return jsonify({"message": "Employee not found"}), 404
-    if not _can_grant_comp_off(request.user, emp_id):
-        return jsonify({"message": "Unauthorized — that employee isn't on your team."}), 403
+    granted = []
+    for emp_id in emp_ids:
+        try:
+            target = users_col.find_one({"_id": ObjectId(emp_id)}, {"name": 1, "email": 1})
+        except Exception:
+            continue
+        if not target or not _can_grant_comp_off(request.user, emp_id):
+            continue
+        _comp_off_entry(emp_id, days, "grant", reason=reason,
+                        by=str(request.user["_id"]), by_name=request.user.get("name", ""))
+        granted.append(target.get("name", "employee"))
+        try:
+            if target.get("email"):
+                threading.Thread(
+                    target=send_email,
+                    args=(target["email"], "Comp-Off Granted",
+                          f"You have been granted {days:g} comp-off day(s)"
+                          f"{(' — ' + reason) if reason else ''}.\n\n"
+                          f"New balance: {_comp_off_balance(emp_id):g} day(s).\n\nApply via the Leave page."),
+                    daemon=True,
+                ).start()
+        except Exception:
+            pass
 
-    _comp_off_entry(emp_id, days, "grant", reason=reason,
-                    by=str(request.user["_id"]), by_name=request.user.get("name", ""))
-
-    try:
-        if target.get("email"):
-            threading.Thread(
-                target=send_email,
-                args=(target["email"], "Comp-Off Granted",
-                      f"You have been granted {days:g} comp-off day(s)"
-                      f"{(' — ' + reason) if reason else ''}.\n\n"
-                      f"New balance: {_comp_off_balance(emp_id):g} day(s).\n\nApply via the Leave page."),
-                daemon=True,
-            ).start()
-    except Exception:
-        pass
-
-    return jsonify({
-        "message": f"Granted {days:g} comp-off day(s) to {target.get('name', 'the employee')}.",
-        "balance": _comp_off_balance(emp_id),
-    }), 200
+    if not granted:
+        return jsonify({"message": "Nothing granted — those employees aren't on your team."}), 403
+    who = ", ".join(granted) if len(granted) <= 4 else f"{len(granted)} employees"
+    return jsonify({"message": f"Granted {days:g} comp-off day(s) to {who}."}), 200
 
 
 @bp.route("/api/comp-off/balances", methods=["GET"])
@@ -159,12 +186,15 @@ def comp_off_balances():
     if role not in ("admin", "owner", "manager") and not has_delegated:
         return jsonify({"message": "Unauthorized"}), 403
 
-    if role == "manager" and not has_delegated:
-        emps = list(users_col.find({"manager_id": str(user["_id"])},
-                                   {"name": 1, "department": 1, "employee_code": 1}))
-    else:
+    if role in ("admin", "owner") or has_delegated:
         emps = list(users_col.find({"role": {"$in": ["employee", "manager"]}},
                                    {"name": 1, "department": 1, "employee_code": 1}))
+    else:
+        team_ids = _comp_off_team_ids(user)
+        emps = list(users_col.find(
+            {"_id": {"$in": [ObjectId(i) for i in team_ids]}},
+            {"name": 1, "department": 1, "employee_code": 1},
+        )) if team_ids else []
     ids = [str(e["_id"]) for e in emps]
     bal_map = {
         r["_id"]: round(r["bal"], 2)

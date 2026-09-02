@@ -351,10 +351,31 @@ def list_departments():
     depts = []
     for d in departments_col.find().sort("name", 1):
         d["_id"] = str(d["_id"])
-        if d.get("head_id"):
-            d["head_id"] = str(d["head_id"])
+        heads = d.get("head_ids") or ([d["head_id"]] if d.get("head_id") else [])
+        d["head_ids"] = [str(h) for h in heads]
+        d["head_id"]  = d["head_ids"][0] if d["head_ids"] else None
         depts.append(d)
     return jsonify(depts), 200
+
+
+def _norm_head_ids(data):
+    """Accept head_ids (list) and/or the legacy single head_id → list[ObjectId].
+    Returns None only when neither field was sent (so a PUT can leave heads
+    untouched)."""
+    raw = data.get("head_ids")
+    if raw is None:
+        if "head_id" not in data:
+            return None
+        raw = [data["head_id"]] if data.get("head_id") else []
+    out = []
+    for x in raw or []:
+        if not x:
+            continue
+        try:
+            out.append(ObjectId(x))
+        except Exception:
+            pass
+    return out
 
 
 def _cascade_department_rename(old_name, new_name):
@@ -426,18 +447,19 @@ def create_department():
         return jsonify({"message": "Department name is required."}), 400
     if departments_col.find_one({"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}):
         return jsonify({"message": f"Department '{name}' already exists."}), 400
-    head_id = data.get("head_id")
+    head_ids = _norm_head_ids(data) or []
     doc = {
         "name":        name,
         "description": str(data.get("description", "")).strip(),
-        "head_id":     ObjectId(head_id) if head_id else None,
+        "head_ids":    head_ids,
+        "head_id":     head_ids[0] if head_ids else None,
         "created_at":  datetime.now(timezone.utc),
         "updated_at":  datetime.now(timezone.utc),
     }
     res       = departments_col.insert_one(doc)
     doc["_id"] = str(res.inserted_id)
-    if doc.get("head_id"):
-        doc["head_id"] = str(doc["head_id"])
+    doc["head_ids"] = [str(h) for h in head_ids]
+    doc["head_id"]  = doc["head_ids"][0] if doc["head_ids"] else None
 
     # "Formalizing" a legacy department — one that only ever existed as a
     # string on employee records, never as its own departments_col document
@@ -484,18 +506,17 @@ def update_department(dept_id):
 
     if "description" in data:
         update["description"] = str(data["description"]).strip()
-    if "head_id" in data:
-        raw = data["head_id"]
-        try:
-            update["head_id"] = ObjectId(raw) if raw else None
-        except Exception:
-            return jsonify({"message": "Invalid head_id."}), 400
+    head_ids = _norm_head_ids(data)
+    if head_ids is not None:
+        update["head_ids"] = head_ids
+        update["head_id"]  = head_ids[0] if head_ids else None
 
     departments_col.update_one({"_id": ObjectId(dept_id)}, {"$set": update})
     updated        = departments_col.find_one({"_id": ObjectId(dept_id)})
     updated["_id"] = str(updated["_id"])
-    if updated.get("head_id"):
-        updated["head_id"] = str(updated["head_id"])
+    heads = updated.get("head_ids") or ([updated["head_id"]] if updated.get("head_id") else [])
+    updated["head_ids"] = [str(h) for h in heads]
+    updated["head_id"]  = updated["head_ids"][0] if updated["head_ids"] else None
     return jsonify(updated), 200
 
 
