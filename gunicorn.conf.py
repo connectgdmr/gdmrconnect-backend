@@ -31,7 +31,10 @@ import os
 workers = int(os.environ.get("WEB_CONCURRENCY", 4))
 threads = 1
 worker_class = "sync"
-timeout = 60
+# 120s (was 60): the yearly HR spreadsheet reports (Master Tracker + its
+# Dep-wise / Leave-Monitoring / Late-Coming sheets) do a lot of work in one
+# request; 60s was tight enough to kill the worker mid-build on a full roster.
+timeout = 120
 
 
 def when_ready(server):

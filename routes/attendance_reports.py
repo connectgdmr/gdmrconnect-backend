@@ -333,17 +333,16 @@ def monthly_attendance_csv():
 
 # ── Master Tracker (yearly) ─────────────────────────────────────────────────
 
-def _month_working_stats(uid, year, month, holiday_dates, leaves_for_emp, joined, lwd):
-    """(total_working_days, attended_days, leave_days) for one employee/month."""
+def _month_working_stats(checkin_dates, year, month, holiday_dates, leaves_for_emp, joined, lwd):
+    """(total_working_days, attended_days, leave_days) for one employee/month.
+
+    `checkin_dates` is the set of that employee's check-in date strings for the
+    whole year, fetched once by the caller — this used to run its own
+    per-employee-per-month query (12 x N round-trips for the whole report,
+    enough to blow the gunicorn worker timeout on a real roster)."""
     days_in_month = calendar.monthrange(year, month)[1]
     today_str     = str(datetime.now(IST).date())
     month_str     = f"{year:04d}-{month:02d}"
-
-    checkin_dates = {
-        rec["date"] for rec in attendance_col.find(
-            {"user_id": uid, "type": "checkin", "date": {"$regex": f"^{month_str}"}}, {"date": 1}
-        )
-    }
 
     total, attended, leave_days = 0, 0.0, 0.0
     for d in range(1, days_in_month + 1):
@@ -385,17 +384,27 @@ def _build_master_tracker_rows(year):
         if _leave_is_approved(lv):
             leaves_by_uid.setdefault(lv["user_id"], []).append(lv)
 
+    # One query for the whole year's check-ins for everyone, grouped into a
+    # per-employee set of date strings (was 12 x N separate queries).
+    checkins_by_uid = {}
+    for rec in attendance_col.find({
+        "user_id": {"$in": uids}, "type": "checkin",
+        "date": {"$gte": year_start, "$lte": year_end},
+    }, {"user_id": 1, "date": 1}):
+        checkins_by_uid.setdefault(rec["user_id"], set()).add(rec["date"])
+
     rows = []
     for emp in sorted(employees, key=lambda e: (e.get("name") or "")):
         uid    = str(emp["_id"])
         joined = _date_str(emp.get("doj"))
         lwd    = _date_str((emp.get("resignation") or {}).get("last_working_day"))
-        emp_leaves = leaves_by_uid.get(uid, [])
+        emp_leaves    = leaves_by_uid.get(uid, [])
+        emp_checkins  = checkins_by_uid.get(uid, set())
 
         months = []
         yr_total, yr_attended = 0.0, 0.0
         for m in range(1, 13):
-            total, attended, leave_days = _month_working_stats(uid, year, m, holiday_dates, emp_leaves, joined, lwd)
+            total, attended, leave_days = _month_working_stats(emp_checkins, year, m, holiday_dates, emp_leaves, joined, lwd)
             pct = round(attended / total * 100, 1) if total else None
             months.append({"total": total, "attended": attended, "leaves": leave_days, "pct": pct})
             yr_total += total
