@@ -196,8 +196,11 @@ def _render_monthly_report_pdf(rows, day_headers, dow_headers, day_is_off, month
     hdr_style   = ParagraphStyle("hdr", fontSize=6.5, leading=7.5, alignment=1, fontName="Helvetica-Bold")
     cell_style  = ParagraphStyle("cell", fontSize=5.5, leading=6.5, alignment=1)
 
-    row1 = [""] * 5 + [Paragraph(d, hdr_style) for d in day_headers]
-    row2 = [Paragraph(l, hdr_style) for l in fixed_labels] + [Paragraph(d, hdr_style) for d in dow_headers]
+    # Fixed-column labels go in row1, NOT row2: cols 0-4 are SPAN-merged across
+    # both header rows and reportlab renders the span from the TOP-LEFT cell,
+    # so a label sitting in row2 would be hidden behind an empty row1 cell.
+    row1 = [Paragraph(l, hdr_style) for l in fixed_labels] + [Paragraph(d, hdr_style) for d in day_headers]
+    row2 = [""] * 5 + [Paragraph(d, hdr_style) for d in dow_headers]
 
     STATUS_COLOR = {
         "Present": rl_colors.HexColor("#16a34a"),
@@ -563,8 +566,10 @@ def _master_tracker_flowables(rows, year, doc):
     hdr_style  = ParagraphStyle("hdr", fontSize=6, leading=7, alignment=1, fontName="Helvetica-Bold")
     cell_style = ParagraphStyle("cell", fontSize=5.5, leading=6.5, alignment=1)
 
-    row1 = [""] * 3 + sum(([Paragraph(calendar.month_abbr[m], hdr_style)] + [""] * 3 for m in range(1, 13)), []) + [Paragraph("Total %", hdr_style)]
-    row2 = [Paragraph(l, hdr_style) for l in fixed_labels] + [Paragraph(l, hdr_style) for _ in range(12) for l in sub_labels] + [""]
+    # Fixed-column labels sit in row1 (cols 0-2 and the last col are SPAN-merged
+    # across both header rows; reportlab draws a span from its top-left cell).
+    row1 = [Paragraph(l, hdr_style) for l in fixed_labels] + sum(([Paragraph(calendar.month_abbr[m], hdr_style)] + [""] * 3 for m in range(1, 13)), []) + [Paragraph("Total %", hdr_style)]
+    row2 = [""] * 3 + [Paragraph(l, hdr_style) for _ in range(12) for l in sub_labels] + [""]
 
     body_rows = []
     for r in rows:
@@ -660,9 +665,11 @@ def _leave_monitoring_flowables(rows, year, doc):
     hdr_style  = ParagraphStyle("lhdr", fontSize=5.5, leading=6, alignment=1, fontName="Helvetica-Bold")
     cell_style = ParagraphStyle("lcell", fontSize=5.5, leading=6.5, alignment=1)
 
-    row1 = [""] * 3 + sum(([Paragraph(calendar.month_name[m], hdr_style)] + [""] * 5 for m in range(1, 13)), [])
-    row2 = [Paragraph(l, hdr_style) for l in ["Employee ID", "Name", "Department"]] + \
-           [Paragraph(s.replace("\n", " "), hdr_style) for _ in range(12) for s in subs]
+    # Fixed-column labels in row1 (cols 0-2 are SPAN-merged across both header
+    # rows; reportlab renders a span from its top-left cell).
+    row1 = [Paragraph(l, hdr_style) for l in ["Employee ID", "Name", "Department"]] + \
+           sum(([Paragraph(calendar.month_name[m], hdr_style)] + [""] * 5 for m in range(1, 13)), [])
+    row2 = [""] * 3 + [Paragraph(s.replace("\n", " "), hdr_style) for _ in range(12) for s in subs]
 
     body_rows = []
     for r in rows:
