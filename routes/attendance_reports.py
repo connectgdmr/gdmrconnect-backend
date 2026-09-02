@@ -193,7 +193,9 @@ def _render_monthly_report_pdf(rows, day_headers, dow_headers, day_is_off, month
     total_weight = sum(weights)
     col_widths = [doc.width * (w / total_weight) for w in weights]
 
-    hdr_style   = ParagraphStyle("hdr", fontSize=6.5, leading=7.5, alignment=1, fontName="Helvetica-Bold")
+    # Header cells are Paragraph flowables, so the TableStyle TEXTCOLOR command
+    # does NOT reach them — the white-on-navy has to be set on the style itself.
+    hdr_style   = ParagraphStyle("hdr", fontSize=6.5, leading=7.5, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
     cell_style  = ParagraphStyle("cell", fontSize=5.5, leading=6.5, alignment=1)
 
     # Fixed-column labels go in row1, NOT row2: cols 0-4 are SPAN-merged across
@@ -563,7 +565,7 @@ def _master_tracker_flowables(rows, year, doc):
     total_weight = sum(weights)
     col_widths = [doc.width * (w / total_weight) for w in weights]
 
-    hdr_style  = ParagraphStyle("hdr", fontSize=6, leading=7, alignment=1, fontName="Helvetica-Bold")
+    hdr_style  = ParagraphStyle("hdr", fontSize=6, leading=7, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
     cell_style = ParagraphStyle("cell", fontSize=5.5, leading=6.5, alignment=1)
 
     # Fixed-column labels sit in row1 (cols 0-2 and the last col are SPAN-merged
@@ -611,7 +613,7 @@ def _dept_wise_flowables(blocks, year, doc):
     total_weight = sum(weights)
     col_widths = [doc.width * (w / total_weight) for w in weights]
 
-    hdr_style  = ParagraphStyle("dhdr", fontSize=7, leading=8, alignment=1, fontName="Helvetica-Bold")
+    hdr_style  = ParagraphStyle("dhdr", fontSize=7, leading=8, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
     cell_style = ParagraphStyle("dcell", fontSize=6.5, leading=7.5, alignment=1)
     sec_style  = ParagraphStyle("dsec", fontSize=7.5, leading=9, alignment=0, fontName="Helvetica-Bold", textColor=rl_colors.white)
     agg_style  = ParagraphStyle("dagg", parent=cell_style, fontName="Helvetica-Bold")
@@ -662,7 +664,7 @@ def _leave_monitoring_flowables(rows, year, doc):
     total_weight = sum(weights)
     col_widths = [doc.width * (w / total_weight) for w in weights]
 
-    hdr_style  = ParagraphStyle("lhdr", fontSize=5.5, leading=6, alignment=1, fontName="Helvetica-Bold")
+    hdr_style  = ParagraphStyle("lhdr", fontSize=5.5, leading=6, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
     cell_style = ParagraphStyle("lcell", fontSize=5.5, leading=6.5, alignment=1)
 
     # Fixed-column labels in row1 (cols 0-2 are SPAN-merged across both header
@@ -706,7 +708,7 @@ def _late_coming_flowables(rows, year, doc):
     total_weight = sum(weights)
     col_widths = [doc.width * (w / total_weight) for w in weights]
 
-    hdr_style  = ParagraphStyle("xhdr", fontSize=6.5, leading=7.5, alignment=1, fontName="Helvetica-Bold")
+    hdr_style  = ParagraphStyle("xhdr", fontSize=6.5, leading=7.5, alignment=1, fontName="Helvetica-Bold", textColor=rl_colors.white)
     cell_style = ParagraphStyle("xcell", fontSize=5.5, leading=7, alignment=1)
 
     header = [Paragraph(l, hdr_style) for l in ["Employee ID", "Name", "Department", "Count"]] + \
