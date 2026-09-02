@@ -64,6 +64,17 @@ def _catch_report_errors(fn):
     return wrapper
 
 
+@bp.errorhandler(Exception)
+def _report_blueprint_error(exc):
+    """Belt-and-braces: even if a route somehow isn't wrapped, no report
+    endpoint should ever return the bare Flask 500 HTML page."""
+    from werkzeug.exceptions import HTTPException
+    if isinstance(exc, HTTPException):
+        return exc
+    traceback.print_exc()
+    return f"Report generation failed: {type(exc).__name__}: {exc}", 500
+
+
 def _csv_bytes(string_buf):
     """UTF-8 (with BOM for Excel) bytes of a csv.writer StringIO buffer.
     errors='replace' so a single stray/un-encodable character in an employee
@@ -303,9 +314,10 @@ def monthly_attendance_pdf():
 def _render_monthly_report_csv(rows, day_headers):
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["Employee ID", "Employee Name", "Department", "Status", "Total Leaves"] + day_headers)
+    w.writerow(["Employee ID", "Employee Name", "Department", "Status", "Total Leaves"] + [str(h) for h in day_headers])
     for r in rows:
-        w.writerow([r["employee_code"], r["name"], r["department"], r["status"], f'{r["total_leaves"]:g}'] + r["cells"])
+        lead = [r.get("employee_code"), r.get("name"), r.get("department"), r.get("status"), f'{(r.get("total_leaves") or 0):g}']
+        w.writerow(["" if v is None else str(v) for v in (lead + list(r.get("cells") or []))])
     out = _csv_bytes(buf)
     out.seek(0)
     return out
