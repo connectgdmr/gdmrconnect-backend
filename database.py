@@ -37,6 +37,7 @@ mongo_client = _client
 users_col       = db["users"]
 attendance_col  = db["attendance"]
 leaves_col      = db["leaves"]
+comp_off_col    = db["comp_off_ledger"]  # manager-granted comp-off credits / debits
 
 # ── Extended modules ──────────────────────────────────────────────────────────
 corrections_col  = db["attendance_corrections"]

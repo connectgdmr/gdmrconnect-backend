@@ -11,13 +11,179 @@ from datetime import datetime, timezone, timedelta
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
 
-from database import leaves_col, users_col
+from database import leaves_col, users_col, comp_off_col
 from decorators import token_required
 from helpers import _is_admin, _has_module_grant
 from config import IST, HR_EMAIL, DASHBOARD_URL
 from utils import send_email
 
 bp = Blueprint("leaves", __name__)
+
+
+# ── Comp-Off ───────────────────────────────────────────────────────────────
+# A manager (or admin/owner) credits comp-off days to a team member; the
+# employee then spends them by ticking "Comp-Off" on a leave request. Kept
+# as a signed ledger (comp_off_col) so the running balance is just a sum and
+# every credit/debit is auditable. This is deliberately NOT a new leave
+# "category" — most staff have unlimited leave; comp-off is the one balance
+# we track, per Joffin's call.
+
+def _leave_days(from_date, to_date, ltype):
+    if ltype == "half":
+        return 0.5
+    try:
+        f = datetime.strptime(str(from_date)[:10], "%Y-%m-%d").date()
+        t = datetime.strptime(str(to_date)[:10], "%Y-%m-%d").date()
+        return float(max(1, (t - f).days + 1))
+    except Exception:
+        return 1.0
+
+
+def _comp_off_balance(uid):
+    agg = list(comp_off_col.aggregate([
+        {"$match": {"user_id": uid}},
+        {"$group": {"_id": None, "bal": {"$sum": "$days"}}},
+    ]))
+    return round(agg[0]["bal"], 2) if agg else 0.0
+
+
+def _comp_off_entry(uid, days, kind, reason="", by=None, by_name="", ref_leave_id=None):
+    comp_off_col.insert_one({
+        "user_id":         uid,
+        "days":            round(float(days), 2),   # signed: + credit, - debit
+        "kind":            kind,                     # grant | reserve | refund
+        "reason":          reason or "",
+        "granted_by":      by,
+        "granted_by_name": by_name or "",
+        "ref_leave_id":    str(ref_leave_id) if ref_leave_id else None,
+        "created_at":      datetime.now(timezone.utc),
+    })
+
+
+def _refund_comp_off_leave(leave):
+    """Return the reserved days if a comp-off leave is rejected/cancelled —
+    at most once (guarded on an existing refund row)."""
+    if not leave or not leave.get("comp_off"):
+        return
+    lid = str(leave["_id"])
+    if comp_off_col.find_one({"ref_leave_id": lid, "kind": "refund"}):
+        return
+    reserved = comp_off_col.find_one({"ref_leave_id": lid, "kind": "reserve"})
+    if not reserved:
+        return
+    _comp_off_entry(leave["user_id"], abs(reserved["days"]), "refund",
+                    reason="Comp-off leave not taken", ref_leave_id=lid)
+
+
+def _can_grant_comp_off(user, target_uid):
+    role = user.get("role")
+    if role in ("admin", "owner") or _has_module_grant(user, "leaves", write=True):
+        return True
+    if role == "manager":
+        try:
+            tgt = users_col.find_one({"_id": ObjectId(target_uid)}, {"manager_id": 1})
+        except Exception:
+            return False
+        return bool(tgt) and str(tgt.get("manager_id")) == str(user["_id"])
+    return False
+
+
+@bp.route("/api/my/comp-off", methods=["GET"])
+@token_required
+def my_comp_off():
+    uid = str(request.user["_id"])
+    entries = []
+    for e in comp_off_col.find({"user_id": uid}).sort("created_at", -1):
+        e["_id"]        = str(e["_id"])
+        e["created_at"] = e["created_at"].isoformat() if e.get("created_at") else ""
+        entries.append(e)
+    return jsonify({"balance": _comp_off_balance(uid), "entries": entries}), 200
+
+
+@bp.route("/api/comp-off/grant", methods=["POST"])
+@token_required
+def grant_comp_off():
+    if request.user.get("role") not in ("admin", "owner", "manager") \
+            and not _has_module_grant(request.user, "leaves", write=True):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data   = request.json or {}
+    emp_id = data.get("employee_id")
+    reason = (data.get("reason") or "").strip()
+    try:
+        days = float(data.get("days"))
+    except (TypeError, ValueError):
+        return jsonify({"message": "days must be a number"}), 400
+    if not emp_id or days <= 0:
+        return jsonify({"message": "Pick an employee and a positive number of days."}), 400
+    if days > 60:
+        return jsonify({"message": "That grant looks too large — please split it into smaller ones."}), 400
+
+    try:
+        target = users_col.find_one({"_id": ObjectId(emp_id)}, {"name": 1})
+    except Exception:
+        return jsonify({"message": "Invalid employee id"}), 400
+    if not target:
+        return jsonify({"message": "Employee not found"}), 404
+    if not _can_grant_comp_off(request.user, emp_id):
+        return jsonify({"message": "Unauthorized — that employee isn't on your team."}), 403
+
+    _comp_off_entry(emp_id, days, "grant", reason=reason,
+                    by=str(request.user["_id"]), by_name=request.user.get("name", ""))
+
+    try:
+        if target.get("email"):
+            threading.Thread(
+                target=send_email,
+                args=(target["email"], "Comp-Off Granted",
+                      f"You have been granted {days:g} comp-off day(s)"
+                      f"{(' — ' + reason) if reason else ''}.\n\n"
+                      f"New balance: {_comp_off_balance(emp_id):g} day(s).\n\nApply via the Leave page."),
+                daemon=True,
+            ).start()
+    except Exception:
+        pass
+
+    return jsonify({
+        "message": f"Granted {days:g} comp-off day(s) to {target.get('name', 'the employee')}.",
+        "balance": _comp_off_balance(emp_id),
+    }), 200
+
+
+@bp.route("/api/comp-off/balances", methods=["GET"])
+@token_required
+def comp_off_balances():
+    user = request.user
+    role = user.get("role")
+    has_delegated = _has_module_grant(user, "leaves") or _has_module_grant(user, "attendance")
+    if role not in ("admin", "owner", "manager") and not has_delegated:
+        return jsonify({"message": "Unauthorized"}), 403
+
+    if role == "manager" and not has_delegated:
+        emps = list(users_col.find({"manager_id": str(user["_id"])},
+                                   {"name": 1, "department": 1, "employee_code": 1}))
+    else:
+        emps = list(users_col.find({"role": {"$in": ["employee", "manager"]}},
+                                   {"name": 1, "department": 1, "employee_code": 1}))
+    ids = [str(e["_id"]) for e in emps]
+    bal_map = {
+        r["_id"]: round(r["bal"], 2)
+        for r in comp_off_col.aggregate([
+            {"$match": {"user_id": {"$in": ids}}},
+            {"$group": {"_id": "$user_id", "bal": {"$sum": "$days"}}},
+        ])
+    }
+    rows = [
+        {
+            "employee_id": str(e["_id"]),
+            "employee_code": e.get("employee_code") or "",
+            "name": e.get("name", ""),
+            "department": ", ".join(e["department"]) if isinstance(e.get("department"), list) else (e.get("department") or ""),
+            "balance": bal_map.get(str(e["_id"]), 0.0),
+        }
+        for e in sorted(emps, key=lambda x: (x.get("name") or "").lower())
+    ]
+    return jsonify(rows), 200
 
 
 def _send_leave_notification(leave_doc: dict, employee: dict):
@@ -218,6 +384,7 @@ def apply_leave():
     leave_type = request.form.get("type", "full")
     period     = request.form.get("period")
     reason     = request.form.get("reason", "")
+    is_comp_off = str(request.form.get("comp_off", "")).lower() in ("true", "1", "on", "yes")
 
     if not from_date or not to_date:
         return jsonify({"message": "Start and End dates are required"}), 400
@@ -270,6 +437,15 @@ def apply_leave():
                        f"{' to ' + ex.get('to_date') if ex.get('to_date') != ex.get('from_date') else ''}."
         }), 409
 
+    # Comp-off request — must have the balance for it (the balance already
+    # nets out any earlier still-pending comp-off leave, so this is safe).
+    comp_off_days = _leave_days(from_date, to_date, leave_type) if is_comp_off else 0.0
+    if is_comp_off:
+        bal = _comp_off_balance(uid)
+        if bal < comp_off_days:
+            return jsonify({"message": f"Not enough comp-off balance — you have {bal:g} day(s), "
+                                       f"this request needs {comp_off_days:g}."}), 400
+
     attachment_url = None
     file = request.files.get("attachment")
     if file:
@@ -287,6 +463,7 @@ def apply_leave():
         "type":          leave_type,
         "period":        period,
         "reason":        reason,
+        "comp_off":      is_comp_off,
         "status":        "Pending",
         "manager_status": "Pending",
         "admin_status":  "Pending",
@@ -295,6 +472,9 @@ def apply_leave():
     }
 
     res = leaves_col.insert_one(leave)
+    if is_comp_off:
+        _comp_off_entry(uid, -comp_off_days, "reserve",
+                        reason="Comp-off leave applied", ref_leave_id=res.inserted_id)
     threading.Thread(target=_send_leave_notification,
                      args=(leave, dict(request.user)), daemon=True).start()
     return jsonify({"message": "Applied", "id": str(res.inserted_id)}), 201
@@ -383,6 +563,10 @@ def update_leave(leave_id):
 
     leaves_col.update_one({"_id": ObjectId(leave_id)}, {"$set": {"status": final_status}})
 
+    # A rejected comp-off leave gives its reserved days back.
+    if final_status == "Rejected":
+        _refund_comp_off_leave(leave)
+
     try:
         user = users_col.find_one({"_id": ObjectId(leave["user_id"])})
         if user:
@@ -450,6 +634,9 @@ def revoke_leave(leave_id):
         "cancelled_at":      datetime.now(timezone.utc),
         "cancelled_by_role": role,
     }})
+
+    # Cancelling a comp-off leave returns the reserved days.
+    _refund_comp_off_leave(leave)
 
     if not is_owner:
         try:
