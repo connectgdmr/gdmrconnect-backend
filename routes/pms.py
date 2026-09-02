@@ -30,7 +30,7 @@ def save_pms_template():
             and not _has_module_grant(request.user, "pms", write=True):
         return jsonify({"message": "Unauthorized"}), 403
 
-    data       = request.json
+    data       = request.json or {}
     mgr_id     = str(request.user["_id"])
     is_manager = request.user.get("role") == "manager"
 
@@ -40,19 +40,63 @@ def save_pms_template():
     if not assigned_to_list:
         return jsonify({"message": "You must assign the template to at least one employee."}), 400
 
-    template_record = {
-        "department": dept_to_store,
-        "sessions":   data.get("sessions", []),
+    fields = {
+        "department":  dept_to_store,
+        "sessions":    data.get("sessions", []),
         "assigned_to": assigned_to_list,
-        "cycle_name": data.get("cycle_name", ""),
-        "due_date":   data.get("due_date", ""),
-        "created_by": mgr_id,
-        "updated_at": datetime.now(timezone.utc),
+        "cycle_name":  data.get("cycle_name", ""),
+        "due_date":    data.get("due_date", ""),
+        "updated_at":  datetime.now(timezone.utc),
     }
 
-    upsert_key = {"created_by": mgr_id} if is_manager else {"department": dept_to_store}
-    pms_templates_col.update_one(upsert_key, {"$set": template_record}, upsert=True)
-    return jsonify({"message": f"PMS Form Assigned to {len(assigned_to_list)} employees successfully!"}), 200
+    # `template_id` present  → editing that specific form (multiple PMS forms
+    # can coexist now; the "All PMS" tab manages them). Absent → brand new
+    # form, always inserted as its own document (no more upsert-by-department,
+    # which capped an admin at one form ever).
+    template_id = data.get("template_id")
+    if template_id:
+        try:
+            oid = ObjectId(template_id)
+        except Exception:
+            return jsonify({"message": "Invalid template id."}), 400
+        scope = {"_id": oid}
+        if is_manager:
+            scope["created_by"] = mgr_id  # a manager may only edit their own
+        res = pms_templates_col.update_one(scope, {"$set": fields})
+        if res.matched_count == 0:
+            return jsonify({"message": "PMS form not found."}), 404
+        return jsonify({"message": "PMS form updated.", "_id": template_id}), 200
+
+    fields["created_by"] = mgr_id
+    fields["created_at"] = datetime.now(timezone.utc)
+    ins = pms_templates_col.insert_one(fields)
+    return jsonify({
+        "message": f"PMS Form Assigned to {len(assigned_to_list)} employees successfully!",
+        "_id": str(ins.inserted_id),
+    }), 200
+
+
+@bp.route("/api/admin/pms-template/<template_id>", methods=["DELETE"])
+@token_required
+def delete_pms_template(template_id):
+    role = request.user.get("role")
+    if role not in ("admin", "owner", "manager") \
+            and not _has_module_grant(request.user, "pms", write=True):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        oid = ObjectId(template_id)
+    except Exception:
+        return jsonify({"message": "Invalid template id."}), 400
+
+    scope = {"_id": oid}
+    if role == "manager":
+        scope["created_by"] = str(request.user["_id"])
+    res = pms_templates_col.delete_one(scope)
+    if res.deleted_count == 0:
+        return jsonify({"message": "PMS form not found."}), 404
+    # Submitted self-assessments (pms_reviews_col) are left untouched — they
+    # keep their own copy of the questions and stay in PMS History / Reviews.
+    return jsonify({"message": "PMS form deleted."}), 200
 
 
 @bp.route("/api/pms-template", methods=["GET"])
@@ -404,19 +448,20 @@ def finalize_pms_review():
 @bp.route("/api/admin/pms-templates", methods=["GET"])
 @token_required
 def list_pms_templates():
-    """Every PMS form the current user has created/assigned, newest first —
-    backs the "Active PMS Forms" list in PMSWorkspace's builder tab. Nothing
-    surfaced an assigned template before: the Reviews tab only ever shows
-    self-assessments employees have actually submitted, so a freshly built
-    form looked like it had vanished."""
+    """Every PMS form the current user owns, newest first — backs the
+    "All PMS" tab in PMSWorkspace (active + expired), with enough detail
+    (full `sessions`, raw `assigned_to`) to re-open one in the builder for
+    editing. Nothing surfaced assigned templates before: the Reviews tab
+    only ever shows self-assessments employees have actually submitted."""
     role = request.user.get("role")
     if role not in ("admin", "owner", "manager") and not _has_module_grant(request.user, "pms"):
         return jsonify({"message": "Unauthorized"}), 403
 
-    # A manager only ever owns one template (keyed on created_by); admin /
-    # owner / delegate see the whole org's set.
+    # Managers see only their own forms; admin / owner / delegate see the
+    # whole org's set.
     query = {"created_by": str(request.user["_id"])} if role == "manager" else {}
     templates = list(pms_templates_col.find(query).sort("updated_at", -1))
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
 
     all_uids = set()
     for t in templates:
@@ -437,13 +482,19 @@ def list_pms_templates():
         submitted = set(pms_reviews_col.distinct("user_id", {"template_id": tid}))
         sessions  = t.get("sessions", []) or []
         updated   = t.get("updated_at")
+        created   = t.get("created_at")
+        due       = t.get("due_date", "") or ""
         out.append({
             "_id":            tid,
             "cycle_name":     t.get("cycle_name", ""),
             "department":     t.get("department", ""),
-            "due_date":       t.get("due_date", ""),
+            "due_date":       due,
+            "status":         "expired" if (due and due < today_str) else "active",
             "updated_at":     updated.isoformat() if hasattr(updated, "isoformat") else (updated or ""),
+            "created_at":     created.isoformat() if hasattr(created, "isoformat") else (created or ""),
             "created_by":     t.get("created_by"),
+            "sessions":       sessions,
+            "assigned_to":    assigned,
             "section_count":  len(sessions),
             "question_count": sum(len(s.get("questions", []) or []) for s in sessions),
             "assigned_count": len(assigned),
