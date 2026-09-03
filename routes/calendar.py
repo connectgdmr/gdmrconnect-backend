@@ -148,7 +148,25 @@ def _month_calendar_for_employee(uid, month_str):
                     entry["holiday_name"] = holiday_names[day_str]
                 counts["weekly_off"] += 1
             else:
-                entry = {"status": "future"}
+                # A leave request (approved by a manager or admin — or still
+                # pending; anything not Rejected/Cancelled, same rule the
+                # past-day path uses) that already covers a future working day
+                # is known now: show it as leave and count it, instead of a
+                # blank "future" cell that reads as upcoming LOP. Planned time
+                # off — including leave taken while in a previous department,
+                # which is matched here by user_id, not department — is
+                # visible ahead of the day this way.
+                lv = next((l for l in leaves if l.get("from_date", "") <= day_str <= l.get("to_date", "")), None)
+                if lv:
+                    entry = {
+                        "status":       "approved_leave",
+                        "leave_type":   lv.get("type", "full"),
+                        "leave_period": lv.get("period"),
+                        "leave_reason": lv.get("reason"),
+                    }
+                    counts["approved_leave"] += 1
+                else:
+                    entry = {"status": "future"}
             days[day_str] = entry
             continue
 
