@@ -56,32 +56,37 @@ def chat_users():
     useful, and existing DMs with them still work fine without this."""
     uid  = str(request.user["_id"])
     rows = []
-    for u in users_col.find(
-        {"_id": {"$ne": ObjectId(uid)}},
-        {"name": 1, "role": 1, "department": 1, "position": 1, "email": 1, "phone": 1, "location": 1, "resignation": 1, "photo_url": 1}
-    ):
-        # One malformed resignation record must not 500 the whole directory —
-        # that leaves employees (who usually have no prior threads to fall
-        # back on) with a completely empty Messages screen.
+    # Every step here is wrapped so a single bad user document can never take
+    # down the whole directory — that failure showed up as a completely empty
+    # Messages screen for anyone (typically employees) with no prior threads
+    # to fall back on.
+    try:
+        cursor = users_col.find(
+            {"_id": {"$ne": ObjectId(uid)}},
+            {"name": 1, "role": 1, "department": 1, "position": 1, "email": 1, "phone": 1, "location": 1, "resignation": 1, "photo_url": 1}
+        )
+    except Exception:
+        cursor = []
+    for u in cursor:
         try:
             if is_offboarded(u):
                 continue
+            dept = u.get("department") or ""
+            if isinstance(dept, list):
+                dept = ", ".join(d for d in dept if d)
+            rows.append({
+                "_id":        str(u["_id"]),
+                "name":       u.get("name") or "",
+                "role":       u.get("role") or "",
+                "department": dept,
+                "position":   u.get("position") or "",
+                "email":      u.get("email") or "",
+                "phone":      u.get("phone") or "",
+                "photo_url":  u.get("photo_url"),
+                "location":   u.get("location") or "",
+            })
         except Exception:
-            pass
-        dept = u.get("department") or ""
-        if isinstance(dept, list):
-            dept = ", ".join(d for d in dept if d)
-        rows.append({
-            "_id":        str(u["_id"]),
-            "name":       u.get("name") or "",
-            "role":       u.get("role") or "",
-            "department": dept,
-            "position":   u.get("position") or "",
-            "email":      u.get("email") or "",
-            "phone":      u.get("phone") or "",
-            "photo_url":  u.get("photo_url"),
-            "location":   u.get("location") or "",
-        })
+            continue
     return jsonify({"users": rows}), 200
 
 
