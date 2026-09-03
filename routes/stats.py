@@ -10,7 +10,8 @@ from bson import ObjectId
 
 from database import (attendance_col, leaves_col, users_col)
 from decorators import token_required
-from helpers import _is_admin, _has_module_grant, classify_attendance_day, get_company_holiday_dates, is_weekend_day
+from helpers import (_is_admin, _has_module_grant, classify_attendance_day,
+                     get_company_holiday_dates, is_weekend_day, active_staff)
 from config import IST
 
 bp = Blueprint("stats", __name__)
@@ -27,18 +28,10 @@ def today_stats():
     today    = str(datetime.now(IST).date())
     today_dt = datetime.strptime(today, "%Y-%m-%d")
 
-    all_staff = list(users_col.find(
-        {"role": {"$in": ["employee", "manager"]}},
-        {"_id": 1, "role": 1, "department": 1, "resignation": 1}
-    ))
-    active_users = []
-    for u in all_staff:
-        lwd = (u.get("resignation") or {}).get("last_working_day")
-        if lwd:
-            lwd_str = lwd.date().isoformat() if hasattr(lwd, "date") else str(lwd)[:10]
-            if lwd_str < today:
-                continue
-        active_users.append(u)
+    # active_staff() = the canonical "non-off-boarded employee/manager" roster
+    # (helpers.py) — off-boarded = notice recorded AND last working day passed,
+    # the same rule every other endpoint uses.
+    active_users = active_staff({"_id": 1, "role": 1, "department": 1, "resignation": 1})
     active_ids = {str(e["_id"]) for e in active_users}
 
     present_ids = {
@@ -115,10 +108,11 @@ def attendance_summary():
     end_str   = (end - timedelta(days=1)).date().isoformat()
     today_str = str(datetime.now(IST).date())
 
-    employees = list(users_col.find(
-        {"role": {"$in": ["employee", "manager"]}},
-        {"name": 1, "doj": 1, "resignation": 1, "extended_leaves": 1}
-    ))
+    # Off-boarded staff (notice given + last working day passed) are excluded
+    # from the roster entirely — same as routes/attendance_reports.py — so
+    # total_employees is the active headcount and no ex-employee name can land
+    # in a day's present/absent/leave/not-checked-in list.
+    employees = active_staff({"name": 1, "doj": 1, "resignation": 1, "extended_leaves": 1})
     emp_names = {str(e["_id"]): e.get("name", "") for e in employees}
 
     all_recs = attendance_col.find({"date": {"$regex": f"^{month_param}"}, "type": "checkin"})

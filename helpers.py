@@ -122,6 +122,31 @@ def is_offboarded(user_doc):
     return lwd_date < _today_ist()
 
 
+ACTIVE_STAFF_ROLES = ["employee", "manager"]
+
+
+def active_staff(projection=None, extra_query=None, roles=None):
+    """All non-off-boarded employee/manager docs — the single source of truth
+    for "the current active roster". Wraps the users_col.find + is_offboarded
+    filter that was otherwise re-written (and occasionally forgotten) in every
+    route that needs a headcount or a roster.
+
+    projection / extra_query / roles are optional passthroughs to the
+    underlying find(); off-boarding can't be expressed as a plain Mongo query
+    (it's a date comparison against IST "today" over a mixed string/datetime
+    field) so the is_offboarded() filter is always applied in Python here.
+    """
+    q = {"role": {"$in": list(roles or ACTIVE_STAFF_ROLES)}}
+    if extra_query:
+        q.update(extra_query)
+    # A caller-supplied inclusion projection must still bring back `resignation`
+    # (and `role`, used by some callers to split employee/manager) or the
+    # is_offboarded() filter below silently sees nothing and never excludes.
+    if projection and all(v for v in projection.values()):
+        projection = {**projection, "resignation": 1, "role": 1}
+    return [u for u in users_col.find(q, projection) if not is_offboarded(u)]
+
+
 # ── Company holidays ─────────────────────────────────────────────────────────
 # Single source of truth for the company holiday calendar — holidays_col
 # (database.py), managed via GET/POST/DELETE /api/holidays (routes/

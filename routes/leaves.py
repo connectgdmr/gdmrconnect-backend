@@ -13,7 +13,7 @@ from bson import ObjectId
 
 from database import leaves_col, users_col, comp_off_col, departments_col
 from decorators import token_required
-from helpers import _is_admin, _has_module_grant, _managed_employee_ids, _mgr_depts
+from helpers import _is_admin, _has_module_grant, _managed_employee_ids, _mgr_depts, active_staff
 from config import IST, HR_EMAIL, DASHBOARD_URL
 from utils import send_email
 
@@ -187,8 +187,7 @@ def comp_off_balances():
         return jsonify({"message": "Unauthorized"}), 403
 
     if role in ("admin", "owner") or has_delegated:
-        emps = list(users_col.find({"role": {"$in": ["employee", "manager"]}},
-                                   {"name": 1, "department": 1, "employee_code": 1}))
+        emps = active_staff({"name": 1, "department": 1, "employee_code": 1})
     else:
         team_ids = _comp_off_team_ids(user)
         emps = list(users_col.find(
