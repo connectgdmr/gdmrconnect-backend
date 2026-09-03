@@ -60,8 +60,14 @@ def chat_users():
         {"_id": {"$ne": ObjectId(uid)}},
         {"name": 1, "role": 1, "department": 1, "position": 1, "email": 1, "phone": 1, "location": 1, "resignation": 1, "photo_url": 1}
     ):
-        if is_offboarded(u):
-            continue
+        # One malformed resignation record must not 500 the whole directory —
+        # that leaves employees (who usually have no prior threads to fall
+        # back on) with a completely empty Messages screen.
+        try:
+            if is_offboarded(u):
+                continue
+        except Exception:
+            pass
         dept = u.get("department") or ""
         if isinstance(dept, list):
             dept = ", ".join(d for d in dept if d)
@@ -102,6 +108,7 @@ def chat_conversations():
 
     all_member_ids  = {m for c in convs for m in c.get("members", [])}
     member_name_map = {uid: request.user.get("name") or ""}
+    offboarded_ids  = set()
     oids = []
     for m in all_member_ids:
         if m != uid:
@@ -109,8 +116,20 @@ def chat_conversations():
                 oids.append(ObjectId(m))
             except Exception:
                 pass
-    for u in users_col.find({"_id": {"$in": oids}}, {"name": 1}):
+    for u in users_col.find({"_id": {"$in": oids}}, {"name": 1, "resignation": 1}):
         member_name_map[str(u["_id"])] = u.get("name") or ""
+        try:
+            if is_offboarded(u):
+                offboarded_ids.add(str(u["_id"]))
+        except Exception:
+            pass
+
+    # Conversations that actually hold at least one message — an off-boarded
+    # person's DM only stays in the list if there's real history to keep;
+    # an empty DM auto-created by opening their card once is dropped.
+    convs_with_history = set(
+        messages_col.distinct("conversation_id", {"conversation_id": {"$in": conv_ids}})
+    )
 
     result = []
     for c in convs:
@@ -132,6 +151,10 @@ def chat_conversations():
                     peer_id_out   = m
                     peer_name_out = member_name_map.get(m, "")
                     break
+            # Hide DMs with an off-boarded teammate unless the thread has
+            # history worth keeping around.
+            if peer_id_out in offboarded_ids and cid not in convs_with_history:
+                continue
 
         result.append({
             "_id":          cid,
