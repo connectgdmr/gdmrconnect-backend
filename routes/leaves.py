@@ -75,6 +75,21 @@ def _refund_comp_off_leave(leave):
                     reason="Comp-off leave not taken", ref_leave_id=lid)
 
 
+def _final_leave_status(leave):
+    """Roll the per-stage statuses up into the single `status` the rest of the
+    app reads. A manager's own leave has no manager-approval stage — the
+    owner's one decision (kept in admin_status) is the whole approval. Keyed
+    off applicant_role so leaves filed before that field existed still resolve
+    right once the startup migration backfills them."""
+    ms  = leave.get("manager_status", "Pending")
+    as_ = leave.get("admin_status",   "Pending")
+    if ms == "Rejected" or as_ == "Rejected":
+        return "Rejected"
+    if leave.get("applicant_role") == "manager":
+        return "Approved" if as_ == "Approved" else "Pending"
+    return "Approved" if (ms == "Approved" and as_ == "Approved") else "Pending"
+
+
 def _dept_head_dept_names(user_id):
     """Names of departments this user heads (departments_col.head_ids array,
     or the legacy single head_id). A department head is treated as a manager
@@ -291,30 +306,41 @@ def _send_leave_notification(leave_doc: dict, employee: dict):
         monthly_detail = (f"{monthly_leave_count} applied · {monthly_breakdown}"
                           if monthly_breakdown else str(monthly_leave_count))
 
-        # Resolve manager
-        manager_email = None
-        manager_id    = employee.get("manager_id")
-        print(f"[leave-notify] employee={emp_name!r} manager_id={manager_id!r} dept={department!r}")
-        if manager_id:
-            try:
-                mgr = users_col.find_one({"_id": ObjectId(str(manager_id))}, {"email": 1})
-                if mgr:
-                    manager_email = mgr.get("email")
-                    print(f"[leave-notify] manager found by id: {manager_email!r}")
-            except Exception as mgr_exc:
-                print(f"[leave-notify] manager lookup error: {mgr_exc}")
+        # A manager's own leave is approved by the owner in one step — send it
+        # straight to the owner(s), not to a reporting manager / HR.
+        if employee.get("role") == "manager":
+            owner_emails = [o["email"] for o in users_col.find({"role": "owner"}, {"email": 1}) if o.get("email")]
+            to_email = owner_emails[0] if owner_emails else HR_EMAIL
+            cc_list  = owner_emails[1:] + (
+                [HR_EMAIL] if HR_EMAIL.lower() not in {e.lower() for e in owner_emails} else []
+            )
+            print(f"[leave-notify] manager applicant — routing to owner(s): {owner_emails!r}")
+        else:
+            # Resolve manager
+            manager_email = None
+            manager_id    = employee.get("manager_id")
+            print(f"[leave-notify] employee={emp_name!r} manager_id={manager_id!r} dept={department!r}")
+            if manager_id:
+                try:
+                    mgr = users_col.find_one({"_id": ObjectId(str(manager_id))}, {"email": 1})
+                    if mgr:
+                        manager_email = mgr.get("email")
+                        print(f"[leave-notify] manager found by id: {manager_email!r}")
+                except Exception as mgr_exc:
+                    print(f"[leave-notify] manager lookup error: {mgr_exc}")
 
-        if not manager_email and department:
-            try:
-                dept_mgr = users_col.find_one({"role": "manager", "department": department}, {"email": 1})
-                if dept_mgr:
-                    manager_email = dept_mgr.get("email")
-                    print(f"[leave-notify] manager found by dept: {manager_email!r}")
-            except Exception as dept_exc:
-                print(f"[leave-notify] dept manager lookup error: {dept_exc}")
+            if not manager_email and department:
+                try:
+                    dept_mgr = users_col.find_one({"role": "manager", "department": department}, {"email": 1})
+                    if dept_mgr:
+                        manager_email = dept_mgr.get("email")
+                        print(f"[leave-notify] manager found by dept: {manager_email!r}")
+                except Exception as dept_exc:
+                    print(f"[leave-notify] dept manager lookup error: {dept_exc}")
 
-        to_email = manager_email or HR_EMAIL
-        cc_list  = [HR_EMAIL] if manager_email and manager_email.lower() != HR_EMAIL.lower() else []
+            to_email = manager_email or HR_EMAIL
+            cc_list  = [HR_EMAIL] if manager_email and manager_email.lower() != HR_EMAIL.lower() else []
+
         reply_to = emp_email or None
         print(f"[leave-notify] to={to_email!r} cc={cc_list!r} reply_to={reply_to!r}")
 
@@ -380,12 +406,14 @@ def _send_leave_notification(leave_doc: dict, employee: dict):
                         html_body=html_body, cc_emails=cc_list, reply_to=reply_to)
         print(f"[leave-notify] send_email returned {ok}")
 
-        # Also notify all Business Owners
+        # Also notify all Business Owners (skip any already on the To/Cc line —
+        # for a manager applicant every owner is already a primary/cc recipient).
+        already = {to_email.lower()} | {c.lower() for c in cc_list}
         try:
             owners = list(users_col.find({"role": "owner"}, {"email": 1, "name": 1}))
             for owner in owners:
                 owner_email = owner.get("email")
-                if not owner_email or owner_email.lower() == to_email.lower():
+                if not owner_email or owner_email.lower() in already:
                     continue
                 ok_o = send_email(to_email=owner_email, subject=subject, body=plain,
                                   html_body=html_body, reply_to=reply_to)
@@ -484,8 +512,14 @@ def apply_leave():
         except Exception:
             return jsonify({"message": "File upload failed"}), 500
 
+    # A manager applying for their own leave has no manager-approval stage —
+    # it goes straight to the owner, one approval, done (see _final_leave_status
+    # and _send_leave_notification). "N/A" is the UI's existing "no such stage"
+    # sentinel. Everyone else keeps the two-stage manager -> HR flow.
+    applicant_role = request.user.get("role")
     leave = {
         "user_id":       str(request.user["_id"]),
+        "applicant_role": applicant_role,
         "from_date":     from_date,
         "to_date":       to_date,
         "date":          from_date,
@@ -494,7 +528,7 @@ def apply_leave():
         "reason":        reason,
         "comp_off":      is_comp_off,
         "status":        "Pending",
-        "manager_status": "Pending",
+        "manager_status": "N/A" if applicant_role == "manager" else "Pending",
         "admin_status":  "Pending",
         "applied_at":    datetime.now(timezone.utc),
         "attachment_url": attachment_url,
@@ -564,10 +598,14 @@ def update_leave(leave_id):
     update_fields = {}
     if role in ("admin", "owner"):
         update_fields["admin_status"] = action
+        update_fields["admin_decided_by_role"] = "owner" if role == "owner" else "hr"
+        update_fields["admin_decided_by_name"] = request.user.get("name", "")
     elif has_delegated:
         if not _has_module_grant(request.user, "leaves", write=True):
             return jsonify({"message": "Unauthorized: Your delegated access is View Only."}), 403
         update_fields["admin_status"] = action
+        update_fields["admin_decided_by_role"] = "hr"
+        update_fields["admin_decided_by_name"] = request.user.get("name", "")
     elif role == "manager":
         leave_doc  = leaves_col.find_one({"_id": ObjectId(leave_id)}, {"user_id": 1})
         if not leave_doc:
@@ -582,13 +620,7 @@ def update_leave(leave_id):
     leave = leaves_col.find_one({"_id": ObjectId(leave_id)})
     ms    = leave.get("manager_status", "Pending")
     as_   = leave.get("admin_status",   "Pending")
-
-    if ms == "Rejected" or as_ == "Rejected":
-        final_status = "Rejected"
-    elif ms == "Approved" and as_ == "Approved":
-        final_status = "Approved"
-    else:
-        final_status = "Pending"
+    final_status = _final_leave_status(leave)
 
     leaves_col.update_one({"_id": ObjectId(leave_id)}, {"$set": {"status": final_status}})
 

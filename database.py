@@ -213,3 +213,25 @@ try:
         print(f"Startup migration: seeded {len(_seed_holidays)} company holiday(s).")
 except Exception as _hol_err:
     print(f"Warning: holiday seed migration failed: {_hol_err}")
+
+try:
+    # A manager's own leave now goes to the owner alone — one approval, no
+    # manager-approval stage (routes/leaves.py). Backfill applicant_role on
+    # leaves filed before that field existed, and unblock any manager leave an
+    # owner had already approved but the old "manager AND admin" rule left
+    # stuck at Pending.
+    _mgr_ids = [str(u["_id"]) for u in users_col.find({"role": "manager"}, {"_id": 1})]
+    if _mgr_ids:
+        _br = leaves_col.update_many(
+            {"user_id": {"$in": _mgr_ids}, "applicant_role": {"$exists": False}},
+            {"$set": {"applicant_role": "manager"}},
+        ).modified_count
+        _fx = leaves_col.update_many(
+            {"applicant_role": "manager", "admin_status": "Approved",
+             "manager_status": {"$ne": "Rejected"}, "status": "Pending"},
+            {"$set": {"status": "Approved", "manager_status": "N/A"}},
+        ).modified_count
+        if _br or _fx:
+            print(f"Startup migration: tagged {_br} manager leave(s), unblocked {_fx} owner-approved one(s).")
+except Exception as _lv_err:
+    print(f"Warning: manager-leave migration failed: {_lv_err}")
