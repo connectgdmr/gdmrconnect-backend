@@ -607,6 +607,37 @@ def edit_employee(emp_id):
 # Carried over automatically when someone is onboarded from the ATS pipeline
 # (see routes/ats.py's ats_update_status), and admins can add/remove more here.
 
+def _upload_employee_doc_file(file, emp_id):
+    """Push an employee-file upload to Cloudinary and return its secure URL.
+    Raises ValueError with a message an admin can act on when the provider
+    rejects the file (usually: too large), instead of leaking a raw 500."""
+    filename = (getattr(file, "filename", "") or "").lower()
+    is_pdf = filename.endswith(".pdf") or (getattr(file, "mimetype", "") or "").lower() == "application/pdf"
+    # PDFs go up as `raw`: as `auto`/`image` Cloudinary ingests them for
+    # thumbnailing, which has a tighter size ceiling and needs "PDF and ZIP
+    # delivery" enabled on the account to be viewable afterwards. `raw` just
+    # stores and serves the bytes untouched.
+    resource_type = "raw" if is_pdf else "auto"
+    try:
+        res = cloudinary.uploader.upload(
+            file, resource_type=resource_type,
+            folder=f"gdmr/employee_docs/{emp_id}",
+            use_filename=True, unique_filename=True,
+        )
+    except Exception as e:
+        low = str(e).lower()
+        if "too large" in low or "maximum is" in low or "file size" in low:
+            raise ValueError(
+                "The file is larger than the upload service allows. "
+                "Please compress the PDF (or split it into parts) and try again."
+            )
+        raise ValueError(f"The upload service rejected the file: {e}")
+    url = res.get("secure_url")
+    if not url:
+        raise ValueError("The upload service did not return a file URL — please retry.")
+    return url
+
+
 @bp.route("/api/admin/employees/<emp_id>/documents", methods=["POST"])
 @token_required
 def upload_employee_document(emp_id):
@@ -634,17 +665,13 @@ def upload_employee_document(emp_id):
 
     file.seek(0, 2)
     if file.tell() > 15 * 1024 * 1024:
-        return jsonify({"message": "File too large (max 15 MB)"}), 400
+        return jsonify({"message": "File too large (max 15 MB). Compress the PDF and try again."}), 400
     file.seek(0)
 
     try:
-        res = cloudinary.uploader.upload(
-            file, resource_type="auto", folder=f"gdmr/employee_docs/{emp_id}",
-            use_filename=True, unique_filename=True,
-        )
-        url = res.get("secure_url")
-    except Exception as e:
-        return jsonify({"message": f"Upload failed: {str(e)}"}), 500
+        url = _upload_employee_doc_file(file, emp_id)
+    except ValueError as e:
+        return jsonify({"message": str(e)}), 400
 
     now = datetime.now(timezone.utc)
     doc = {
@@ -699,17 +726,13 @@ def replace_employee_document(emp_id, doc_id):
         return jsonify({"message": "file is required"}), 400
     file.seek(0, 2)
     if file.tell() > 15 * 1024 * 1024:
-        return jsonify({"message": "File too large (max 15 MB)"}), 400
+        return jsonify({"message": "File too large (max 15 MB). Compress the PDF and try again."}), 400
     file.seek(0)
 
     try:
-        res = cloudinary.uploader.upload(
-            file, resource_type="auto", folder=f"gdmr/employee_docs/{emp_id}",
-            use_filename=True, unique_filename=True,
-        )
-        url = res.get("secure_url")
-    except Exception as e:
-        return jsonify({"message": f"Upload failed: {str(e)}"}), 500
+        url = _upload_employee_doc_file(file, emp_id)
+    except ValueError as e:
+        return jsonify({"message": str(e)}), 400
 
     now = datetime.now(timezone.utc)
     # A blank expiry field here is ambiguous by itself — it could mean "the
