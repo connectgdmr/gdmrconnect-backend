@@ -204,17 +204,22 @@ def submit_referral():
     resume_link     = str(src.get("resume_url",      "")).strip() or None
     notes           = str(src.get("notes",            "")).strip() or None
 
-    if not job_id or not candidate_name or not candidate_email:
-        return jsonify({"message": "job_id, candidate_name, and candidate_email are required"}), 400
+    if not candidate_name or not candidate_email:
+        return jsonify({"message": "candidate_name and candidate_email are required"}), 400
 
-    try:
-        # Tolerant match: accept "active" (current scheme), "Open" (legacy),
-        # or a missing status field — anything that isn't explicitly closed.
-        job = career_jobs_col.find_one({"_id": ObjectId(job_id), "status": {"$nin": ["closed", "Closed"]}})
-    except Exception:
-        return jsonify({"message": "Invalid job ID"}), 400
-    if not job:
-        return jsonify({"message": "Job not found or no longer open"}), 404
+    # job_id is optional — a referral isn't always for a currently-posted
+    # opening; without this an employee had no way to refer someone when
+    # nothing was open.
+    job = None
+    if job_id:
+        try:
+            # Tolerant match: accept "active" (current scheme), "Open" (legacy),
+            # or a missing status field — anything that isn't explicitly closed.
+            job = career_jobs_col.find_one({"_id": ObjectId(job_id), "status": {"$nin": ["closed", "Closed"]}})
+        except Exception:
+            return jsonify({"message": "Invalid job ID"}), 400
+        if not job:
+            return jsonify({"message": "Job not found or no longer open"}), 404
 
     resume_file_url = None
     f = request.files.get("resume")
@@ -243,8 +248,8 @@ def submit_referral():
             return jsonify({"message": "Resume upload failed. Please try again."}), 500
 
     doc = {
-        "job_id":            job_id,
-        "job_title":         job.get("title", ""),
+        "job_id":            job_id or None,
+        "job_title":         job.get("title", "") if job else "General Application",
         "referred_by":       str(request.user["_id"]),
         "referred_by_name":  request.user.get("name", ""),
         "candidate_name":    candidate_name,

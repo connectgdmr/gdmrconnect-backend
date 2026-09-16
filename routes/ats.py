@@ -67,11 +67,23 @@ PHONE_RE = re.compile(r"^(?:\+?\d{1,3}[\s-]?)?\d{10}$")
 
 DOC_CHECKLIST_DEFAULT = [
     "Resume / CV",
-    "Government ID Proof",
-    "Address Proof",
-    "Educational Certificates",
-    "Experience / Relieving Letters",
+    "Recent Photograph",
+    "ID Proof (Aadhar Card / Passport / Driving License)",
+    "PAN Card",
+    "10th Certificate",
+    "12th Certificate",
+    "Diploma Certificate",
+    "Degree Certificate",
+    "Consolidated Mark List",
+    "Certification Course Certificate",
+    "Experience Certificate",
+    "Payslip - Last Month",
+    "Payslip - 2nd Last Month",
+    "Payslip - 3rd Last Month",
 ]
+# On the checklist but doesn't block the "all submitted" banner — not every
+# candidate has taken a certification course.
+DOC_CHECKLIST_OPTIONAL = {"Certification Course Certificate"}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1055,7 +1067,8 @@ def ats_doc_request(candidate_id):
 
     existing_names = {d.get("name") for d in docs}
     new_entries    = [
-        {"name": doc, "url": None, "status": "Pending", "required": True}
+        {"name": doc, "url": None, "status": "Pending", "required": True,
+         "optional": doc in DOC_CHECKLIST_OPTIONAL}
         for doc in required_docs if doc not in existing_names
     ]
     docs.extend(new_entries)
@@ -1243,6 +1256,10 @@ def ats_get_doc_checklist(doc_token):
         "candidate_name": c.get("name", ""),
         "job_role":       _job_role_of(c),
         "required":       [d["name"] for d in docs if d.get("required")],
+        # Present on the checklist, but shouldn't block the "all submitted"
+        # banner or read as a red missing item — e.g. certification courses,
+        # which not every candidate has.
+        "optional_names": [d["name"] for d in docs if d.get("required") and d.get("optional")],
         "documents":      [
             {"name": d.get("name"), "url": d.get("url"), "status": d.get("status")}
             for d in docs if d.get("url")
@@ -1279,11 +1296,17 @@ def ats_upload_doc(doc_token):
         return jsonify({"message": "Only PDF and image files (JPEG, PNG) are accepted"}), 400
 
     candidate_id = str(c["_id"])
+    # PDFs go up as "raw", not "auto" — as "auto" Cloudinary ingests a PDF as
+    # an image for thumbnailing, which has a tighter size ceiling and needs
+    # "PDF and ZIP delivery" enabled on the account to even be viewable
+    # afterward (see the identical fix for employee documents). "raw" just
+    # stores and serves the bytes as-is.
+    is_pdf = header[:5] == b"%PDF-"
     try:
         import cloudinary.uploader as _cu
         res = _cu.upload(
             file,
-            resource_type="auto",
+            resource_type="raw" if is_pdf else "auto",
             folder=f"gdmr/ats_docs/{candidate_id}",
             use_filename=True,
             unique_filename=True,
@@ -1292,16 +1315,21 @@ def ats_upload_doc(doc_token):
     except Exception as e:
         return jsonify({"message": f"Upload failed: {str(e)}"}), 500
 
+    # "Submitted" (not "Pending") — the candidate HAS uploaded it, it's just
+    # awaiting HR review. Both the candidate-facing checklist and the admin
+    # ATS view were showing this the same as a still-outstanding requirement,
+    # with no visible difference between "nothing uploaded yet" and
+    # "uploaded, waiting on us".
     now      = datetime.now(timezone.utc)
     docs     = list(c.get("documents") or [])
     replaced = False
     for d in docs:
         if d.get("name") == doc_name:
-            d.update({"url": url, "status": "Pending", "uploaded_at": now})
+            d.update({"url": url, "status": "Submitted", "uploaded_at": now})
             replaced = True
             break
     if not replaced:
-        docs.append({"name": doc_name, "url": url, "status": "Pending", "required": False, "uploaded_at": now})
+        docs.append({"name": doc_name, "url": url, "status": "Submitted", "required": False, "uploaded_at": now})
 
     ats_candidates_col.update_one(
         {"_id": c["_id"]},
