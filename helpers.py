@@ -327,6 +327,38 @@ def _managed_employee_ids(manager_user):
     )}
 
 
+# ── Notification recipients ──────────────────────────────────────────────────
+# Shared "who to email" resolution so every activity-submitted notification
+# (leave, asset request, referral, ...) reaches the same people the same way,
+# instead of each route hand-rolling its own manager lookup.
+
+def resolve_employee_manager_email(employee):
+    """Best-effort manager email for a staff member: their direct manager_id,
+    falling back to any manager in their department. None if neither resolves.
+    Mirrors the lookup routes/leaves.py's _send_leave_notification already
+    does inline for leave requests."""
+    manager_id = employee.get("manager_id")
+    if manager_id:
+        try:
+            mgr = users_col.find_one({"_id": ObjectId(str(manager_id))}, {"email": 1})
+            if mgr and mgr.get("email"):
+                return mgr["email"]
+        except Exception:
+            pass
+    dept = employee.get("department")
+    if dept:
+        dept_name = dept[0] if isinstance(dept, list) else dept
+        dept_mgr = users_col.find_one({"role": "manager", "department": dept_name}, {"email": 1})
+        if dept_mgr and dept_mgr.get("email"):
+            return dept_mgr["email"]
+    return None
+
+
+def all_owner_emails():
+    """Email addresses of every 'owner' role user (Business Owners)."""
+    return [o["email"] for o in users_col.find({"role": "owner"}, {"email": 1}) if o.get("email")]
+
+
 # ── Delegated (Grant Access) module permissions ─────────────────────────────
 # Canonical set of admin features that "Grant Access" can delegate, keyed the
 # same as the sidebar's view name so frontend/backend stay in sync. Excludes

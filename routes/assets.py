@@ -10,8 +10,9 @@ from bson import ObjectId
 
 from database import assets_col, users_col
 from decorators import token_required
-from helpers import _is_admin, _mgr_depts, _has_module_grant, _dept_list
+from helpers import _is_admin, _mgr_depts, _has_module_grant, _dept_list, resolve_employee_manager_email, all_owner_emails
 from utils import send_email
+from config import HR_EMAIL
 
 bp = Blueprint("assets", __name__)
 
@@ -49,6 +50,29 @@ def request_asset():
         "created_at":    datetime.now(timezone.utc),
     }
     res = assets_col.insert_one(asset_request)
+
+    # Notify the requester's manager + HR/owners — this used to be a
+    # submission nobody was told about until they happened to check the
+    # Manage Assets badge; now it gets the same "activity submitted" email
+    # every other approval-flow request (leave, referral) already sends.
+    subject = f"New Asset Request — {request.user.get('name', 'Employee')}"
+    body = (
+        f"{request.user.get('name', 'An employee')} has submitted an asset request.\n\n"
+        f"Type      : {request_type}\n"
+        f"Asset     : {asset_name}\n"
+        f"Reason    : {reason}\n"
+        f"Department: {request.user.get('department') or '—'}\n\n"
+        f"Please review in the GDMR Connect admin panel (Manage Assets)."
+    )
+    recipients = {HR_EMAIL.lower(): HR_EMAIL}
+    for email in all_owner_emails():
+        recipients[email.lower()] = email
+    manager_email = resolve_employee_manager_email(request.user)
+    if manager_email:
+        recipients[manager_email.lower()] = manager_email
+    for email in recipients.values():
+        threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
+
     return jsonify({"message": "Asset requested successfully.", "id": str(res.inserted_id)}), 201
 
 

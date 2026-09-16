@@ -12,8 +12,9 @@ from bson import ObjectId
 
 from database import career_jobs_col, referrals_col, users_col
 from decorators import token_required
-from helpers import _is_admin, _has_module_grant
+from helpers import _is_admin, _has_module_grant, resolve_employee_manager_email, all_owner_emails
 from utils import send_email
+from config import HR_EMAIL
 
 bp = Blueprint("career", __name__)
 
@@ -270,25 +271,30 @@ def submit_referral():
     res       = referrals_col.insert_one(doc)
     doc["_id"] = str(res.inserted_id)
 
-    manager_id = request.user.get("manager_id")
-    if manager_id:
-        try:
-            manager = users_col.find_one({"_id": ObjectId(manager_id)})
-        except Exception:
-            manager = None
-        if manager and manager.get("email"):
-            subject = f"New Referral from {doc['referred_by_name']}"
-            body = (
-                f"{doc['referred_by_name']} has submitted a referral.\n\n"
-                f"Candidate : {candidate_name}\n"
-                f"Email     : {candidate_email}\n"
-                f"Phone     : {candidate_phone or '—'}\n"
-                f"Position  : {doc['job_title']}\n"
-                f"Resume    : {resume_file_url or resume_link or 'Not provided'}\n"
-                f"Notes     : {notes or '—'}\n\n"
-                f"Please review in the GDMR Connect admin panel."
-            )
-            threading.Thread(target=send_email, args=(manager["email"], subject, body), daemon=True).start()
+    # Notify the referrer's manager (if resolvable), HR, and every Business
+    # Owner — a referral needs HR/admin to actually action it (the Referrals
+    # tab under Jobs & Recruitment), not just the reporting manager who
+    # previously was the only one ever told this happened.
+    subject = f"New Referral from {doc['referred_by_name']}"
+    body = (
+        f"{doc['referred_by_name']} has submitted a referral.\n\n"
+        f"Candidate : {candidate_name}\n"
+        f"Email     : {candidate_email}\n"
+        f"Phone     : {candidate_phone or '—'}\n"
+        f"Position  : {doc['job_title']}\n"
+        f"Resume    : {resume_file_url or resume_link or 'Not provided'}\n"
+        f"Notes     : {notes or '—'}\n\n"
+        f"Please review in the GDMR Connect admin panel (Jobs & Recruitment "
+        f"-> Referrals)."
+    )
+    recipients = {HR_EMAIL.lower(): HR_EMAIL}
+    for email in all_owner_emails():
+        recipients[email.lower()] = email
+    manager_email = resolve_employee_manager_email(request.user)
+    if manager_email:
+        recipients[manager_email.lower()] = manager_email
+    for email in recipients.values():
+        threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
 
     return jsonify(doc), 201
 

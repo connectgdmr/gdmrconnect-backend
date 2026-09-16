@@ -7,7 +7,7 @@ from datetime import datetime
 from flask import Blueprint, request, jsonify
 
 from database import (leaves_col, pms_reviews_col, corrections_col,
-                      assets_col, access_grants_col, users_col)
+                      assets_col, access_grants_col, users_col, referrals_col)
 from decorators import token_required
 from helpers import _mgr_depts
 from config import IST
@@ -20,7 +20,7 @@ bp = Blueprint("notifications", __name__)
 def get_notification_counts():
     role          = request.user.get("role")
     has_delegated = access_grants_col.find_one({"employee_id": str(request.user["_id"]), "is_active": True})
-    counts = {"leaves": 0, "pms": 0, "corrections": 0, "assets": 0, "announcements": 0}
+    counts = {"leaves": 0, "pms": 0, "corrections": 0, "assets": 0, "announcements": 0, "referrals": 0}
 
     if role == "manager":
         mgr_id    = str(request.user["_id"])
@@ -53,6 +53,10 @@ def get_notification_counts():
         counts["corrections"] = corrections_col.count_documents({
             "approval_target": "admin", "status": "Pending"
         })
+        # New employee referrals waiting to be reviewed / moved into
+        # Recruitment — same "Pending" badge pattern as the rest of this
+        # branch (Jobs & Recruitment -> Referrals).
+        counts["referrals"] = referrals_col.count_documents({"status": "New"})
 
     return jsonify(counts), 200
 
