@@ -179,10 +179,16 @@ def update_referral(referral_id):
     valid_statuses = {"New", "Shortlisted", "Interview", "Hired", "Rejected"}
     if not status or status not in valid_statuses:
         return jsonify({"message": f"status must be one of: {', '.join(sorted(valid_statuses))}"}), 400
-    result = referrals_col.update_one(
-        {"_id": obj},
-        {"$set": {"status": status, "updated_at": datetime.now(timezone.utc)}}
-    )
+
+    update_fields = {"status": status, "updated_at": datetime.now(timezone.utc)}
+    # Set once, when "Move to Recruitment" (AdminCareer.jsx) turns this
+    # referral into an ATS candidate — links the two so the UI can offer
+    # "Open in Recruitment" afterward instead of converting it again.
+    candidate_id = str(data.get("candidate_id") or "").strip()
+    if candidate_id:
+        update_fields["candidate_id"] = candidate_id
+
+    result = referrals_col.update_one({"_id": obj}, {"$set": update_fields})
     if result.matched_count == 0:
         return jsonify({"message": "Referral not found"}), 404
     return jsonify({"message": "Referral status updated"}), 200
