@@ -177,7 +177,7 @@ def update_referral(referral_id):
     status         = data.get("status")
     # Must match the admin UI's REF_STATUSES exactly, or "New"/"Interview" picks
     # in the dropdown fail with a 400 the UI doesn't surface.
-    valid_statuses = {"New", "Shortlisted", "Interview", "Hired", "Rejected"}
+    valid_statuses = {"New", "Screened", "Shortlisted", "Interview", "Hired", "Rejected"}
     if not status or status not in valid_statuses:
         return jsonify({"message": f"status must be one of: {', '.join(sorted(valid_statuses))}"}), 400
 
