@@ -235,3 +235,51 @@ try:
             print(f"Startup migration: tagged {_br} manager leave(s), unblocked {_fx} owner-approved one(s).")
 except Exception as _lv_err:
     print(f"Warning: manager-leave migration failed: {_lv_err}")
+
+try:
+    # A department head is a manager of that department by definition —
+    # routes/employees.py now promotes to role="manager" the moment someone
+    # is newly picked as a head, but that only fires on the next Add/Edit
+    # Department save. Backfill it once here for every head already set
+    # before this rule existed, so they show correctly in the department
+    # drawer's Management section and get manager-level access everywhere
+    # else immediately, not just on the next unrelated department edit.
+    _head_ids = set()
+    for _d in departments_col.find({}, {"head_ids": 1, "head_id": 1}):
+        _head_ids.update(_d.get("head_ids") or [])
+        if _d.get("head_id"):
+            _head_ids.add(_d["head_id"])
+    if _head_ids:
+        _promoted = users_col.update_many(
+            {"_id": {"$in": list(_head_ids)}, "role": "employee"},
+            {"$set": {"role": "manager"}},
+        ).modified_count
+        if _promoted:
+            print(f"Startup migration: promoted {_promoted} existing department head(s) to role='manager'.")
+except Exception as _head_err:
+    print(f"Warning: department-head-promotion migration failed: {_head_err}")
+
+try:
+    # The reverse gap: a department with an existing manager but no head on
+    # record at all (shows "Department Head: Not assigned" even though
+    # someone is clearly running it) — routes/employees.py's
+    # register_manager now fills this in the moment a NEW manager is
+    # registered for an empty-headed department; this backfills it once for
+    # departments that already had a manager before that existed. Picks one
+    # deterministically (alphabetically first by name) rather than guessing
+    # — an admin can always add/change heads afterward.
+    for _d in departments_col.find({}, {"name": 1, "head_ids": 1, "head_id": 1}):
+        if _d.get("head_ids") or _d.get("head_id"):
+            continue  # already has a head
+        _cands = list(users_col.find(
+            {"role": "manager", "department": _d["name"]}, {"name": 1}
+        ).sort("name", 1).limit(1))
+        if _cands:
+            departments_col.update_one(
+                {"_id": _d["_id"]},
+                {"$set": {"head_ids": [_cands[0]["_id"]], "head_id": _cands[0]["_id"],
+                         "updated_at": datetime.now(timezone.utc)}},
+            )
+            print(f"Startup migration: set '{_cands[0]['name']}' as head of headless department '{_d['name']}'.")
+except Exception as _headless_err:
+    print(f"Warning: headless-department migration failed: {_headless_err}")

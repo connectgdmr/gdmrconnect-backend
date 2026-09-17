@@ -139,7 +139,21 @@ def register_manager():
         "position": "Manager", "created_at": datetime.now(timezone.utc),
         "late_checkin_count_monthly": 0, "last_late_checkin_month": None,
     }
-    users_col.insert_one(new_user)
+    res = users_col.insert_one(new_user)
+
+    # A department with no head yet gets this new manager as its head —
+    # closes the "Department Head: Not assigned" gap the moment a manager
+    # is actually registered for it, instead of leaving it for an admin to
+    # separately remember to set in Edit Department. Never overrides an
+    # existing head.
+    dept_doc = departments_col.find_one({"name": {"$regex": f"^{re.escape(department)}$", "$options": "i"}})
+    if dept_doc and not (dept_doc.get("head_ids") or dept_doc.get("head_id")):
+        departments_col.update_one(
+            {"_id": dept_doc["_id"]},
+            {"$set": {"head_ids": [res.inserted_id], "head_id": res.inserted_id,
+                     "updated_at": datetime.now(timezone.utc)}},
+        )
+
     return jsonify({"message": "Manager created successfully!"}), 201
 
 
@@ -378,6 +392,23 @@ def _norm_head_ids(data):
     return out
 
 
+def _promote_heads_to_manager(head_ids):
+    """A department head is a manager of that department by definition
+    (helpers.py's _team_ids_incl_dept_head already treats them as one for
+    approval/notification purposes) — picking someone as head should make
+    that official everywhere else too: the department drawer's Management
+    section, manager-only screens/permissions, etc. all key off role, not
+    head_ids. Only promotes — never demotes someone already manager/admin/
+    owner — and never touches anything else on their record (position
+    stays whatever it was)."""
+    if not head_ids:
+        return
+    users_col.update_many(
+        {"_id": {"$in": head_ids}, "role": "employee"},
+        {"$set": {"role": "manager"}},
+    )
+
+
 def _cascade_department_rename(old_name, new_name):
     """
     Every place a department NAME (not departments_col's _id) gets copied
@@ -448,6 +479,7 @@ def create_department():
     if departments_col.find_one({"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}):
         return jsonify({"message": f"Department '{name}' already exists."}), 400
     head_ids = _norm_head_ids(data) or []
+    _promote_heads_to_manager(head_ids)
     doc = {
         "name":        name,
         "description": str(data.get("description", "")).strip(),
@@ -510,6 +542,7 @@ def update_department(dept_id):
     if head_ids is not None:
         update["head_ids"] = head_ids
         update["head_id"]  = head_ids[0] if head_ids else None
+        _promote_heads_to_manager(head_ids)
 
     departments_col.update_one({"_id": ObjectId(dept_id)}, {"$set": update})
     updated        = departments_col.find_one({"_id": ObjectId(dept_id)})
@@ -525,14 +558,41 @@ def update_department(dept_id):
 def delete_department(dept_id):
     if not _is_admin(request.user):
         return jsonify({"message": "Unauthorized"}), 403
+
+    dept = None
     try:
         dept = departments_col.find_one({"_id": ObjectId(dept_id)})
     except Exception:
-        return jsonify({"message": "Invalid department ID."}), 400
-    if not dept:
+        pass  # not a real ObjectId — see the legacy-department handling below
+
+    # A department that only ever existed as a string on employee records,
+    # never formalized into its own departments_col document, has no
+    # metadata row to look up by ObjectId — AdminDepartments.jsx's synthetic
+    # card for one of these is keyed by the name itself, so dept_id IS the
+    # department name in that case. That used to crash this endpoint
+    # outright ("Invalid department ID.") the moment anyone tried to delete
+    # one instead of unassigning its members like every other department.
+    dept_name = dept["name"] if dept else dept_id
+    name_re   = {"$regex": f"^{re.escape(dept_name)}$", "$options": "i"}
+    if not dept and not users_col.find_one({"department": name_re}, {"_id": 1}):
         return jsonify({"message": "Department not found."}), 404
-    departments_col.delete_one({"_id": ObjectId(dept_id)})
-    return jsonify({"message": f"Department '{dept['name']}' metadata deleted."}), 200
+
+    # Unassign every current member — the confirm dialog on the frontend
+    # already promises this; previously only the departments_col metadata
+    # row (when one existed at all) was ever actually deleted, silently
+    # leaving every member's `department` field pointing at nothing.
+    def _strip(dv):
+        if isinstance(dv, list):
+            return [d for d in dv if not (isinstance(d, str) and d.strip().lower() == dept_name.strip().lower())]
+        return ""
+
+    for u in users_col.find({"department": name_re}, {"department": 1}):
+        users_col.update_one({"_id": u["_id"]}, {"$set": {"department": _strip(u.get("department"))}})
+
+    if dept:
+        departments_col.delete_one({"_id": dept["_id"]})
+
+    return jsonify({"message": f"Department '{dept_name}' deleted and its employees unassigned."}), 200
 
 
 @bp.route("/api/departments/<dept_name>/work-types", methods=["GET"])
