@@ -174,52 +174,60 @@ def share_work_plan():
     if not plan or not plan.get("tasks"):
         return jsonify({"message": "No work plan found for that date"}), 404
 
-    raw_dept = request.user.get("department")
-    dept = ", ".join(raw_dept) if isinstance(raw_dept, list) else (raw_dept or "").strip()
+    raw_dept  = request.user.get("department")
+    dept      = ", ".join(raw_dept) if isinstance(raw_dept, list) else (raw_dept or "").strip()
+    user_name = request.user.get("name", "")
 
-    def _build_body(plan_doc, date_s):
-        lines  = [
-            f"Work Plan — {request.user.get('name', '')}",
-            f"Date: {date_s}",
-            f"Department: {dept}",
-            "",
-        ]
-        ci_map = _checkin_map([uid], date_s)
-        ci     = ci_map.get(uid) or "—"
-        lines.append(f"Check-in: {ci}")
-        lines.append("")
-        for t in plan_doc.get("tasks", []):
-            done = "✓" if _is_task_done(t) else " "
-            lines.append(
-                f"  [{done}] {t.get('title', '')}"
-                f"  | type: {t.get('work_type', '-')}"
-                f"  | priority: {t.get('priority', '-')}"
-                f"  | est: {t.get('est_time', '-')}"
-                f"  | project: {t.get('project', '-')}"
-            )
-        if plan_doc.get("manager_comment"):
-            lines.append(f"\nManager comment: {plan_doc['manager_comment']}")
-        return "\n".join(lines)
+    lines = [
+        f"Work Plan — {user_name}",
+        f"Date: {date_str}",
+        f"Department: {dept}",
+        "",
+    ]
+    ci_map = _checkin_map([uid], date_str)
+    ci     = ci_map.get(uid) or "—"
+    lines.append(f"Check-in: {ci}")
+    lines.append("")
+    for t in plan.get("tasks", []):
+        done = "✓" if _is_task_done(t) else " "
+        lines.append(
+            f"  [{done}] {t.get('title', '')}"
+            f"  | type: {t.get('work_type', '-')}"
+            f"  | priority: {t.get('priority', '-')}"
+            f"  | est: {t.get('est_time', '-')}"
+            f"  | project: {t.get('project', '-')}"
+        )
+    if plan.get("manager_comment"):
+        lines.append(f"\nManager comment: {plan['manager_comment']}")
+    body    = "\n".join(lines)
+    subject = f"Work Plan — {user_name} ({date_str})"
 
-    def _send_share():
-        subject    = f"Work Plan — {request.user.get('name', '')} ({date_str})"
-        body       = _build_body(plan, date_str)
-        # Every eligible manager-approver (direct manager, any other manager
-        # in the department, and the department head(s) — same "who can act
-        # as this employee's manager" resolution leave/asset/referral
-        # notifications use) plus every owner. The old version here matched
-        # on `dept`, a comma-joined display string built above — for a
-        # multi-department employee that string never equals any single
-        # manager's stored department, so their share silently reached
-        # nobody but the owners.
-        recipients = set(OWNER_EMAILS) | set(resolve_employee_manager_emails(request.user))
-        for email in recipients:
+    # Every eligible manager-approver (direct manager, any other manager in
+    # the department, and the department head(s) — same "who can act as this
+    # employee's manager" resolution leave/asset/referral notifications use)
+    # plus every owner. The old version here matched on `dept`, a
+    # comma-joined display string — for a multi-department employee that
+    # string never equals any single manager's stored department, so their
+    # share silently reached nobody but the owners.
+    #
+    # Resolved here, in the request thread, and passed in as plain values —
+    # request.user is a Flask context-local; a background thread has no
+    # request context of its own, so touching request.user from inside one
+    # (the previous version's whole _send_share() closure did, on every
+    # line) raises "Working outside of request context" the instant the
+    # thread actually runs. Silently: this endpoint had returned "shared
+    # successfully" 200 on every call while the daemon thread died on its
+    # first line and no email ever went out.
+    recipients = set(OWNER_EMAILS) | set(resolve_employee_manager_emails(request.user))
+
+    def _send_share(to_emails, mail_subject, mail_body):
+        for email in to_emails:
             try:
-                send_email(email, subject, body)
+                send_email(email, mail_subject, mail_body)
             except Exception as e:
                 print(f"[share-plan] email to {email} failed: {e}")
 
-    threading.Thread(target=_send_share, daemon=True).start()
+    threading.Thread(target=_send_share, args=(recipients, subject, body), daemon=True).start()
     return jsonify({"message": "Work plan shared successfully"}), 200
 
 
