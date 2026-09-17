@@ -12,7 +12,7 @@ from bson import ObjectId
 
 from database import career_jobs_col, referrals_col, users_col
 from decorators import token_required
-from helpers import _is_admin, _has_module_grant, resolve_employee_manager_email, all_owner_emails
+from helpers import _is_admin, _has_module_grant, resolve_employee_manager_emails, all_owner_emails
 from utils import send_email
 from config import HR_EMAIL
 
@@ -290,9 +290,8 @@ def submit_referral():
     recipients = {HR_EMAIL.lower(): HR_EMAIL}
     for email in all_owner_emails():
         recipients[email.lower()] = email
-    manager_email = resolve_employee_manager_email(request.user)
-    if manager_email:
-        recipients[manager_email.lower()] = manager_email
+    for email in resolve_employee_manager_emails(request.user):
+        recipients[email.lower()] = email
     for email in recipients.values():
         threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
 

@@ -11,7 +11,7 @@ import cloudinary.uploader
 from database import (announcements_col, corrections_col, attendance_col,
                       users_col)
 from decorators import token_required
-from helpers import _is_admin, is_offboarded, _has_module_grant
+from helpers import _is_admin, is_offboarded, _has_module_grant, _team_ids_incl_dept_head
 from config import IST
 
 bp = Blueprint("announcements", __name__)
@@ -174,9 +174,11 @@ def manager_corrections():
     if request.user.get("role") != "manager":
         return jsonify({"message": "Unauthorized"}), 403
 
-    mgr_id           = str(request.user["_id"])
-    managed_emp_list = list(users_col.find({"manager_id": mgr_id}, {"name": 1}))
-    managed_users    = [str(u["_id"]) for u in managed_emp_list]
+    # department overlap + direct reports (manager_id) + any department this
+    # manager heads — manager_id alone hid these from a second manager or a
+    # department head in the same department.
+    managed_users    = list(_team_ids_incl_dept_head(request.user))
+    managed_emp_list = list(users_col.find({"_id": {"$in": [ObjectId(i) for i in managed_users]}}, {"name": 1}))
     emp_map          = {str(u["_id"]): u["name"] for u in managed_emp_list}
 
     query = {
@@ -220,8 +222,7 @@ def approve_correction():
     if not correction:
         return jsonify({"message": "Not found"}), 404
 
-    corr_owner = users_col.find_one({"_id": ObjectId(correction["user_id"])}, {"manager_id": 1})
-    if not corr_owner or str(corr_owner.get("manager_id")) != str(request.user["_id"]):
+    if correction["user_id"] not in _team_ids_incl_dept_head(request.user):
         return jsonify({"message": "Unauthorized: employee is not in your team"}), 403
 
     synced, sync_error = True, None

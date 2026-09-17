@@ -12,7 +12,7 @@ from bson import ObjectId
 
 from database import pms_templates_col, pms_reviews_col, users_col
 from decorators import token_required
-from helpers import _is_admin, _mgr_depts, _has_module_grant, _managed_employee_ids
+from helpers import _is_admin, _mgr_depts, _has_module_grant, _team_ids_incl_dept_head
 from config import IST
 
 bp = Blueprint("pms", __name__)
@@ -227,15 +227,17 @@ def get_manager_pms():
         return jsonify({"message": "Unauthorized"}), 403
 
     if request.user.get("role") == "manager":
-        # Match on the manager's actual team (department overlap OR direct
-        # manager_id assignment — see _managed_employee_ids), not the
-        # department string a review happened to snapshot at submission
-        # time. A submission's stored "department" can drift out of sync
-        # with a later rename, or the employee may simply be managed
-        # cross-department — either way the review was invisible to the
-        # manager who's supposed to score it.
+        # Match on the manager's actual team (department overlap, direct
+        # manager_id assignment, or heading the department — see
+        # _team_ids_incl_dept_head), not the department string a review
+        # happened to snapshot at submission time. A submission's stored
+        # "department" can drift out of sync with a later rename, an
+        # employee may simply be managed cross-department, or a second
+        # manager/department head in the same department may not be
+        # anyone's manager_id at all — any of these left the review
+        # invisible to a manager who's supposed to score it.
         query = {
-            "user_id": {"$in": list(_managed_employee_ids(request.user))},
+            "user_id": {"$in": list(_team_ids_incl_dept_head(request.user))},
             "$or": [
                 {"owner_role": {"$nin": ["admin", "owner"]}},
                 {"shared_with_manager": True},
@@ -278,7 +280,7 @@ def share_pms_with_admin(review_id):
         return jsonify({"message": "Invalid review ID"}), 400
     if not review:
         return jsonify({"message": "Review not found"}), 404
-    if request.user.get("role") == "manager" and review.get("user_id") not in _managed_employee_ids(request.user):
+    if request.user.get("role") == "manager" and review.get("user_id") not in _team_ids_incl_dept_head(request.user):
         return jsonify({"message": "Unauthorized — this employee isn't on your team."}), 403
     pms_reviews_col.update_one({"_id": ObjectId(review_id)}, {"$set": {"shared_with_admin": True}})
     return jsonify({"message": "Shared with Admin."}), 200
@@ -352,7 +354,7 @@ def pms_calibration():
     if request.user.get("role") == "manager":
         query = {
             "month": month,
-            "user_id": {"$in": list(_managed_employee_ids(request.user))},
+            "user_id": {"$in": list(_team_ids_incl_dept_head(request.user))},
             "$or": [
                 {"owner_role": {"$nin": ["admin", "owner"]}},
                 {"shared_with_manager": True},
@@ -423,7 +425,7 @@ def finalize_pms_review():
         review_doc = pms_reviews_col.find_one({"_id": obj}, {"user_id": 1})
         if not review_doc:
             return jsonify({"message": "Review not found"}), 404
-        if review_doc.get("user_id") not in _managed_employee_ids(request.user):
+        if review_doc.get("user_id") not in _team_ids_incl_dept_head(request.user):
             return jsonify({"message": "Unauthorized: this employee isn't on your team"}), 403
 
     try:
@@ -613,7 +615,7 @@ def export_pms():
     month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
     query = {"month": month}
     if request.user.get("role") == "manager":
-        query["user_id"] = {"$in": list(_managed_employee_ids(request.user))}
+        query["user_id"] = {"$in": list(_team_ids_incl_dept_head(request.user))}
         query["$or"] = [
             {"owner_role": {"$nin": ["admin", "owner"]}},
             {"shared_with_manager": True},

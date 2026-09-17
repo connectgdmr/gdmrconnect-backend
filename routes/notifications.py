@@ -9,7 +9,7 @@ from flask import Blueprint, request, jsonify
 from database import (leaves_col, pms_reviews_col, corrections_col,
                       assets_col, access_grants_col, users_col, referrals_col)
 from decorators import token_required
-from helpers import _mgr_depts
+from helpers import _mgr_depts, _team_ids_incl_dept_head
 from config import IST
 
 bp = Blueprint("notifications", __name__)
@@ -23,9 +23,11 @@ def get_notification_counts():
     counts = {"leaves": 0, "pms": 0, "corrections": 0, "assets": 0, "announcements": 0, "referrals": 0}
 
     if role == "manager":
-        mgr_id    = str(request.user["_id"])
-        mgr_users = [str(u["_id"]) for u in users_col.find({"manager_id": mgr_id}, {"_id": 1})]
-        mgr_depts = _mgr_depts(request.user)
+        # department overlap + direct reports (manager_id) + any department
+        # this manager heads — manager_id alone left a second manager or a
+        # department head in the same department with an always-empty badge,
+        # even though the Leave Requests list itself was visible to them.
+        mgr_users = list(_team_ids_incl_dept_head(request.user))
 
         counts["leaves"] = leaves_col.count_documents({
             "user_id": {"$in": mgr_users}, "status": "Pending", "manager_status": "Pending"
@@ -37,7 +39,7 @@ def get_notification_counts():
             "user_id": {"$in": mgr_users}, "status": "Pending"
         })
         counts["assets"] = assets_col.count_documents({
-            "department": {"$in": mgr_depts}, "manager_status": "Pending"
+            "user_id": {"$in": mgr_users}, "manager_status": "Pending"
         })
 
     elif role in ("admin", "owner") or has_delegated:

@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timedelta
 from bson import ObjectId
 from config import IST
-from database import attendance_col, users_col, access_grants_col, holidays_col
+from database import attendance_col, users_col, access_grants_col, holidays_col, departments_col
 
 
 # ── Timezone helpers ──────────────────────────────────────────────────────────
@@ -313,13 +313,14 @@ def _managed_employee_ids(manager_user):
     """All employee _ids (as strings) a manager can act on — department
     overlap OR a direct manager_id assignment (routes/employees.py sets
     this on every employee and keeps it current through promotions/
-    reassignments, so it's the authoritative "who reports to whom" field —
-    routes/leaves.py's admin_view_leaves() already uses manager_id alone
-    for the exact same purpose). Department-string equality alone is
-    fragile: a review/leave/etc. can carry a department value snapshotted
-    at submission time that later drifts out of sync with a rename, or an
-    employee can simply be managed cross-department. Matching on either
-    catches both cases instead of silently hiding a manager's own team."""
+    reassignments, so it's the authoritative "who reports to whom" field).
+    Department-string equality alone is fragile: a review/leave/etc. can
+    carry a department value snapshotted at submission time that later
+    drifts out of sync with a rename, or an employee can simply be managed
+    cross-department. Matching on either catches both cases instead of
+    silently hiding a manager's own team. Doesn't cover department heads
+    who aren't also a manager_id/department match — see
+    _team_ids_incl_dept_head() below for that."""
     depts  = _mgr_depts(manager_user)
     mgr_id = str(manager_user["_id"])
     return {str(u["_id"]) for u in users_col.find(
@@ -327,31 +328,90 @@ def _managed_employee_ids(manager_user):
     )}
 
 
+def _dept_head_dept_names(user_id):
+    """Names of departments this user heads (departments_col.head_ids array,
+    or the legacy single head_id). A department head is treated as a manager
+    of that department everywhere "who can act as this employee's manager"
+    matters — comp-off, leave/asset approval, notification badges."""
+    try:
+        oid = ObjectId(user_id)
+    except Exception:
+        return []
+    names = []
+    for d in departments_col.find(
+        {"$or": [{"head_ids": oid}, {"head_id": oid}]}, {"name": 1}
+    ):
+        if d.get("name"):
+            names.append(d["name"])
+    return names
+
+
+def _team_ids_incl_dept_head(user):
+    """Employee _ids (strings) this user has "manager" authority over: their
+    department(s) + direct reports (manager_id) + any department(s) they
+    head. The single source of truth for manager-side scoping — leave/asset
+    approval authorization, the Leave Requests / notification-badge counts,
+    comp-off grants — so a second manager in the same department, or a
+    department head who isn't literally anyone's manager_id, still counts.
+    (Was _comp_off_team_ids in routes/leaves.py; generalized here since the
+    same "who can act as this employee's manager" question applies well
+    beyond comp-off.)"""
+    ids = set(_managed_employee_ids(user))
+    head_depts = _dept_head_dept_names(str(user["_id"]))
+    if head_depts:
+        ids |= {str(u["_id"]) for u in users_col.find(
+            {"department": {"$in": head_depts}}, {"_id": 1}
+        )}
+    ids.discard(str(user["_id"]))  # not oneself
+    return ids
+
+
 # ── Notification recipients ──────────────────────────────────────────────────
 # Shared "who to email" resolution so every activity-submitted notification
 # (leave, asset request, referral, ...) reaches the same people the same way,
 # instead of each route hand-rolling its own manager lookup.
 
-def resolve_employee_manager_email(employee):
-    """Best-effort manager email for a staff member: their direct manager_id,
-    falling back to any manager in their department. None if neither resolves.
-    Mirrors the lookup routes/leaves.py's _send_leave_notification already
-    does inline for leave requests."""
-    manager_id = employee.get("manager_id")
-    if manager_id:
+def resolve_employee_manager_emails(employee):
+    """Every manager-tier person eligible to approve / be notified about this
+    employee's requests — the exact reverse of _team_ids_incl_dept_head():
+    their direct manager (manager_id), any other manager in their
+    department, and anyone heading their department. A department with two
+    managers (or a department head who isn't set as anyone's manager_id)
+    means everyone here gets the same notification, and any ONE of them
+    approving is enough (see routes/leaves.py's update_leave). De-duplicated
+    by email, original list order kept; empty list if none resolve."""
+    emp_depts = _mgr_depts(employee)  # original case; works for any user doc, not just managers
+    seen, emails = set(), []
+
+    def _add(u):
+        e = u.get("email") if u else None
+        if e and e.lower() not in seen:
+            seen.add(e.lower())
+            emails.append(e)
+
+    # Direct manager first (whatever their role — matches the pre-existing
+    # single-recipient lookup this replaces, which never role-checked it).
+    if employee.get("manager_id"):
         try:
-            mgr = users_col.find_one({"_id": ObjectId(str(manager_id))}, {"email": 1})
-            if mgr and mgr.get("email"):
-                return mgr["email"]
+            _add(users_col.find_one({"_id": ObjectId(str(employee["manager_id"]))}, {"email": 1}))
         except Exception:
             pass
-    dept = employee.get("department")
-    if dept:
-        dept_name = dept[0] if isinstance(dept, list) else dept
-        dept_mgr = users_col.find_one({"role": "manager", "department": dept_name}, {"email": 1})
-        if dept_mgr and dept_mgr.get("email"):
-            return dept_mgr["email"]
-    return None
+    # Then every other role:"manager" person sharing a department — role-
+    # scoped here so this doesn't sweep in ordinary department colleagues.
+    if emp_depts:
+        for u in users_col.find({"role": "manager", "department": {"$in": emp_depts}}, {"email": 1}):
+            _add(u)
+
+    # Department head(s) may not carry role "manager" in the data, so
+    # resolved separately rather than folded into the role-scoped query above.
+    if emp_depts:
+        head_ids = []
+        for d in departments_col.find({"name": {"$in": emp_depts}}, {"head_ids": 1, "head_id": 1}):
+            head_ids.extend(d.get("head_ids") or ([d["head_id"]] if d.get("head_id") else []))
+        for hid in head_ids:
+            _add(users_col.find_one({"_id": hid}, {"email": 1}))
+
+    return emails
 
 
 def all_owner_emails():

@@ -11,9 +11,11 @@ from datetime import datetime, timezone, timedelta
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
 
-from database import leaves_col, users_col, comp_off_col, departments_col
+from database import leaves_col, users_col, comp_off_col
 from decorators import token_required
-from helpers import _is_admin, _has_module_grant, _managed_employee_ids, _mgr_depts, active_staff
+from helpers import (_is_admin, _has_module_grant, active_staff,
+                     _team_ids_incl_dept_head, resolve_employee_manager_emails,
+                     all_owner_emails)
 from config import IST, HR_EMAIL, DASHBOARD_URL
 from utils import send_email
 
@@ -90,35 +92,10 @@ def _final_leave_status(leave):
     return "Approved" if (ms == "Approved" and as_ == "Approved") else "Pending"
 
 
-def _dept_head_dept_names(user_id):
-    """Names of departments this user heads (departments_col.head_ids array,
-    or the legacy single head_id). A department head is treated as a manager
-    of that department for comp-off."""
-    try:
-        oid = ObjectId(user_id)
-    except Exception:
-        return []
-    names = []
-    for d in departments_col.find(
-        {"$or": [{"head_ids": oid}, {"head_id": oid}]}, {"name": 1}
-    ):
-        if d.get("name"):
-            names.append(d["name"])
-    return names
-
-
-def _comp_off_team_ids(user):
-    """Employee _ids (strings) a manager / department head may grant to and
-    see balances for: their department(s) + direct reports + any department
-    they head."""
-    ids = set(_managed_employee_ids(user))
-    head_depts = _dept_head_dept_names(str(user["_id"]))
-    if head_depts:
-        ids |= {str(u["_id"]) for u in users_col.find(
-            {"department": {"$in": head_depts}}, {"_id": 1}
-        )}
-    ids.discard(str(user["_id"]))  # not oneself
-    return ids
+# Comp-off's "manager or department head who may grant/see this employee's
+# balance" question is exactly the same as every other manager-scoping
+# question in this file now — one shared implementation in helpers.py.
+_comp_off_team_ids = _team_ids_incl_dept_head
 
 
 def _can_grant_comp_off(user, target_uid):
@@ -309,37 +286,28 @@ def _send_leave_notification(leave_doc: dict, employee: dict):
         # A manager's own leave is approved by the owner in one step — send it
         # straight to the owner(s), not to a reporting manager / HR.
         if employee.get("role") == "manager":
-            owner_emails = [o["email"] for o in users_col.find({"role": "owner"}, {"email": 1}) if o.get("email")]
+            owner_emails = all_owner_emails()
             to_email = owner_emails[0] if owner_emails else HR_EMAIL
             cc_list  = owner_emails[1:] + (
                 [HR_EMAIL] if HR_EMAIL.lower() not in {e.lower() for e in owner_emails} else []
             )
             print(f"[leave-notify] manager applicant — routing to owner(s): {owner_emails!r}")
         else:
-            # Resolve manager
-            manager_email = None
-            manager_id    = employee.get("manager_id")
-            print(f"[leave-notify] employee={emp_name!r} manager_id={manager_id!r} dept={department!r}")
-            if manager_id:
-                try:
-                    mgr = users_col.find_one({"_id": ObjectId(str(manager_id))}, {"email": 1})
-                    if mgr:
-                        manager_email = mgr.get("email")
-                        print(f"[leave-notify] manager found by id: {manager_email!r}")
-                except Exception as mgr_exc:
-                    print(f"[leave-notify] manager lookup error: {mgr_exc}")
+            # Every eligible manager-approver: the direct manager, any other
+            # manager in the department, and the department head(s) — a
+            # department with two managers (or a head who isn't literally
+            # anyone's manager_id) previously meant only one of them, or
+            # neither, ever heard about this leave at all. Any ONE of them
+            # approving is enough (update_leave's manager branch checks the
+            # same _team_ids_incl_dept_head() set this is the reverse of).
+            manager_emails = resolve_employee_manager_emails(employee)
+            print(f"[leave-notify] employee={emp_name!r} manager_id={employee.get('manager_id')!r} "
+                  f"dept={department!r} approvers={manager_emails!r}")
 
-            if not manager_email and department:
-                try:
-                    dept_mgr = users_col.find_one({"role": "manager", "department": department}, {"email": 1})
-                    if dept_mgr:
-                        manager_email = dept_mgr.get("email")
-                        print(f"[leave-notify] manager found by dept: {manager_email!r}")
-                except Exception as dept_exc:
-                    print(f"[leave-notify] dept manager lookup error: {dept_exc}")
-
-            to_email = manager_email or HR_EMAIL
-            cc_list  = [HR_EMAIL] if manager_email and manager_email.lower() != HR_EMAIL.lower() else []
+            to_email = manager_emails[0] if manager_emails else HR_EMAIL
+            cc_list  = manager_emails[1:] + (
+                [HR_EMAIL] if HR_EMAIL.lower() not in {e.lower() for e in manager_emails} else []
+            )
 
         reply_to = emp_email or None
         print(f"[leave-notify] to={to_email!r} cc={cc_list!r} reply_to={reply_to!r}")
@@ -562,9 +530,10 @@ def admin_view_leaves():
 
     query = {}
     if role == "manager" and not has_delegated:
-        mgr_id         = str(request.user["_id"])
-        managed_users  = [str(u["_id"]) for u in users_col.find({"manager_id": mgr_id}, {"_id": 1})]
-        query          = {"user_id": {"$in": managed_users}}
+        # department overlap + direct reports (manager_id) + any department
+        # this manager heads — manager_id alone missed a second manager or a
+        # department head in the same department seeing these at all.
+        query = {"user_id": {"$in": list(_team_ids_incl_dept_head(request.user))}}
 
     employees = {str(e["_id"]): e for e in users_col.find({}, {"name": 1, "department": 1})}
     rows = []
@@ -607,11 +576,15 @@ def update_leave(leave_id):
         update_fields["admin_decided_by_role"] = "hr"
         update_fields["admin_decided_by_name"] = request.user.get("name", "")
     elif role == "manager":
-        leave_doc  = leaves_col.find_one({"_id": ObjectId(leave_id)}, {"user_id": 1})
+        leave_doc = leaves_col.find_one({"_id": ObjectId(leave_id)}, {"user_id": 1})
         if not leave_doc:
             return jsonify({"message": "Leave not found"}), 404
-        leave_owner = users_col.find_one({"_id": ObjectId(leave_doc["user_id"])}, {"manager_id": 1})
-        if not leave_owner or str(leave_owner.get("manager_id")) != str(request.user["_id"]):
+        # Any manager with authority over this employee may approve — direct
+        # manager_id, a shared department, or heading their department —
+        # not just whoever their manager_id happens to point at. Whichever
+        # one of them acts first is the manager approval; the other(s) just
+        # never get to act on an already-decided request.
+        if leave_doc["user_id"] not in _team_ids_incl_dept_head(request.user):
             return jsonify({"message": "Unauthorized: employee is not in your team"}), 403
         update_fields["manager_status"] = action
 
@@ -680,8 +653,7 @@ def revoke_leave(leave_id):
     elif role in ("admin", "owner"):
         allowed = True
     elif role == "manager":
-        leave_owner = users_col.find_one({"_id": ObjectId(leave["user_id"])}, {"manager_id": 1})
-        if leave_owner and str(leave_owner.get("manager_id")) == uid:
+        if leave["user_id"] in _team_ids_incl_dept_head(request.user):
             allowed = True
 
     if not allowed:

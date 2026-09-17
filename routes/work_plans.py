@@ -12,12 +12,12 @@ from datetime import datetime, timezone, timedelta
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
 
-from database import work_plans_col, users_col, attendance_col
+from database import work_plans_col, attendance_col
 from decorators import token_required
 from helpers import (
     _is_admin, _mgr_depts, _is_task_done, _has_module_grant,
     _checkin_map, _serialize_plan, _range_start, _build_analytics, _today_ist,
-    format_datetime_ist,
+    format_datetime_ist, resolve_employee_manager_emails,
 )
 from config import GROQ_API_KEY, GROQ_MODEL, OWNER_EMAILS
 from utils import send_email
@@ -204,14 +204,15 @@ def share_work_plan():
     def _send_share():
         subject    = f"Work Plan — {request.user.get('name', '')} ({date_str})"
         body       = _build_body(plan, date_str)
-        recipients = set(OWNER_EMAILS)
-        if dept:
-            for mgr in users_col.find({"role": "manager", "department": dept}, {"email": 1}):
-                if mgr.get("email"):
-                    recipients.add(mgr["email"])
-            for mgr in users_col.find({"role": "manager", "department": {"$in": [dept]}}, {"email": 1}):
-                if mgr.get("email"):
-                    recipients.add(mgr["email"])
+        # Every eligible manager-approver (direct manager, any other manager
+        # in the department, and the department head(s) — same "who can act
+        # as this employee's manager" resolution leave/asset/referral
+        # notifications use) plus every owner. The old version here matched
+        # on `dept`, a comma-joined display string built above — for a
+        # multi-department employee that string never equals any single
+        # manager's stored department, so their share silently reached
+        # nobody but the owners.
+        recipients = set(OWNER_EMAILS) | set(resolve_employee_manager_emails(request.user))
         for email in recipients:
             try:
                 send_email(email, subject, body)
