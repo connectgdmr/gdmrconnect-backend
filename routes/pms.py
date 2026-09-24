@@ -421,12 +421,12 @@ def finalize_pms_review():
     except Exception:
         return jsonify({"message": "Invalid review ID"}), 400
 
-    if request.user.get("role") == "manager":
-        review_doc = pms_reviews_col.find_one({"_id": obj}, {"user_id": 1})
-        if not review_doc:
-            return jsonify({"message": "Review not found"}), 404
-        if review_doc.get("user_id") not in _team_ids_incl_dept_head(request.user):
-            return jsonify({"message": "Unauthorized: this employee isn't on your team"}), 403
+    review_doc = pms_reviews_col.find_one({"_id": obj}, {"user_id": 1, "manager_id": 1, "month": 1})
+    if not review_doc:
+        return jsonify({"message": "Review not found"}), 404
+    if request.user.get("role") == "manager" \
+            and review_doc.get("user_id") not in _team_ids_incl_dept_head(request.user):
+        return jsonify({"message": "Unauthorized: this employee isn't on your team"}), 403
 
     try:
         pms_reviews_col.update_one(
@@ -443,6 +443,19 @@ def finalize_pms_review():
         )
     except Exception:
         return jsonify({"message": "Invalid review ID"}), 400
+
+    # PMS Compliance & Attendance Blocking: finishing off this review may be
+    # exactly what was keeping the manager's team blocked — check and lift it.
+    try:
+        mgr_id = review_doc.get("manager_id")
+        month  = review_doc.get("month")
+        if mgr_id and month:
+            manager_doc = users_col.find_one({"_id": ObjectId(mgr_id)})
+            if manager_doc:
+                import pms_compliance as pc
+                pc.auto_unblock_if_complete(manager_doc, month)
+    except Exception as e:
+        print(f"[pms_compliance] auto-unblock check failed: {e}")
 
     return jsonify({"message": "PMS Evaluation Review Completed successfully!"}), 200
 

@@ -26,6 +26,11 @@ def checkin_photo():
     if is_offboarded(request.user):
         return jsonify({"message": "Your employment has ended. Attendance check-in is no longer available."}), 403
 
+    import pms_compliance as pc
+    _blocked, _blocking_mgr = pc.is_employee_blocked(request.user)
+    if _blocked:
+        return jsonify({"message": pc.BLOCKED_MESSAGE, "blocked": True}), 403
+
     uid            = str(request.user["_id"])
     now_ist        = datetime.now(IST)
     current_time   = now_ist.time()
@@ -136,6 +141,11 @@ def checkout_photo():
 
     if is_offboarded(request.user):
         return jsonify({"message": "Your employment has ended. Attendance check-out is no longer available."}), 403
+
+    import pms_compliance as pc
+    _blocked, _blocking_mgr = pc.is_employee_blocked(request.user)
+    if _blocked:
+        return jsonify({"message": pc.BLOCKED_MESSAGE, "blocked": True}), 403
 
     uid            = str(request.user["_id"])
     now_ist        = datetime.now(IST)

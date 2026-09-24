@@ -50,6 +50,16 @@ assets_col        = db["assets"]
 pms_templates_col = db["pms_templates"]
 pms_reviews_col   = db["pms_reviews"]
 
+# ── PMS Compliance & Attendance Blocking (pms_compliance.py) ──────────────────
+# One doc per (manager_id, month): review-completion status for that manager's
+# team + whether their team's attendance check-in is currently blocked for it.
+pms_compliance_col       = db["pms_compliance"]
+# Append-only history of every reminder/block/unblock/override/extension.
+pms_compliance_audit_col = db["pms_compliance_audit"]
+# Single "singleton" doc: the master on/off switch + configurable exceptions
+# (FRD §14) — never hard-coded.
+pms_compliance_settings_col = db["pms_compliance_settings"]
+
 # ── Departments ───────────────────────────────────────────────────────────────
 departments_col = db["departments"]
 
@@ -205,6 +215,9 @@ try:
     messages_col.create_index([("conversation_id", 1), ("created_at", 1)], background=True)
     messages_col.create_index([("conversation_id", 1), ("read_by", 1)], background=True)
     holidays_col.create_index("date", unique=True, background=True)
+    pms_compliance_col.create_index([("manager_id", 1), ("month", 1)], unique=True, background=True)
+    pms_compliance_audit_col.create_index([("manager_id", 1), ("month", 1), ("at", -1)], background=True)
+    pms_compliance_audit_col.create_index([("at", -1)], background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
@@ -333,3 +346,23 @@ try:
             print(f"Startup migration: set '{_cands[0]['name']}' as head of headless department '{_d['name']}'.")
 except Exception as _headless_err:
     print(f"Warning: headless-department migration failed: {_headless_err}")
+
+try:
+    # PMS Compliance & Attendance Blocking — seed the singleton settings doc
+    # once so every reader can assume it exists. blocking_enabled defaults to
+    # False: status tracking, the dashboard and every notification run for
+    # real from the day this ships, but nobody's check-in is actually
+    # rejected until HR/Admin turns it on from the Compliance tab.
+    if pms_compliance_settings_col.count_documents({"_id": "singleton"}) == 0:
+        pms_compliance_settings_col.insert_one({
+            "_id":                    "singleton",
+            "blocking_enabled":       False,
+            "exempt_employee_ids":    [],
+            "exempt_department_names": [],
+            "new_joiner_grace_days":  30,
+            "updated_at":             datetime.now(timezone.utc),
+            "updated_by":             None,
+        })
+        print("Startup migration: seeded PMS compliance settings (blocking disabled by default).")
+except Exception as _pmscomp_err:
+    print(f"Warning: PMS compliance settings seed failed: {_pmscomp_err}")

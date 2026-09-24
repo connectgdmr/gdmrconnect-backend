@@ -8,6 +8,7 @@ APScheduler background jobs:
   - Owner HTML daily digest       (11:30 AM IST)
   - Weekly work-plan reports      (Monday 9:00 AM IST)
   - LMS course-expiry reminders   (9:05 AM IST daily)
+  - PMS compliance / attendance blocking check (9:30 AM IST daily)
 """
 import threading
 import html as _html
@@ -17,9 +18,10 @@ from bson import ObjectId
 from database import (
     users_col, pms_reviews_col, access_grants_col,
     work_plans_col, attendance_col, lms_courses_col, lms_progress_col,
+    pms_compliance_col,
 )
 from config import IST, OWNER_EMAILS
-from helpers import _is_task_done, _checkin_map, format_datetime_ist
+from helpers import _is_task_done, _checkin_map, format_datetime_ist, get_company_holiday_dates
 from utils import send_email
 
 
@@ -429,6 +431,58 @@ def send_lms_expiry_reminders():
 
 
 # =============================================================================
+# PMS Compliance & Department Attendance Blocking
+# =============================================================================
+
+def run_pms_compliance_check():
+    """9:30 AM IST daily — recompute every manager's review-compliance status
+    for the current month, then handle the two deadline moments: the last
+    working day itself (send the prior warning) and the day after (deadline
+    missed — mark Overdue and block). Runs regardless of blocking_enabled;
+    only the attendance gate itself (routes/attendance.py) checks that flag,
+    so status/dashboard/notifications stay live even while blocking is off."""
+    import pms_compliance as pc
+    print("Running PMS Compliance Check...")
+
+    settings = pc.get_settings()
+    holiday_dates = get_company_holiday_dates()
+    today = datetime.now(IST).date()
+    yesterday = today - timedelta(days=1)
+    month = today.strftime("%Y-%m")
+
+    managers = pc.active_managers()
+    for manager in managers:
+        try:
+            status, completed, pending, team_size = pc.set_status(manager, month, settings)
+        except Exception as e:
+            print(f"[pms_compliance] set_status failed for {manager.get('email')}: {e}")
+            continue
+
+        if status == "Completed" or pending == 0:
+            continue
+        if pc.is_manager_on_leave(manager):
+            continue
+
+        rec = pms_compliance_col.find_one({"manager_id": str(manager["_id"]), "month": month}) or {}
+        deadline_override = rec.get("deadline_override")
+
+        try:
+            if deadline_override:
+                deadline_passed_today = str(today) == deadline_override
+                deadline_missed = str(today) > deadline_override
+            else:
+                deadline_passed_today = pc.is_last_working_day(today, holiday_dates)
+                deadline_missed = pc.is_last_working_day(yesterday, holiday_dates)
+
+            if deadline_passed_today and not rec.get("first_warning_sent_at"):
+                pc.send_warning(manager, month)
+            elif deadline_missed and not rec.get("blocked"):
+                pc.send_overdue_and_block(manager, month)
+        except Exception as e:
+            print(f"[pms_compliance] deadline check failed for {manager.get('email')}: {e}")
+
+
+# =============================================================================
 # Scheduler startup — called from create_app()
 # =============================================================================
 
@@ -442,6 +496,7 @@ def start_scheduler():
         scheduler.add_job(func=send_owner_daily_digest,    trigger="cron",     hour=11, minute=30)
         scheduler.add_job(func=send_weekly_work_reports,   trigger="cron",     day_of_week="mon", hour=9, minute=0)
         scheduler.add_job(func=send_lms_expiry_reminders,  trigger="cron",     hour=9, minute=5)
+        scheduler.add_job(func=run_pms_compliance_check,   trigger="cron",     hour=9, minute=30)
         scheduler.start()
         print("Background Job Scheduler initialized successfully.")
     except Exception as e:

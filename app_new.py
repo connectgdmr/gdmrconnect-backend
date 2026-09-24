@@ -126,6 +126,7 @@ def create_app():
     from routes.employees     import bp as employees_bp
     from routes.access        import bp as access_bp
     from routes.pms           import bp as pms_bp
+    from routes.pms_compliance import bp as pms_compliance_bp
     from routes.attendance    import bp as attendance_bp
     from routes.leaves        import bp as leaves_bp
     from routes.assistant     import bp as assistant_bp
@@ -146,7 +147,7 @@ def create_app():
     from routes.attendance_reports import bp as attendance_reports_bp
 
     for bp in (
-        auth_bp, employees_bp, access_bp, pms_bp, attendance_bp,
+        auth_bp, employees_bp, access_bp, pms_bp, pms_compliance_bp, attendance_bp,
         leaves_bp, assistant_bp, assets_bp, announcements_bp,
         notifications_bp, stats_bp, assessment_bp, lms_bp,
         career_bp, payroll_bp, work_plans_bp, clients_bp,
