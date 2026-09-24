@@ -6,6 +6,7 @@ Announcements CRUD, attendance corrections, user profile.
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 import cloudinary.uploader
 
 from database import (announcements_col, corrections_col, attendance_col,
@@ -66,6 +67,12 @@ def _apply_correction_attendance(correction, cid):
             "correction_ref":   cid,
         })
         return True, None
+    except DuplicateKeyError:
+        # attendance_col's unique (user_id, date, type) index rejected this —
+        # a check-in/check-out already exists for that exact day, so this
+        # correction (meant for "there's no record at all yet") isn't the
+        # right tool; the existing record needs editing/deleting directly.
+        return False, "An attendance record already exists for that day and type — edit or delete it directly instead."
     except Exception as e:
         print("Error updating attendance log:", e)
         return False, "Unexpected error writing the attendance record — check server logs."

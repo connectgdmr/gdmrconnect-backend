@@ -104,12 +104,62 @@ achievements_col = db["achievements"]
 # collection so none of them can drift out of sync with each other again).
 holidays_col = db["holidays"]
 
+# ── One-time cleanup: duplicate attendance punches ─────────────────────────────
+# A check-then-insert race in checkin_photo()/checkout_photo() (routes/
+# attendance.py) — the "already checked in/out today?" existence check and
+# the actual insert are two separate steps with the slow (1-3s) Cloudinary
+# photo upload sitting between them, leaving a window for a second
+# near-simultaneous request (a double-tap on a laggy touchscreen, most
+# often) to pass the same check before the first request has written its
+# row — could leave two check-in or two check-out rows for the same
+# user/date. Must run before the unique index below is created: Mongo
+# refuses to build a unique index over data that already violates it, which
+# would otherwise silently skip creating this index forever on any database
+# that already has duplicates — and because index creation below is one big
+# try/except, that failure would also abort every index listed after it.
+try:
+    _dupe_groups = list(attendance_col.aggregate([
+        {"$group": {
+            "_id":     {"user_id": "$user_id", "date": "$date", "type": "$type"},
+            "docs":    {"$push": {"_id": "$_id", "status_indicator": "$status_indicator"}},
+            "count":   {"$sum": 1},
+        }},
+        {"$match": {"count": {"$gt": 1}}},
+    ]))
+    _removed = 0
+    for _g in _dupe_groups:
+        docs = sorted(_g["docs"], key=lambda d: d["_id"])  # ObjectId sorts chronologically
+        corrected = [d for d in docs if d.get("status_indicator") == "Corrected"]
+        if corrected:
+            # A deliberate, admin-approved correction (routes/announcements.py's
+            # _apply_correction_attendance) beats an accidental duplicate —
+            # keep its latest, drop everything else in the group.
+            keep_id = corrected[-1]["_id"]
+        else:
+            # Otherwise this is the double-tap race (routes/attendance.py's
+            # checkin_photo/checkout_photo) — keep the earliest (the real
+            # punch), drop the rest.
+            keep_id = docs[0]["_id"]
+        for d in docs:
+            if d["_id"] != keep_id:
+                attendance_col.delete_one({"_id": d["_id"]})
+                _removed += 1
+    if _removed:
+        print(f"Startup migration: removed {_removed} duplicate attendance punch(es).")
+except Exception as _att_dupe_err:
+    print(f"Warning: attendance dedupe migration failed: {_att_dupe_err}")
+
 # ── Indexes (background=True — no write-lock) ─────────────────────────────────
 try:
     users_col.create_index("email", background=True)
     users_col.create_index("role", background=True)
     users_col.create_index("department", background=True)
-    attendance_col.create_index([("user_id", 1), ("date", 1), ("type", 1)], background=True)
+    # unique: the real fix for the duplicate-punch race above — the
+    # check-then-insert gap in checkin_photo()/checkout_photo() can no
+    # longer let two rows through no matter how the two requests interleave,
+    # since Mongo now rejects the second insert outright (caught there and
+    # turned back into the same friendly "Already checked in/out" message).
+    attendance_col.create_index([("user_id", 1), ("date", 1), ("type", 1)], unique=True, background=True)
     attendance_col.create_index([("date", 1), ("type", 1)], background=True)
     leaves_col.create_index([("user_id", 1), ("status", 1)], background=True)
     leaves_col.create_index([("from_date", 1), ("to_date", 1), ("status", 1)], background=True)

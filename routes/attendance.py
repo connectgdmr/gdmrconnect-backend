@@ -7,6 +7,7 @@ import cloudinary.uploader
 from datetime import datetime, timezone, timedelta, time
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 
 from database import attendance_col, leaves_col, users_col
 from decorators import token_required
@@ -105,16 +106,25 @@ def checkin_photo():
         print("Cloudinary Upload Error:", e)
         return jsonify({"message": "Image upload failed. Check connection."}), 500
 
-    attendance_col.insert_one({
-        "user_id":          uid,
-        "type":             "checkin",
-        "date":             today_str,
-        "day_type":         day_type,
-        "time":             datetime.now(timezone.utc),
-        "photo_url":        photo_url,
-        "status_indicator": status_indicator,
-        "location":         location,
-    })
+    try:
+        attendance_col.insert_one({
+            "user_id":          uid,
+            "type":             "checkin",
+            "date":             today_str,
+            "day_type":         day_type,
+            "time":             datetime.now(timezone.utc),
+            "photo_url":        photo_url,
+            "status_indicator": status_indicator,
+            "location":         location,
+        })
+    except DuplicateKeyError:
+        # The find_one() check above and this insert aren't atomic — a
+        # second near-simultaneous request (a double-tap while this one was
+        # still mid-upload) can slip past that check too. The unique index
+        # on (user_id, date, type) is what actually stops the duplicate row;
+        # this just turns Mongo's rejection back into the same message the
+        # up-front check already gives for the normal case.
+        return jsonify({"message": "Already checked in!"}), 400
     return jsonify({"message": f"Checked in successfully ({status_indicator})"}), 200
 
 
@@ -196,16 +206,22 @@ def checkout_photo():
         print("Cloudinary Upload Error:", e)
         return jsonify({"message": "Image upload failed"}), 500
 
-    attendance_col.insert_one({
-        "user_id":          uid,
-        "type":             "checkout",
-        "date":             str(today),
-        "time":             datetime.now(timezone.utc),
-        "photo_url":        photo_url,
-        "day_type":         final_day_type,
-        "status_indicator": status_indicator,
-        "location":         location,
-    })
+    try:
+        attendance_col.insert_one({
+            "user_id":          uid,
+            "type":             "checkout",
+            "date":             str(today),
+            "time":             datetime.now(timezone.utc),
+            "photo_url":        photo_url,
+            "day_type":         final_day_type,
+            "status_indicator": status_indicator,
+            "location":         location,
+        })
+    except DuplicateKeyError:
+        # Same race as checkin_photo() above — the unique index on
+        # (user_id, date, type) is what actually stops the duplicate row;
+        # this just turns Mongo's rejection into the same friendly message.
+        return jsonify({"message": "Already checked out for today!"}), 400
     return jsonify({"message": f"Checked out successfully ({final_day_type}, {status_indicator})"}), 200
 
 
