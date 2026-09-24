@@ -40,13 +40,26 @@ def save_pms_template():
     if not assigned_to_list:
         return jsonify({"message": "You must assign the template to at least one employee."}), 400
 
+    recurring = bool(data.get("recurring"))
+    if recurring:
+        try:
+            assign_day = max(1, min(28, int(data.get("assign_day_of_month", 1))))
+            due_day    = max(1, min(28, int(data.get("due_day_of_month", assign_day))))
+        except (TypeError, ValueError):
+            return jsonify({"message": "Assign day and due day must be numbers between 1 and 28."}), 400
+    else:
+        assign_day = due_day = None
+
     fields = {
-        "department":  dept_to_store,
-        "sessions":    data.get("sessions", []),
-        "assigned_to": assigned_to_list,
-        "cycle_name":  data.get("cycle_name", ""),
-        "due_date":    data.get("due_date", ""),
-        "updated_at":  datetime.now(timezone.utc),
+        "department":          dept_to_store,
+        "sessions":            data.get("sessions", []),
+        "assigned_to":         assigned_to_list,
+        "cycle_name":          data.get("cycle_name", ""),
+        "due_date":            data.get("due_date", ""),
+        "recurring":           recurring,
+        "assign_day_of_month": assign_day,
+        "due_day_of_month":    due_day,
+        "updated_at":          datetime.now(timezone.utc),
     }
 
     # `template_id` present  → editing that specific form (multiple PMS forms
@@ -62,13 +75,22 @@ def save_pms_template():
         scope = {"_id": oid}
         if is_manager:
             scope["created_by"] = mgr_id  # a manager may only edit their own
+        existing = pms_templates_col.find_one(scope, {"current_month": 1})
+        if existing is None:
+            return jsonify({"message": "PMS form not found."}), 404
+        # A one-off form just turned recurring needs a live cycle to start
+        # from — otherwise it'd sit inactive until the scheduler's next
+        # assign-day match, which could be up to a month away.
+        if recurring and not existing.get("current_month"):
+            fields["current_month"] = datetime.now(IST).strftime("%Y-%m")
         res = pms_templates_col.update_one(scope, {"$set": fields})
         if res.matched_count == 0:
             return jsonify({"message": "PMS form not found."}), 404
         return jsonify({"message": "PMS form updated.", "_id": template_id}), 200
 
-    fields["created_by"] = mgr_id
-    fields["created_at"] = datetime.now(timezone.utc)
+    fields["created_by"]   = mgr_id
+    fields["created_at"]   = datetime.now(timezone.utc)
+    fields["current_month"] = datetime.now(IST).strftime("%Y-%m")
     ins = pms_templates_col.insert_one(fields)
     return jsonify({
         "message": f"PMS Form Assigned to {len(assigned_to_list)} employees successfully!",
@@ -121,10 +143,16 @@ def get_pms_template():
     # without this check the assignment (and its now-blank form, since the
     # frontend clears its local answers right after a successful submit)
     # kept showing on the employee's screen forever instead of disappearing
-    # once completed.
-    already_submitted = pms_reviews_col.find_one(
-        {"user_id": uid, "template_id": str(template["_id"])}, {"_id": 1}
-    )
+    # once completed. Scoped to the template's *current cycle month* (set on
+    # creation, advanced monthly by the recurring-assignment scheduler job)
+    # so a recurring template re-opens for everyone once a new cycle starts,
+    # instead of staying permanently "submitted" from month one onward.
+    # Legacy templates with no current_month fall back to the old
+    # ever-submitted check (they were never meant to recur).
+    submitted_query = {"user_id": uid, "template_id": str(template["_id"])}
+    if template.get("current_month"):
+        submitted_query["month"] = template["current_month"]
+    already_submitted = pms_reviews_col.find_one(submitted_query, {"_id": 1})
     if already_submitted:
         return jsonify({
             "sessions": [], "already_submitted": True,
@@ -143,7 +171,6 @@ def get_pms_template():
 def submit_pms_review():
     uid   = str(request.user["_id"])
     data  = request.json
-    month = datetime.now(IST).strftime("%Y-%m")
 
     # Use the exact template the employee was shown (GET /api/pms-template
     # now sends its _id back for this reason) rather than re-querying fresh
@@ -162,6 +189,14 @@ def submit_pms_review():
             template = None
     if not template:
         template = pms_templates_col.find_one({"assigned_to": uid}, sort=[("updated_at", -1)])
+    # Tie the submission to whichever cycle was actually open on the
+    # template (set at creation, advanced monthly for recurring templates)
+    # rather than wall-clock "now" — an employee submitting a few days late,
+    # after the due date but before the *next* cycle opens, must still land
+    # in the cycle they were shown, or get_pms_template()'s already-submitted
+    # check (scoped to current_month) would never find it and keep showing
+    # them the same form as unsubmitted.
+    month = (template.get("current_month") if template else None) or datetime.now(IST).strftime("%Y-%m")
     cycle_name = template.get("cycle_name", "") if template else ""
     owner_id   = template.get("created_by") if template else None
     owner_role = None
@@ -492,34 +527,147 @@ def list_pms_templates():
 
     out = []
     for t in templates:
-        tid       = str(t["_id"])
-        assigned  = t.get("assigned_to", []) or []
-        submitted = set(pms_reviews_col.distinct("user_id", {"template_id": tid}))
+        tid          = str(t["_id"])
+        assigned     = t.get("assigned_to", []) or []
+        current_month = t.get("current_month")
+        # Scoped to the live cycle month for a recurring template — an
+        # all-time distinct() would keep showing everyone as "submitted"
+        # forever from their very first month, even once a brand new cycle
+        # has opened and they haven't touched it yet.
+        submitted_query = {"template_id": tid}
+        if current_month:
+            submitted_query["month"] = current_month
+        submitted = set(pms_reviews_col.distinct("user_id", submitted_query))
         sessions  = t.get("sessions", []) or []
         updated   = t.get("updated_at")
         created   = t.get("created_at")
         due       = t.get("due_date", "") or ""
         out.append({
-            "_id":            tid,
-            "cycle_name":     t.get("cycle_name", ""),
-            "department":     t.get("department", ""),
-            "due_date":       due,
-            "status":         "expired" if (due and due < today_str) else "active",
-            "updated_at":     updated.isoformat() if hasattr(updated, "isoformat") else (updated or ""),
-            "created_at":     created.isoformat() if hasattr(created, "isoformat") else (created or ""),
-            "created_by":     t.get("created_by"),
-            "sessions":       sessions,
-            "assigned_to":    assigned,
-            "section_count":  len(sessions),
-            "question_count": sum(len(s.get("questions", []) or []) for s in sessions),
-            "assigned_count": len(assigned),
-            "submitted_count": len([u for u in assigned if u in submitted]),
+            "_id":                 tid,
+            "cycle_name":          t.get("cycle_name", ""),
+            "department":          t.get("department", ""),
+            "due_date":            due,
+            "status":              "expired" if (due and due < today_str) else "active",
+            "updated_at":          updated.isoformat() if hasattr(updated, "isoformat") else (updated or ""),
+            "created_at":          created.isoformat() if hasattr(created, "isoformat") else (created or ""),
+            "created_by":          t.get("created_by"),
+            "sessions":            sessions,
+            "assigned_to":         assigned,
+            "section_count":       len(sessions),
+            "question_count":      sum(len(s.get("questions", []) or []) for s in sessions),
+            "assigned_count":      len(assigned),
+            "submitted_count":     len([u for u in assigned if u in submitted]),
+            "recurring":           bool(t.get("recurring")),
+            "assign_day_of_month": t.get("assign_day_of_month"),
+            "due_day_of_month":    t.get("due_day_of_month"),
+            "current_month":       current_month,
             "assignees": [
                 {"id": u, "name": name_map.get(u, "Unknown"), "submitted": u in submitted}
                 for u in assigned
             ],
         })
     return jsonify(out), 200
+
+
+@bp.route("/api/admin/pms-template/<template_id>/responses", methods=["GET"])
+@token_required
+def pms_template_responses(template_id):
+    """Every response ever submitted against this template, across every
+    monthly cycle it's had (not just the current one) — the saved template's
+    full response history, for the "view past responses" / export needs."""
+    role = request.user.get("role")
+    if role not in ("admin", "owner", "manager") and not _has_module_grant(request.user, "pms"):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        oid = ObjectId(template_id)
+    except Exception:
+        return jsonify({"message": "Invalid template id."}), 400
+
+    scope = {"_id": oid}
+    if role == "manager":
+        scope["created_by"] = str(request.user["_id"])
+    template = pms_templates_col.find_one(scope)
+    if not template:
+        return jsonify({"message": "PMS form not found."}), 404
+
+    reviews = list(pms_reviews_col.find({"template_id": template_id}).sort("month", -1))
+    uids = []
+    for r in reviews:
+        try:
+            uids.append(ObjectId(r["user_id"]))
+        except Exception:
+            pass
+    name_map = {str(u["_id"]): u.get("name", "Unknown") for u in users_col.find({"_id": {"$in": uids}}, {"name": 1})}
+
+    rows = []
+    for r in reviews:
+        rows.append({
+            "_id":            str(r["_id"]),
+            "employee_name":  name_map.get(r.get("user_id"), "Unknown"),
+            "month":          r.get("month"),
+            "status":         r.get("status"),
+            "overall_rating": r.get("overall_rating"),
+            "self_assessment_date": r.get("self_assessment_date"),
+            "manager_review_date":  r.get("manager_review_date"),
+        })
+    return jsonify({
+        "cycle_name": template.get("cycle_name", ""),
+        "recurring":  bool(template.get("recurring")),
+        "responses":  rows,
+    }), 200
+
+
+@bp.route("/api/admin/pms-template/<template_id>/export", methods=["GET"])
+@token_required
+def export_pms_template_responses(template_id):
+    """CSV export of every response ever submitted against this one saved
+    template, across every monthly cycle — a full history export, distinct
+    from /api/admin/export-pms which is scoped to a single month across all
+    templates."""
+    role = request.user.get("role")
+    if role not in ("admin", "owner", "manager") and not _has_module_grant(request.user, "pms"):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        oid = ObjectId(template_id)
+    except Exception:
+        return jsonify({"message": "Invalid template id."}), 400
+
+    scope = {"_id": oid}
+    if role == "manager":
+        scope["created_by"] = str(request.user["_id"])
+    template = pms_templates_col.find_one(scope)
+    if not template:
+        return jsonify({"message": "PMS form not found."}), 404
+
+    reviews = list(pms_reviews_col.find({"template_id": template_id}).sort("month", -1))
+    uids = []
+    for r in reviews:
+        try:
+            uids.append(ObjectId(r["user_id"]))
+        except Exception:
+            pass
+    emp_map = {str(e["_id"]): e["name"] for e in users_col.find({"_id": {"$in": uids}}, {"name": 1})}
+
+    def _to_num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0
+
+    si = io.StringIO()
+    cw = csv.writer(si)
+    cw.writerow(["Employee Name", "Month", "Status", "Self Score Total", "Manager Score Total", "Overall Rating", "Manager Feedback"])
+    for r in reviews:
+        self_total = sum(_to_num(res.get("self_score", 0)) for res in r.get("responses", []))
+        mgr_total  = sum(_to_num(ms.get("score", 0)) for ms in r.get("manager_scores", []))
+        cw.writerow([
+            emp_map.get(r.get("user_id"), "Unknown"), r.get("month"), r.get("status"),
+            self_total, mgr_total, r.get("overall_rating") or "", r.get("manager_feedback", ""),
+        ])
+
+    safe_name = "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in template.get("cycle_name", "PMS")).strip() or "PMS"
+    output = io.BytesIO(si.getvalue().encode("utf-8"))
+    return send_file(output, mimetype="text/csv", as_attachment=True, download_name=f"{safe_name}_All_Responses.csv")
 
 
 @bp.route("/api/my/pms", methods=["GET"])

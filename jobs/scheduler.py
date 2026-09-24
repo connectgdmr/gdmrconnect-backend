@@ -9,7 +9,9 @@ APScheduler background jobs:
   - Weekly work-plan reports      (Monday 9:00 AM IST)
   - LMS course-expiry reminders   (9:05 AM IST daily)
   - PMS compliance / attendance blocking check (9:30 AM IST daily)
+  - PMS recurring template auto-assignment (8:00 AM IST daily)
 """
+import calendar
 import threading
 import html as _html
 from datetime import datetime, timedelta
@@ -18,7 +20,7 @@ from bson import ObjectId
 from database import (
     users_col, pms_reviews_col, access_grants_col,
     work_plans_col, attendance_col, lms_courses_col, lms_progress_col,
-    pms_compliance_col,
+    pms_compliance_col, pms_templates_col,
 )
 from config import IST, OWNER_EMAILS
 from helpers import _is_task_done, _checkin_map, format_datetime_ist, get_company_holiday_dates
@@ -65,6 +67,65 @@ def send_pms_reminders():
             ).start()
         except Exception as e:
             print(f"PMS reminder email failed for {manager.get('email')}: {e}")
+
+
+# =============================================================================
+# PMS recurring template auto-assignment
+# =============================================================================
+
+def run_pms_recurring_assignments():
+    """8:00 AM IST — a recurring PMS template opens a fresh monthly cycle on
+    its configured "assign day". Opening a cycle just means advancing
+    current_month to this month and refreshing due_date — routes/pms.py's
+    get_pms_template() already re-shows the form to every assignee the
+    instant current_month no longer matches their last submission's month,
+    so nothing else needs to "push" it to anyone's dashboard."""
+    print("Running PMS Recurring Assignment Job...")
+    today       = datetime.now(IST).date()
+    this_month  = today.strftime("%Y-%m")
+    days_in_mo  = calendar.monthrange(today.year, today.month)[1]
+
+    for t in pms_templates_col.find({"recurring": True}):
+        if t.get("current_month") == this_month:
+            continue  # this month's cycle is already open
+
+        assign_day = min(int(t.get("assign_day_of_month") or 1), days_in_mo)
+        if today.day != assign_day:
+            continue
+
+        due_day  = min(int(t.get("due_day_of_month") or assign_day), days_in_mo)
+        due_date = today.replace(day=due_day).isoformat()
+
+        pms_templates_col.update_one(
+            {"_id": t["_id"]},
+            {"$set": {"current_month": this_month, "due_date": due_date, "updated_at": datetime.now(IST)}},
+        )
+
+        assignee_ids = []
+        for uid in (t.get("assigned_to") or []):
+            try:
+                assignee_ids.append(ObjectId(uid))
+            except Exception:
+                pass
+        if not assignee_ids:
+            continue
+
+        cycle_name = t.get("cycle_name") or "Monthly Performance Review"
+        due_display = today.replace(day=due_day).strftime("%d %b %Y")
+        subject = f"New PMS Cycle Open — {cycle_name}"
+        for u in users_col.find({"_id": {"$in": assignee_ids}}, {"email": 1, "name": 1}):
+            if not u.get("email"):
+                continue
+            body = (
+                f"Hello {u.get('name', '')},\n\n"
+                f"Your monthly performance review \"{cycle_name}\" is now open for {this_month}.\n"
+                f"Please submit your self-assessment by {due_display}.\n\n"
+                f"Log in to GDMR Connect to complete it."
+            )
+            try:
+                threading.Thread(target=send_email, args=(u["email"], subject, body), daemon=True).start()
+            except Exception as e:
+                print(f"PMS recurring-cycle email failed for {u.get('email')}: {e}")
 
 
 # =============================================================================
@@ -497,6 +558,7 @@ def start_scheduler():
         scheduler.add_job(func=send_weekly_work_reports,   trigger="cron",     day_of_week="mon", hour=9, minute=0)
         scheduler.add_job(func=send_lms_expiry_reminders,  trigger="cron",     hour=9, minute=5)
         scheduler.add_job(func=run_pms_compliance_check,   trigger="cron",     hour=9, minute=30)
+        scheduler.add_job(func=run_pms_recurring_assignments, trigger="cron",  hour=8, minute=0)
         scheduler.start()
         print("Background Job Scheduler initialized successfully.")
     except Exception as e:
