@@ -120,7 +120,10 @@ def team_for_manager(manager, settings=None):
         oids = []
     docs = {
         str(u["_id"]): u
-        for u in users_col.find({"_id": {"$in": oids}}, {"department": 1, "doj": 1, "resignation": 1})
+        for u in users_col.find(
+            {"_id": {"$in": oids}},
+            {"department": 1, "doj": 1, "resignation": 1, "extended_leaves": 1, "name": 1},
+        )
     }
 
     exempt_emp   = set(settings.get("exempt_employee_ids") or [])
@@ -149,8 +152,29 @@ def team_for_manager(manager, settings=None):
                         continue
                 except Exception:
                     pass
+        if _on_long_term_leave(u, today):
+            continue
         out.add(uid)
     return out
+
+
+def _on_long_term_leave(user, today=None):
+    """FRD §14 — 'Employees on approved long-term leave' is a configured
+    exception category, distinct from a routine day-leave. extended_leaves
+    is this codebase's existing long-term-leave record (the same field
+    classify_attendance_day() and is_manager_on_leave() read), so a team
+    member currently on one doesn't count toward their manager's pending
+    reviews for the month."""
+    today = today or datetime.now(IST).date()
+    for el in (user.get("extended_leaves") or []):
+        f, t = _date_str(el.get("from_date")), _date_str(el.get("to_date"))
+        if f and t:
+            try:
+                if datetime.strptime(f, "%Y-%m-%d").date() <= today <= datetime.strptime(t, "%Y-%m-%d").date():
+                    return True
+            except Exception:
+                pass
+    return False
 
 
 def is_manager_on_leave(manager):
@@ -197,6 +221,42 @@ def manager_month_status(manager, month, settings=None):
     else:
         status = "In Progress"
     return status, completed, pending, len(team)
+
+
+def team_roster(manager, month, settings=None):
+    """FRD §10 — 'View the employees affected by the block': the manager's
+    resolved team for `month`, each with their individual review status, so
+    HR/Admin can see exactly who a block/unblock touches, not just a count."""
+    settings = settings if settings is not None else get_settings()
+    team = team_for_manager(manager, settings)
+    if not team:
+        return []
+
+    oids = [ObjectId(i) for i in team]
+    people = {str(u["_id"]): u for u in users_col.find({"_id": {"$in": oids}}, {"name": 1, "department": 1})}
+    reviews_by_uid = {
+        r["user_id"]: r.get("status")
+        for r in pms_reviews_col.find({"user_id": {"$in": list(team)}, "month": month}, {"user_id": 1, "status": 1})
+    }
+
+    roster = []
+    for uid in team:
+        u = people.get(uid, {})
+        review_status = reviews_by_uid.get(uid)
+        if review_status == "Manager Review Completed":
+            label = "Completed"
+        elif review_status:
+            label = "Pending"
+        else:
+            label = "Not Assigned"
+        roster.append({
+            "employee_id": uid,
+            "name": u.get("name", ""),
+            "department": _dept_label(u),
+            "review_status": label,
+        })
+    roster.sort(key=lambda r: r["name"])
+    return roster
 
 
 # ── State transitions (each upserts the record + writes the audit trail) ────

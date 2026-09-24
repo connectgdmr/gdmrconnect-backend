@@ -73,6 +73,28 @@ def get_pms_compliance():
     }), 200
 
 
+@bp.route("/api/admin/pms-compliance/<manager_id>/team", methods=["GET"])
+@token_required
+def get_pms_compliance_team(manager_id):
+    """FRD §10 — 'View the employees affected by the block' for one manager+month."""
+    if not _authorized():
+        return jsonify({"message": "Unauthorized"}), 403
+
+    month = request.args.get("month") or datetime.now(IST).strftime("%Y-%m")
+    try:
+        manager = users_col.find_one({"_id": ObjectId(manager_id)})
+    except Exception:
+        return jsonify({"message": "Invalid manager ID"}), 400
+    if not manager:
+        return jsonify({"message": "Manager not found"}), 404
+
+    return jsonify({
+        "manager": manager.get("name", ""),
+        "month": month,
+        "roster": pc.team_roster(manager, month),
+    }), 200
+
+
 @bp.route("/api/admin/pms-compliance/settings", methods=["GET"])
 @token_required
 def get_pms_compliance_settings():
