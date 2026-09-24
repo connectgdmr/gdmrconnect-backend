@@ -31,6 +31,18 @@ def _serialize_record(rec):
     override = rec.get("override") or {}
     override_active = bool(override.get("active"))
     blocked = bool(rec.get("blocked")) and not override_active
+
+    # "Completed" is technically correct here (compliance = finalize whatever
+    # was submitted, and nothing has been submitted yet), but it reads as a
+    # false positive next to "0 / 0" on the dashboard — no PMS form has even
+    # been assigned to this manager's team for the month. Display-only
+    # relabel; the stored status (used by the scheduler/auto-unblock logic)
+    # is untouched.
+    review_status = rec.get("status", "Pending")
+    if review_status == "Completed" and rec.get("team_size", 0) > 0 \
+            and rec.get("reviews_completed", 0) == 0 and rec.get("reviews_pending", 0) == 0:
+        review_status = "Not Started"
+
     return {
         "manager_id":          rec.get("manager_id"),
         "manager":             rec.get("manager_name", ""),
@@ -39,7 +51,7 @@ def _serialize_record(rec):
         "team_strength":       rec.get("team_size", 0),
         "reviews_completed":   rec.get("reviews_completed", 0),
         "reviews_pending":     rec.get("reviews_pending", 0),
-        "review_status":       rec.get("status", "Pending"),
+        "review_status":       review_status,
         "attendance_status":   "Blocked" if blocked else "Active",
         "block_date":          rec.get("blocked_at"),
         "last_reminder_sent":  rec.get("overdue_notice_sent_at") or rec.get("first_warning_sent_at"),

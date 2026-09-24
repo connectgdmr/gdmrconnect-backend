@@ -18,7 +18,7 @@ from database import (
 )
 from decorators import token_required
 from extensions import bcrypt
-from helpers import _is_admin, _mgr_depts, _serialize_emp_status, parse_employment_type, _has_module_grant, is_offboarded
+from helpers import _is_admin, _mgr_depts, _serialize_emp_status, parse_employment_type, _has_module_grant, is_offboarded, _team_ids_incl_dept_head
 from utils import send_email, generate_random_password
 from config import IST
 
@@ -634,8 +634,20 @@ def set_dept_work_types(dept_name):
 def manager_my_employees():
     if request.user.get("role") != "manager":
         return jsonify({"message": "Unauthorized"}), 403
+    # Was a plain department-string match restricted to role "employee" —
+    # missed direct reports (manager_id) and department-headship, the same
+    # gap _team_ids_incl_dept_head() was built to close everywhere else this
+    # session (leave/asset/PMS approvals). Left this one endpoint stale,
+    # which is why the PMS "Assign to Employees" picker came up empty for
+    # managers whose team isn't a plain department-string overlap.
+    try:
+        team_oids = [ObjectId(i) for i in _team_ids_incl_dept_head(request.user)]
+    except Exception:
+        team_oids = []
     rows = []
-    for u in users_col.find({"department": {"$in": _mgr_depts(request.user)}, "role": "employee"}, {"password": 0}):
+    for u in users_col.find({"_id": {"$in": team_oids}}, {"password": 0}):
+        if is_offboarded(u):
+            continue
         u["_id"] = str(u["_id"])
         rows.append(u)
     return jsonify(rows), 200
