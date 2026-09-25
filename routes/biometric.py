@@ -53,6 +53,22 @@ def _verify_to_method(verify_field):
     return "face" if v in (2, 9, 15) else "fingerprint"
 
 
+# A device pushes to us — it can't be pinged/reached on demand from here (no
+# inbound connection to an office-LAN device from the cloud). "Active" means
+# it's checked in with us recently — anything within a normal heartbeat
+# cycle counts; past that, treat it as gone quiet even if it once connected.
+ONLINE_THRESHOLD_MINUTES = 15
+
+
+def _is_recently_active(last_seen_at):
+    if not last_seen_at:
+        return False
+    if last_seen_at.tzinfo is None:
+        last_seen_at = last_seen_at.replace(tzinfo=timezone.utc)
+    minutes_ago = (datetime.now(timezone.utc) - last_seen_at).total_seconds() / 60
+    return minutes_ago <= ONLINE_THRESHOLD_MINUTES
+
+
 # =============================================================================
 # Device-facing: ADMS protocol
 # No @token_required — a physical device can't hold a login token. Trust is
@@ -200,6 +216,11 @@ def _serialize_device(d):
         "serial_number":  d.get("serial_number", ""),
         "status":         d.get("status", "pending"),
         "last_seen_at":   d.get("last_seen_at"),
+        # Connected = has completed the initial handshake at least once.
+        # Active = actually heard from within the last ONLINE_THRESHOLD_MINUTES —
+        # a device can be "connected" but gone quiet (powered off, lost
+        # network) without ever flipping back to pending.
+        "is_active":      d.get("status") == "connected" and _is_recently_active(d.get("last_seen_at")),
         "mapped_count":   mapped,
         "unmapped_count": total - mapped,
     }
@@ -263,13 +284,6 @@ def delete_biometric_device(device_id):
     return jsonify({"message": "Device removed. Existing attendance history is unaffected."}), 200
 
 
-# A device pushes to us — it can't be pinged/reached on demand from here (no
-# inbound connection to an office-LAN device from the cloud). "Testing" a
-# connection honestly means: how recently did we actually hear from it.
-# Anything within a normal heartbeat cycle counts as online.
-ONLINE_THRESHOLD_MINUTES = 15
-
-
 @bp.route("/api/admin/biometric-devices/<device_id>/test", methods=["POST"])
 @token_required
 def test_biometric_device(device_id):
@@ -292,8 +306,8 @@ def test_biometric_device(device_id):
 
     if last_seen.tzinfo is None:
         last_seen = last_seen.replace(tzinfo=timezone.utc)
-    minutes_ago = (datetime.now(timezone.utc) - last_seen).total_seconds() / 60
-    online = minutes_ago <= ONLINE_THRESHOLD_MINUTES
+    online       = _is_recently_active(last_seen)
+    minutes_ago  = (datetime.now(timezone.utc) - last_seen).total_seconds() / 60
 
     if online:
         message = f"Online — last heard from this device {int(minutes_ago)} minute(s) ago."
@@ -336,6 +350,13 @@ def list_device_enrollments(device_id):
 @bp.route("/api/admin/biometric-devices/<device_id>/enrollments/<pin>/map", methods=["POST"])
 @token_required
 def map_device_enrollment(device_id, pin):
+    """Links (device_id, pin) to an employee. Works both ways round: the
+    device already reported this pin as an unmapped local enrollment
+    (routes/biometric.py's OPERLOG handler upserted a placeholder — the
+    normal flow, from the Biometric Devices tab), OR an Admin is
+    pre-declaring the link from the employee's own profile before anyone's
+    stood at the device yet (upsert=True) — the moment that pin's first
+    punch arrives, it resolves to this employee immediately."""
     if not _authorized(write=True):
         return jsonify({"message": "Unauthorized"}), 403
     data        = request.json or {}
@@ -346,14 +367,47 @@ def map_device_enrollment(device_id, pin):
         ObjectId(employee_id)
     except Exception:
         return jsonify({"message": "Invalid employee id."}), 400
+    try:
+        device = biometric_devices_col.find_one({"_id": ObjectId(device_id)})
+    except Exception:
+        device = None
+    if not device:
+        return jsonify({"message": "Device not found."}), 404
 
-    res = biometric_enrollments_col.update_one(
+    biometric_enrollments_col.update_one(
         {"device_id": device_id, "device_pin": pin},
-        {"$set": {"employee_id": employee_id, "mapped_at": datetime.now(timezone.utc), "mapped_by": str(request.user["_id"])}},
+        {
+            "$set": {"employee_id": employee_id, "mapped_at": datetime.now(timezone.utc), "mapped_by": str(request.user["_id"])},
+            "$setOnInsert": {"device_id": device_id, "device_pin": pin, "biometric_type": data.get("biometric_type", "fingerprint"), "device_reported_name": None},
+        },
+        upsert=True,
     )
-    if res.matched_count == 0:
-        return jsonify({"message": "This device user was not found."}), 404
     return jsonify({"message": "Linked successfully."}), 200
+
+
+@bp.route("/api/admin/biometric-devices/enrollments/by-employee/<employee_id>", methods=["GET"])
+@token_required
+def list_employee_biometrics(employee_id):
+    """Every device+pin this employee is linked to, across every device —
+    backs the "Add Biometrics" action on an employee's profile, so it can
+    show what's already linked before offering to add another."""
+    if not _authorized():
+        return jsonify({"message": "Unauthorized"}), 403
+    rows = list(biometric_enrollments_col.find({"employee_id": employee_id}))
+    device_ids = []
+    for r in rows:
+        try:
+            device_ids.append(ObjectId(r["device_id"]))
+        except Exception:
+            pass
+    device_map = {str(d["_id"]): d.get("name", "Unknown") for d in biometric_devices_col.find({"_id": {"$in": device_ids}}, {"name": 1})}
+
+    return jsonify([{
+        "device_id":     r.get("device_id"),
+        "device_name":   device_map.get(r.get("device_id"), "Unknown device"),
+        "device_pin":    r.get("device_pin"),
+        "biometric_type": r.get("biometric_type", "fingerprint"),
+    } for r in rows]), 200
 
 
 @bp.route("/api/admin/biometric-devices/<device_id>/enrollments/<pin>", methods=["DELETE"])
