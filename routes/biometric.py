@@ -196,6 +196,7 @@ def _serialize_device(d):
         "_id":            device_id,
         "name":           d.get("name", ""),
         "branch":         d.get("branch", ""),
+        "model":          d.get("model", ""),
         "serial_number":  d.get("serial_number", ""),
         "status":         d.get("status", "pending"),
         "last_seen_at":   d.get("last_seen_at"),
@@ -221,6 +222,7 @@ def add_biometric_device():
     data   = request.json or {}
     name   = (data.get("name") or "").strip()
     branch = (data.get("branch") or "").strip()
+    model  = (data.get("model") or "").strip()
     serial = (data.get("serial_number") or "").strip()
     if not name or not serial:
         return jsonify({"message": "Name and serial number are required."}), 400
@@ -228,7 +230,7 @@ def add_biometric_device():
         return jsonify({"message": "A device with this serial number is already registered."}), 409
 
     doc = {
-        "name": name, "branch": branch, "serial_number": serial,
+        "name": name, "branch": branch, "model": model, "serial_number": serial,
         "status": "pending", "last_seen_at": None,
         "created_by": str(request.user["_id"]), "created_at": datetime.now(timezone.utc),
     }
@@ -259,6 +261,48 @@ def delete_biometric_device(device_id):
         return jsonify({"message": "Device not found."}), 404
     biometric_enrollments_col.delete_many({"device_id": device_id})
     return jsonify({"message": "Device removed. Existing attendance history is unaffected."}), 200
+
+
+# A device pushes to us — it can't be pinged/reached on demand from here (no
+# inbound connection to an office-LAN device from the cloud). "Testing" a
+# connection honestly means: how recently did we actually hear from it.
+# Anything within a normal heartbeat cycle counts as online.
+ONLINE_THRESHOLD_MINUTES = 15
+
+
+@bp.route("/api/admin/biometric-devices/<device_id>/test", methods=["POST"])
+@token_required
+def test_biometric_device(device_id):
+    if not _authorized():
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        oid = ObjectId(device_id)
+    except Exception:
+        return jsonify({"message": "Invalid device id."}), 400
+    device = biometric_devices_col.find_one({"_id": oid})
+    if not device:
+        return jsonify({"message": "Device not found."}), 404
+
+    last_seen = device.get("last_seen_at")
+    if not last_seen:
+        return jsonify({
+            "online": False, "last_seen_at": None,
+            "message": "This device has never contacted GDMR Connect yet. Double-check the Cloud Server Address/Port saved on the device, and that it has network access.",
+        }), 200
+
+    if last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=timezone.utc)
+    minutes_ago = (datetime.now(timezone.utc) - last_seen).total_seconds() / 60
+    online = minutes_ago <= ONLINE_THRESHOLD_MINUTES
+
+    if online:
+        message = f"Online — last heard from this device {int(minutes_ago)} minute(s) ago."
+    else:
+        hours_ago = minutes_ago / 60
+        when = f"{int(hours_ago)} hour(s) ago" if hours_ago >= 1 else f"{int(minutes_ago)} minute(s) ago"
+        message = f"Not responding recently — last heard from this device {when}. Check it's powered on and connected to the network."
+
+    return jsonify({"online": online, "last_seen_at": last_seen.isoformat(), "message": message}), 200
 
 
 @bp.route("/api/admin/biometric-devices/<device_id>/enrollments", methods=["GET"])
