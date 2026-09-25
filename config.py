@@ -40,6 +40,10 @@ GROQ_MODEL   = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 OWNER_EMAILS  = ["gina.gdmr@gmail.com", "githi@gdmrfoundation.com"]
 HR_EMAIL      = "hr@gdmrfoundation.com"
 DASHBOARD_URL = "https://www.gdmrconnect.com"
+# The backend's own public URL — shown to Admin as the "Cloud Server
+# Address" to type into a biometric device's on-screen menu (routes/biometric.py).
+# Same host the frontend already hardcodes as its API fallback (src/api.jsx).
+BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "https://gdmrconnect-backend-production.up.railway.app")
 
 # ── File uploads ──────────────────────────────────────────────────────────────
 UPLOAD_FOLDER = "uploads/attendance_photos"

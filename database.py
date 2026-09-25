@@ -60,6 +60,16 @@ pms_compliance_audit_col = db["pms_compliance_audit"]
 # (FRD §14) — never hard-coded.
 pms_compliance_settings_col = db["pms_compliance_settings"]
 
+# ── Biometric Devices (routes/biometric.py) ────────────────────────────────────
+# One doc per physical fingerprint/face device an Admin has registered:
+# name, branch, serial_number (unique), status (pending|connected|offline),
+# last_seen_at, created_by, created_at.
+biometric_devices_col = db["biometric_devices"]
+# One doc per (device_id, device_pin) — the device's local user number,
+# mapped to a GDMR Connect employee once an Admin links it. Unmapped entries
+# (employee_id: None) are what shows up in the "map this device user" queue.
+biometric_enrollments_col = db["biometric_enrollments"]
+
 # ── Departments ───────────────────────────────────────────────────────────────
 departments_col = db["departments"]
 
@@ -218,6 +228,9 @@ try:
     pms_compliance_col.create_index([("manager_id", 1), ("month", 1)], unique=True, background=True)
     pms_compliance_audit_col.create_index([("manager_id", 1), ("month", 1), ("at", -1)], background=True)
     pms_compliance_audit_col.create_index([("at", -1)], background=True)
+    biometric_devices_col.create_index("serial_number", unique=True, background=True)
+    biometric_enrollments_col.create_index([("device_id", 1), ("device_pin", 1)], unique=True, background=True)
+    biometric_enrollments_col.create_index("employee_id", background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")

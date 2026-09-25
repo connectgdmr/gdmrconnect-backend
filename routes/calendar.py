@@ -75,11 +75,18 @@ def _month_calendar_for_employee(uid, month_str):
 
     checkin_times  = {}
     checkout_times = {}
+    checkin_methods  = {}
+    checkout_methods = {}
     for rec in attendance_col.find(
         {"user_id": uid, "type": {"$in": ["checkin", "checkout"]}, "date": {"$regex": f"^{month_str}"}},
-        {"date": 1, "time": 1, "type": 1}
+        {"date": 1, "time": 1, "type": 1, "method": 1}
     ):
-        (checkin_times if rec["type"] == "checkin" else checkout_times)[rec["date"]] = rec.get("time")
+        if rec["type"] == "checkin":
+            checkin_times[rec["date"]]   = rec.get("time")
+            checkin_methods[rec["date"]] = rec.get("method", "photo")
+        else:
+            checkout_times[rec["date"]]   = rec.get("time")
+            checkout_methods[rec["date"]] = rec.get("method", "photo")
 
     leaves = list(leaves_col.find({
         "user_id":   uid,
@@ -198,9 +205,11 @@ def _month_calendar_for_employee(uid, month_str):
             entry["holiday_name"] = holiday_names[day_str]
         if display == "present":
             if checkin_times.get(day_str):
-                entry["checkin_time"] = format_datetime_ist(checkin_times[day_str])
+                entry["checkin_time"]   = format_datetime_ist(checkin_times[day_str])
+                entry["checkin_method"] = checkin_methods.get(day_str, "photo")
             if checkout_times.get(day_str):
-                entry["checkout_time"] = format_datetime_ist(checkout_times[day_str])
+                entry["checkout_time"]   = format_datetime_ist(checkout_times[day_str])
+                entry["checkout_method"] = checkout_methods.get(day_str, "photo")
         elif display == "approved_leave":
             # Find the specific leave covering this day (leaves is normally
             # a handful of rows, not worth indexing for a per-day loop).

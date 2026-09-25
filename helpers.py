@@ -5,10 +5,11 @@ Pure utility / helper functions shared across route modules.
 No Flask application context required; safe to import at module level.
 """
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time, timezone
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 from config import IST
-from database import attendance_col, users_col, access_grants_col, holidays_col, departments_col
+from database import attendance_col, users_col, access_grants_col, holidays_col, departments_col, leaves_col
 
 
 # ── Timezone helpers ──────────────────────────────────────────────────────────
@@ -250,6 +251,217 @@ def classify_attendance_day(emp, day_str, day_checkins, leaves_by_uid, is_weeken
     if not is_weekend:
         return "absent"
     return None
+
+
+# ── Punch recording (shared by photo check-in and biometric devices) ────────
+
+def infer_punch_type(uid, date_str):
+    """'checkin' if nothing recorded yet today, 'checkout' if a checkin
+    exists but no checkout yet, None if both already exist (an extra punch —
+    the caller should treat it as a no-op). The photo flow always knows
+    which of the two it is from which button the employee tapped; a
+    biometric device only reports "this PIN was scanned at this time" with
+    no reliable checkin/checkout flag (the ADMS "Status" field's meaning
+    varies across vendors/firmware), so it infers the same way this app's
+    own one-checkin-then-one-checkout-per-day model already works."""
+    if not attendance_col.find_one({"user_id": uid, "type": "checkin", "date": date_str}):
+        return "checkin"
+    if not attendance_col.find_one({"user_id": uid, "type": "checkout", "date": date_str}):
+        return "checkout"
+    return None
+
+
+def record_attendance_punch(user, punch_time_utc, punch_type, method,
+                             photo_url=None, upload_photo=None, location=None):
+    """
+    Single source of truth for "what happens when someone punches in/out" —
+    shift-timing rules (per-shift on-time/late/half-day windows), the
+    leave/offboarded/PMS-compliance blocking gates, and the dedup-safe
+    insert into attendance_col (existing unique index on
+    (user_id, date, type); a DuplicateKeyError here means a race, not a bug).
+
+    Extracted from routes/attendance.py's checkin_photo()/checkout_photo(),
+    which now call this too, so a fingerprint/face punch (routes/biometric.py)
+    is judged by the exact same rules as a photo punch — no second copy of
+    the shift-timing logic to drift out of sync.
+
+    `punch_time_utc` drives both the shift-window check and the stored
+    "time" field — for the photo flow the route captures this once, before
+    the (sometimes slow) Cloudinary upload, so attendance reflects the
+    moment the employee actually pressed submit, not when the upload
+    finished. For a biometric device it's the device's own reported scan
+    timestamp.
+
+    `upload_photo`: an optional zero-arg callable that performs the (slow)
+    photo upload and returns its URL, or raises. Only called after every
+    other check below has passed — an out-of-window, blocked, or duplicate
+    punch never pays the upload cost, exactly like the original inline
+    checkin_photo()/checkout_photo() which validated before uploading.
+    Mutually exclusive with passing `photo_url` directly (the biometric path
+    has no photo at all, so neither is set).
+
+    Returns (ok: bool, message: str, http_status: int). ok=True with a
+    non-200 status never happens; ok=True, status=200 covers both an actual
+    insert and the "approved leave, nothing required" short-circuit.
+    """
+    if user.get("role") not in ("employee", "manager"):
+        return False, "Unauthorized", 403
+    if is_offboarded(user):
+        which = "in" if punch_type == "checkin" else "out"
+        return False, f"This employee's employment has ended. Attendance check-{which} is no longer available.", 403
+
+    # Local import: pms_compliance.py imports from this module, so importing
+    # it back at module level here would be circular — same pattern already
+    # used at every other call site of is_employee_blocked().
+    import pms_compliance as pc
+    blocked, _mgr = pc.is_employee_blocked(user)
+    if blocked:
+        return False, pc.BLOCKED_MESSAGE, 403
+
+    uid            = str(user["_id"])
+    punch_ist      = punch_time_utc.astimezone(IST)
+    current_time   = punch_ist.time()
+    employee_shift = user.get("shift", "morning")
+
+    if punch_type == "checkin":
+        if employee_shift == "night" and punch_ist.hour < 4:
+            today = (punch_ist - timedelta(days=1)).date()
+        else:
+            today = punch_ist.date()
+        today_str = str(today)
+
+        if leaves_col.find_one({"user_id": uid, "status": "Approved",
+                                 "from_date": {"$lte": today_str}, "to_date": {"$gte": today_str}}):
+            return True, "You have an approved leave for today. Attendance not required.", 200
+        if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": today_str}):
+            return False, "Already checked in!", 400
+
+        status_indicator = "Unknown"
+        day_type         = "full"
+
+        if employee_shift == "morning":
+            TIME_1000, TIME_1015, TIME_1300, TIME_1400 = time(10, 0), time(10, 15), time(13, 0), time(14, 0)
+            if current_time < TIME_1000:
+                status_indicator, day_type = "Present (On-Time)", "full"
+            elif TIME_1000 <= current_time < TIME_1015:
+                status_indicator, day_type = "Present (Late)", "full"
+            elif TIME_1015 <= current_time < TIME_1300:
+                return False, "Check-in blocked. You missed the morning window (ended 10:15 AM). Please wait until 1:00 PM for Half Day check-in.", 400
+            elif TIME_1300 <= current_time < TIME_1400:
+                status_indicator, day_type = "Half Day", "half-day"
+            else:
+                return False, "Check-in closed for the day. Marked as Absent (Full Day).", 400
+        elif employee_shift == "general":
+            TIME_0800, TIME_0900, TIME_0915 = time(8, 0), time(9, 0), time(9, 15)
+            if current_time < TIME_0800 or current_time >= TIME_0915:
+                return False, "Check-in is allowed 8:00 AM – 9:15 AM for General Shift.", 400
+            status_indicator = "Present (On-Time)" if current_time < TIME_0900 else "Present (Late)"
+            day_type = "full"
+        else:  # night shift
+            TIME_1630, TIME_1900, TIME_2000 = time(16, 30), time(19, 0), time(20, 0)
+            if current_time < TIME_1630:
+                return False, "Check-in opens at 4:30 PM for Night Shift.", 400
+            elif current_time < TIME_1900:
+                status_indicator = "Present (On-Time)"
+            elif current_time < TIME_2000:
+                status_indicator = "Present (Late)"
+            else:
+                return False, "Check-in closed for Night Shift (window ended 8:00 PM).", 400
+            day_type = "full"
+
+        if upload_photo:
+            try:
+                photo_url = upload_photo()
+            except Exception as e:
+                print("Photo upload error during check-in:", e)
+                return False, "Image upload failed. Check connection.", 500
+
+        try:
+            attendance_col.insert_one({
+                "user_id":          uid,
+                "type":             "checkin",
+                "date":             today_str,
+                "day_type":         day_type,
+                "time":             punch_time_utc,
+                "photo_url":        photo_url,
+                "status_indicator": status_indicator,
+                "location":         location,
+                "method":           method,
+            })
+        except DuplicateKeyError:
+            return False, "Already checked in!", 400
+        return True, f"Checked in successfully ({status_indicator})", 200
+
+    elif punch_type == "checkout":
+        if employee_shift == "night" and punch_ist.hour < 7:
+            today = (punch_ist - timedelta(days=1)).date()
+        else:
+            today = punch_ist.date()
+        today_str = str(today)
+
+        checkin = attendance_col.find_one({"user_id": uid, "type": "checkin", "date": today_str})
+        if not checkin:
+            return False, "You must Check-In first before Checking Out.", 400
+        if attendance_col.find_one({"user_id": uid, "type": "checkout", "date": today_str}):
+            return False, "Already checked out for today!", 400
+
+        final_day_type   = checkin.get("day_type", "full")
+        status_indicator = "On Time"
+
+        if employee_shift == "morning":
+            HALF_DAY_OUT_START, HALF_DAY_OUT_END   = time(13, 0), time(14, 0)
+            FULL_DAY_OUT_START, LATE_CHECKOUT_START = time(18, 0), time(20, 0)
+
+            checkin_dt   = utc_to_ist(checkin["time"])
+            checkin_time = checkin_dt.time()
+
+            if checkin_time < time(13, 0) and (HALF_DAY_OUT_START <= current_time <= HALF_DAY_OUT_END):
+                final_day_type = "half-day"
+                attendance_col.update_one({"_id": checkin["_id"]}, {"$set": {"day_type": "half-day"}})
+
+            if current_time > LATE_CHECKOUT_START:
+                status_indicator = "Late Checkout"
+            elif current_time < FULL_DAY_OUT_START:
+                if final_day_type == "half-day" and (HALF_DAY_OUT_START <= current_time <= HALF_DAY_OUT_END):
+                    status_indicator = "On Time"
+                else:
+                    status_indicator = "Early"
+            else:
+                status_indicator = "On Time"
+        elif employee_shift == "general":
+            if current_time < time(17, 0):
+                return False, "Check-out opens at 5:00 PM for General Shift.", 400
+            status_indicator = "Late Checkout" if current_time >= time(20, 0) else "On Time"
+        else:  # night shift
+            hour = punch_ist.hour
+            if not (hour >= 19 or hour < 7):
+                return False, "Check-out is not allowed outside your shift hours (Night Shift: 7 PM – 7 AM)", 400
+            status_indicator = "On Time"
+
+        if upload_photo:
+            try:
+                photo_url = upload_photo()
+            except Exception as e:
+                print("Photo upload error during check-out:", e)
+                return False, "Image upload failed", 500
+
+        try:
+            attendance_col.insert_one({
+                "user_id":          uid,
+                "type":             "checkout",
+                "date":             today_str,
+                "time":             punch_time_utc,
+                "photo_url":        photo_url,
+                "day_type":         final_day_type,
+                "status_indicator": status_indicator,
+                "location":         location,
+                "method":           method,
+            })
+        except DuplicateKeyError:
+            return False, "Already checked out for today!", 400
+        return True, f"Checked out successfully ({final_day_type}, {status_indicator})", 200
+
+    return False, "Invalid punch type", 400
 
 
 # ── Employment type helpers ─────────────────────────────────────────────────
