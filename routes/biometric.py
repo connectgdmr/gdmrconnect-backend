@@ -4,11 +4,12 @@ routes/biometric.py — GDMR Connect
 Biometric (fingerprint/face) attendance devices.
 
 Device-facing routes implement ADMS ("Automatic Data Master Server"), the
-push protocol ZKTeco and most other cloud-capable biometric device vendors
-speak natively — the industry-standard mechanism for a device on an office
-LAN to report to a cloud backend without a local bridge PC. The /iclock/...
-paths below are fixed by that protocol (a device's firmware isn't
-configurable beyond the server host/port), not a GDMR Connect convention.
+push protocol eSSL, ZKTeco, and most other cloud-capable biometric device
+vendors speak natively — the industry-standard mechanism for a device on an
+office LAN to report to a cloud backend without a local bridge PC. The
+/iclock/... paths below are fixed by that protocol (a device's firmware
+isn't configurable beyond the server host/port), not a GDMR Connect
+convention.
 
 "Connect" in the Admin UI = registering a device's serial number here and
 typing our server address into the device's own Cloud Server menu. "The
