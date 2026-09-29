@@ -473,12 +473,15 @@ def parse_employment_type(data):
 
     Returns (employment_type, contract_months, error_message) —
     error_message is None on success. Only Contract is stored as a record
-    only (no password / no welcome email) — Permanent and Internship both
-    get full portal login credentials.
+    only (no password / no welcome email) — Permanent, Internship and
+    Consultant all get full portal login credentials. Consultant exists so
+    daily-attendance-required rosters (e.g. the "Not Checked In" widget,
+    routes/stats.py) can exclude people who aren't expected to physically
+    check in every day, without touching the check itself.
     """
     employment_type = data.get("employment_type") or "Permanent"
-    if employment_type not in ("Permanent", "Contract", "Internship"):
-        return None, None, "employment_type must be 'Permanent', 'Contract' or 'Internship'."
+    if employment_type not in ("Permanent", "Contract", "Internship", "Consultant"):
+        return None, None, "employment_type must be 'Permanent', 'Contract', 'Internship' or 'Consultant'."
 
     contract_months = None
     if employment_type == "Contract":

@@ -10,9 +10,9 @@ from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify, send_file
 from bson import ObjectId
 
-from database import pms_templates_col, pms_reviews_col, users_col
+from database import pms_templates_col, pms_reviews_col, pms_performance_notes_col, users_col
 from decorators import token_required
-from helpers import _is_admin, _mgr_depts, _has_module_grant, _team_ids_incl_dept_head
+from helpers import _is_admin, _mgr_depts, _has_module_grant, _team_ids_incl_dept_head, is_offboarded
 from config import IST
 
 bp = Blueprint("pms", __name__)
@@ -815,3 +815,175 @@ def export_pms():
 
     output = io.BytesIO(si.getvalue().encode("utf-8"))
     return send_file(output, mimetype="text/csv", as_attachment=True, download_name=f"PMS_Report_{month}.csv")
+
+
+# =============================================================================
+# PMS Workforce Dashboard — per-employee performance overview, backs the new
+# "Dashboard" tab in PMSWorkspace (both manager and admin scope). Distinct
+# from pms_dashboard() above, which is a per-department roll-up consumed by
+# ManagerDashboard.jsx's own home-page widget — this is per-employee, and
+# nothing existing reads it, so it's additive.
+# =============================================================================
+
+def _pms_avg(values):
+    nums = []
+    for v in values:
+        try:
+            if v is not None:
+                nums.append(float(v))
+        except (TypeError, ValueError):
+            pass
+    return round(sum(nums) / len(nums), 2) if nums else None
+
+
+@bp.route("/api/pms/workforce-dashboard", methods=["GET"])
+@token_required
+def pms_workforce_dashboard():
+    role = request.user.get("role")
+    if role not in ("manager", "admin", "owner") and not _has_module_grant(request.user, "pms"):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    month = request.args.get("month", datetime.now(IST).strftime("%Y-%m"))
+
+    if role == "manager":
+        team_ids = list(_team_ids_incl_dept_head(request.user))
+    else:
+        query = {"role": {"$in": ["employee", "manager"]}}
+        dept_filter = request.args.get("department")
+        if dept_filter and dept_filter != "All":
+            query["department"] = dept_filter
+        team_ids = [str(u["_id"]) for u in users_col.find(query, {"_id": 1})]
+
+    if not team_ids:
+        return jsonify([]), 200
+
+    try:
+        oids = [ObjectId(i) for i in team_ids]
+    except Exception:
+        oids = []
+    emp_docs = {
+        str(u["_id"]): u
+        for u in users_col.find({"_id": {"$in": oids}}, {"name": 1, "department": 1, "resignation": 1})
+    }
+    team_ids = [uid for uid in team_ids if uid in emp_docs and not is_offboarded(emp_docs[uid])]
+
+    reviews_by_emp = {}
+    for r in pms_reviews_col.find({"user_id": {"$in": team_ids}, "month": month}):
+        reviews_by_emp.setdefault(r["user_id"], []).append(r)
+
+    notes_by_emp = {}
+    for n in pms_performance_notes_col.find({"employee_id": {"$in": team_ids}}):
+        bucket = notes_by_emp.setdefault(n["employee_id"], {"note": 0, "warning": 0})
+        bucket[n.get("type", "note")] = bucket.get(n.get("type", "note"), 0) + 1
+
+    rows = []
+    for uid in team_ids:
+        emp = emp_docs[uid]
+        emp_reviews = reviews_by_emp.get(uid, [])
+        completed = [r for r in emp_reviews if r.get("status") == "Manager Review Completed"]
+        self_scores, mgr_scores = [], []
+        for r in emp_reviews:
+            self_scores.extend(resp.get("self_score") for resp in r.get("responses", []))
+            mgr_scores.extend(ms.get("score") for ms in r.get("manager_scores", []))
+        latest_rating = next((r.get("overall_rating") for r in reversed(completed) if r.get("overall_rating")), None)
+        nc = notes_by_emp.get(uid, {"note": 0, "warning": 0})
+        rows.append({
+            "employee_id":       uid,
+            "name":              emp.get("name", ""),
+            "department":        emp.get("department", ""),
+            "reviews_submitted": len(emp_reviews),
+            "reviews_completed": len(completed),
+            "self_avg":          _pms_avg(self_scores),
+            "manager_avg":       _pms_avg(mgr_scores),
+            "overall_rating":    latest_rating,
+            "notes_count":       nc.get("note", 0),
+            "warnings_count":    nc.get("warning", 0),
+        })
+    rows.sort(key=lambda r: r["name"])
+    return jsonify(rows), 200
+
+
+@bp.route("/api/pms/workforce-dashboard/<employee_id>", methods=["GET"])
+@token_required
+def pms_employee_detail(employee_id):
+    """Full review history + performance notes for one employee — the
+    "detailed report" behind a Dashboard row. Same data for manager and
+    admin scope; a manager can only reach their own team's employees."""
+    role = request.user.get("role")
+    if role not in ("manager", "admin", "owner") and not _has_module_grant(request.user, "pms"):
+        return jsonify({"message": "Unauthorized"}), 403
+    if role == "manager" and employee_id not in _team_ids_incl_dept_head(request.user):
+        return jsonify({"message": "Unauthorized: this employee isn't on your team"}), 403
+
+    try:
+        emp = users_col.find_one({"_id": ObjectId(employee_id)}, {"name": 1, "department": 1})
+    except Exception:
+        emp = None
+    if not emp:
+        return jsonify({"message": "Employee not found"}), 404
+
+    reviews = list(pms_reviews_col.find({"user_id": employee_id}).sort("month", -1))
+    for r in reviews:
+        r["_id"] = str(r["_id"])
+
+    notes = list(pms_performance_notes_col.find({"employee_id": employee_id}).sort("created_at", -1))
+    for n in notes:
+        n["_id"] = str(n["_id"])
+
+    return jsonify({
+        "employee_id": employee_id,
+        "name":        emp.get("name", ""),
+        "department":  emp.get("department", ""),
+        "reviews":     reviews,
+        "notes":       notes,
+    }), 200
+
+
+@bp.route("/api/pms/performance-notes", methods=["POST"])
+@token_required
+def add_performance_note():
+    """A manager logs a performance note or a formal warning against one of
+    their team; admin/owner can log one against anyone. Visible on both the
+    manager's and admin's PMS Dashboard for that employee (same collection,
+    same GET endpoint above — nothing to keep in sync separately)."""
+    role = request.user.get("role")
+    if role not in ("manager", "admin", "owner") and not _has_module_grant(request.user, "pms", write=True):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data        = request.json or {}
+    employee_id = data.get("employee_id")
+    note_type   = data.get("type", "note")
+    text        = (data.get("text") or "").strip()
+    if not employee_id or not text:
+        return jsonify({"message": "employee_id and text are required."}), 400
+    if note_type not in ("note", "warning"):
+        return jsonify({"message": "type must be 'note' or 'warning'."}), 400
+    if role == "manager" and employee_id not in _team_ids_incl_dept_head(request.user):
+        return jsonify({"message": "Unauthorized: this employee isn't on your team"}), 403
+
+    doc = {
+        "employee_id":     employee_id,
+        "type":            note_type,
+        "text":            text,
+        "created_by":      str(request.user["_id"]),
+        "created_by_name": request.user.get("name", ""),
+        "created_at":      datetime.now(timezone.utc),
+    }
+    ins = pms_performance_notes_col.insert_one(doc)
+    return jsonify({"message": "Saved.", "_id": str(ins.inserted_id)}), 201
+
+
+@bp.route("/api/pms/performance-notes/<note_id>", methods=["DELETE"])
+@token_required
+def delete_performance_note(note_id):
+    try:
+        oid = ObjectId(note_id)
+    except Exception:
+        return jsonify({"message": "Invalid id."}), 400
+    note = pms_performance_notes_col.find_one({"_id": oid})
+    if not note:
+        return jsonify({"message": "Not found."}), 404
+    if not (_is_admin(request.user) or note.get("created_by") == str(request.user["_id"])):
+        return jsonify({"message": "Unauthorized"}), 403
+    pms_performance_notes_col.delete_one({"_id": oid})
+    return jsonify({"message": "Deleted."}), 200

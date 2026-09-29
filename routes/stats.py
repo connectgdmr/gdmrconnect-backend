@@ -31,8 +31,12 @@ def today_stats():
     # active_staff() = the canonical "non-off-boarded employee/manager" roster
     # (helpers.py) — off-boarded = notice recorded AND last working day passed,
     # the same rule every other endpoint uses.
-    active_users = active_staff({"_id": 1, "role": 1, "department": 1, "resignation": 1})
+    active_users = active_staff({"_id": 1, "role": 1, "department": 1, "resignation": 1, "employment_type": 1})
     active_ids = {str(e["_id"]) for e in active_users}
+    # Consultants aren't expected to punch in daily, so they shouldn't pad
+    # out the "Not Checked In" nag list/count — they still count everywhere
+    # else (total workforce, present, department breakdown) if they do check in.
+    not_required_ids = {str(e["_id"]) for e in active_users if (e.get("employment_type") or "Permanent") == "Consultant"}
 
     present_ids = {
         r["user_id"] for r in attendance_col.find(
@@ -59,7 +63,7 @@ def today_stats():
     all_leave_ids   = std_leave_ids | ext_leave_ids
     present_count   = len(present_ids & active_ids)
     leave_count     = len((all_leave_ids - present_ids) & active_ids)
-    not_in_count    = len(active_ids - present_ids - all_leave_ids)
+    not_in_count    = len(active_ids - present_ids - all_leave_ids - not_required_ids)
     employee_count  = sum(1 for u in active_users if u.get("role") == "employee")
     manager_count   = sum(1 for u in active_users if u.get("role") == "manager")
     by_department: dict = {}
@@ -112,8 +116,12 @@ def attendance_summary():
     # from the roster entirely — same as routes/attendance_reports.py — so
     # total_employees is the active headcount and no ex-employee name can land
     # in a day's present/absent/leave/not-checked-in list.
-    employees = active_staff({"name": 1, "doj": 1, "resignation": 1, "extended_leaves": 1})
+    employees = active_staff({"name": 1, "doj": 1, "resignation": 1, "extended_leaves": 1, "employment_type": 1})
     emp_names = {str(e["_id"]): e.get("name", "") for e in employees}
+    # Consultants aren't expected to punch in daily — they still land in
+    # Present/Leave/Absent normally, just never in the "Not Checked In" nag
+    # bucket specifically (see today_stats() above for the same rule).
+    not_required_ids = {str(e["_id"]) for e in employees if (e.get("employment_type") or "Permanent") == "Consultant"}
 
     all_recs = attendance_col.find({"date": {"$regex": f"^{month_param}"}, "type": "checkin"})
     checkins_by_date: dict = {}
@@ -152,7 +160,8 @@ def attendance_summary():
             elif status == "leave":
                 leave_ids.append(uid)
             elif status == "not_checked_in":
-                nci_ids.append(uid)
+                if uid not in not_required_ids:
+                    nci_ids.append(uid)
             elif status == "absent":
                 absent_ids.append(uid)
                 # A finalized no-show (day over, no checkin, no leave, not a
@@ -162,7 +171,8 @@ def attendance_summary():
                 # the day ends. Deliberately overlaps with Absent (still
                 # what LOP/payroll reads, unchanged) rather than being
                 # spun off into its own separate headcount bucket.
-                nci_ids.append(uid)
+                if uid not in not_required_ids:
+                    nci_ids.append(uid)
             # status is None: not yet joined / already offboarded / weekend with nothing recorded — no bucket
 
         def _names(ids):

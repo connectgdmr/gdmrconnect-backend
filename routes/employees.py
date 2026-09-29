@@ -10,6 +10,7 @@ import cloudinary.uploader
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 
 from database import (
     users_col, access_grants_col, attendance_col, leaves_col,
@@ -157,6 +158,23 @@ def register_manager():
     return jsonify({"message": "Manager created successfully!"}), 201
 
 
+_EMPLOYEE_CODE_RE = re.compile(r"^GDMR-(\d+)$")
+
+
+def _next_employee_code():
+    """GDMR-001, GDMR-002, ... — scans existing codes rather than keeping a
+    counter doc, since employee creation is a low-frequency admin action (not
+    worth the extra moving part for this volume). The unique sparse index on
+    employee_code (database.py) is the real safety net against a race; the
+    caller retries on DuplicateKeyError."""
+    highest = 0
+    for doc in users_col.find({"employee_code": {"$regex": _EMPLOYEE_CODE_RE}}, {"employee_code": 1}):
+        m = _EMPLOYEE_CODE_RE.match(doc["employee_code"])
+        if m:
+            highest = max(highest, int(m.group(1)))
+    return f"GDMR-{highest + 1:03d}"
+
+
 @bp.route("/api/admin/employees", methods=["POST"])
 @token_required
 def add_employee():
@@ -174,7 +192,6 @@ def add_employee():
     doj           = data.get("doj", "")
     confirmation_date = data.get("confirmation_date", "")
     promotion_date    = data.get("promotion_date", "")
-    employee_code = (data.get("employee_code") or "").strip()
 
     if not name or not email:
         return jsonify({"message": "Name and Email are required."}), 400
@@ -194,7 +211,7 @@ def add_employee():
         "password_changed": False, "role": "employee",
         "department": department, "position": position, "location": location, "doj": doj,
         "confirmation_date": confirmation_date, "promotion_date": promotion_date,
-        "employee_code": employee_code, "created_at": datetime.now(timezone.utc),
+        "created_at": datetime.now(timezone.utc),
         "manager_id": manager_id, "shift": shift,
         "late_checkin_count_monthly": 0, "last_late_checkin_month": None,
         "employment_type": employment_type, "contract_months": contract_months,
@@ -207,7 +224,19 @@ def add_employee():
         password = generate_random_password()
         user_doc["password"] = bcrypt.generate_password_hash(password).decode("utf-8")
 
-    res = users_col.insert_one(user_doc)
+    # Auto-generated (GDMR-001, GDMR-002, ...) — no longer a manual admin
+    # field. The unique index on employee_code is the actual guarantee
+    # against a collision (two admins saving at nearly the same moment);
+    # _next_employee_code() re-scans and retries on that rare race.
+    for _attempt in range(5):
+        user_doc["employee_code"] = _next_employee_code()
+        try:
+            res = users_col.insert_one(user_doc)
+            break
+        except DuplicateKeyError:
+            continue
+    else:
+        return jsonify({"message": "Could not allocate an Employee ID — please try again."}), 500
 
     if employment_type != "Contract":
         subject = "Welcome to GDMR Connect: Your New Account Credentials"
@@ -663,13 +692,15 @@ def edit_employee(emp_id):
     data   = request.json
     update = {}
     for k in ["name", "department", "position", "location", "email", "phone", "manager_id", "shift", "doj", "employee_code",
-              "confirmation_date", "promotion_date"]:
+              "confirmation_date", "promotion_date", "employment_type"]:
         if k in data:
             update[k] = data[k]
     if "manager_id" in data and not data["manager_id"]:
         update["manager_id"] = None
     if "shift" in update and update["shift"] not in ("morning", "night", "general"):
         return jsonify({"message": "Invalid shift value. Must be 'morning', 'night', or 'general'."}), 400
+    if "employment_type" in update and update["employment_type"] not in ("Permanent", "Contract", "Internship", "Consultant"):
+        return jsonify({"message": "Invalid employment_type. Must be 'Permanent', 'Contract', 'Internship' or 'Consultant'."}), 400
     if update:
         users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": update})
     return jsonify({"message": "Employee profile updated successfully."}), 200

@@ -49,6 +49,10 @@ assets_col        = db["assets"]
 # ── PMS ───────────────────────────────────────────────────────────────────────
 pms_templates_col = db["pms_templates"]
 pms_reviews_col   = db["pms_reviews"]
+# One doc per HR note/warning logged against an employee: employee_id, type
+# ("note"|"warning"), text, created_by, created_by_name, created_at. Visible
+# on both the manager's and admin's PMS Dashboard for that employee.
+pms_performance_notes_col = db["pms_performance_notes"]
 
 # ── PMS Compliance & Attendance Blocking (pms_compliance.py) ──────────────────
 # One doc per (manager_id, month): review-completion status for that manager's
@@ -169,11 +173,43 @@ try:
 except Exception as _att_dupe_err:
     print(f"Warning: attendance dedupe migration failed: {_att_dupe_err}")
 
+# employee_code is about to get a unique sparse index (auto-generated
+# "GDMR-###" ids). It's been an optional, unvalidated free-text field until
+# now, so existing data can have blank ("") codes on many employees, or two
+# employees sharing the same typed-in code — a unique index build fails
+# outright over either, silently skipping the index forever (and, since
+# index creation below is one shared try/except, aborting every index
+# listed after it). Same "clean the data before the unique index" pattern
+# as the attendance-dedupe migration above: blank codes become truly
+# missing (which a *sparse* index ignores), and only the first doc in any
+# duplicate-code group keeps its code — same low-stakes tradeoff as
+# attendance's "keep the first" for an accidental duplicate.
+try:
+    users_col.update_many({"employee_code": ""}, {"$unset": {"employee_code": ""}})
+    _emp_dupe_groups = list(users_col.aggregate([
+        {"$match": {"employee_code": {"$exists": True, "$ne": ""}}},
+        {"$group": {"_id": "$employee_code", "ids": {"$push": "$_id"}, "count": {"$sum": 1}}},
+        {"$match": {"count": {"$gt": 1}}},
+    ]))
+    _emp_fixed = 0
+    for _g in _emp_dupe_groups:
+        for _uid in sorted(_g["ids"], key=str)[1:]:
+            users_col.update_one({"_id": _uid}, {"$unset": {"employee_code": ""}})
+            _emp_fixed += 1
+    if _emp_fixed:
+        print(f"Startup migration: cleared employee_code on {_emp_fixed} duplicate-coded user(s).")
+except Exception as _emp_code_err:
+    print(f"Warning: employee_code dedupe migration failed: {_emp_code_err}")
+
 # ── Indexes (background=True — no write-lock) ─────────────────────────────────
 try:
     users_col.create_index("email", background=True)
     users_col.create_index("role", background=True)
     users_col.create_index("department", background=True)
+    # sparse: legacy employees with no code (or a blank one) shouldn't collide
+    # with each other under a unique index — only real, non-empty codes are
+    # constrained to be unique.
+    users_col.create_index("employee_code", unique=True, sparse=True, background=True)
     # unique: the real fix for the duplicate-punch race above — the
     # check-then-insert gap in checkin_photo()/checkout_photo() can no
     # longer let two rows through no matter how the two requests interleave,
@@ -231,6 +267,7 @@ try:
     biometric_devices_col.create_index("serial_number", unique=True, background=True)
     biometric_enrollments_col.create_index([("device_id", 1), ("device_pin", 1)], unique=True, background=True)
     biometric_enrollments_col.create_index("employee_id", background=True)
+    pms_performance_notes_col.create_index([("employee_id", 1), ("created_at", -1)], background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
