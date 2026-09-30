@@ -321,6 +321,32 @@ def share_pms_with_admin(review_id):
     return jsonify({"message": "Shared with Admin."}), 200
 
 
+@bp.route("/api/manager/pms/<review_id>", methods=["DELETE"])
+@token_required
+def delete_pms_review(review_id):
+    """Permanently removes a review (self-assessment + any manager scoring)
+    — same authorization as finalizing one: a manager may only delete a
+    review from their own team, admin/owner can delete any. The employee
+    keeps their assigned template and can resubmit if it's re-opened
+    (recurring cycle, or the same one-off form)."""
+    if request.user.get("role") not in ("manager", "admin", "owner") \
+            and not _has_module_grant(request.user, "pms", write=True):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        oid = ObjectId(review_id)
+    except Exception:
+        return jsonify({"message": "Invalid review ID"}), 400
+
+    review = pms_reviews_col.find_one({"_id": oid})
+    if not review:
+        return jsonify({"message": "Review not found"}), 404
+    if request.user.get("role") == "manager" and review.get("user_id") not in _team_ids_incl_dept_head(request.user):
+        return jsonify({"message": "Unauthorized — this employee isn't on your team."}), 403
+
+    pms_reviews_col.delete_one({"_id": oid})
+    return jsonify({"message": "Review deleted."}), 200
+
+
 @bp.route("/api/manager/pms/<review_id>/share-with-manager", methods=["POST"])
 @token_required
 def share_pms_with_manager(review_id):
