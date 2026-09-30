@@ -12,7 +12,7 @@ from bson import ObjectId
 
 from database import pms_templates_col, pms_reviews_col, pms_performance_notes_col, users_col
 from decorators import token_required
-from helpers import _is_admin, _mgr_depts, _has_module_grant, _team_ids_incl_dept_head, is_offboarded
+from helpers import _is_admin, _mgr_depts, _has_module_grant, _team_ids_incl_dept_head, is_offboarded, active_staff
 from config import IST
 
 bp = Blueprint("pms", __name__)
@@ -722,9 +722,24 @@ def pms_dashboard():
     else:
         departments = users_col.distinct("department")
 
+    # Same headcount rule as the Departments tab (AdminDepartments.jsx):
+    # every non-offboarded employee/manager whose department field matches,
+    # department read as either a plain string or (for a multi-department
+    # head) a list — not just role="employee", and not counting anyone
+    # who's off-boarded. Counting document-count({"department": d, "role":
+    # "employee"}) directly (the old query) both excluded managers/department
+    # heads and included off-boarded staff, so this page's headcount could
+    # read higher than the Departments tab's for the exact same department.
+    dept_member_count: dict = {}
+    for u in active_staff({"_id": 1, "department": 1}):
+        dept_val = u.get("department")
+        depts = dept_val if isinstance(dept_val, list) else ([dept_val] if dept_val else [])
+        for dn in depts:
+            dept_member_count[dn] = dept_member_count.get(dn, 0) + 1
+
     for d in departments:
         if d:
-            total_emps = users_col.count_documents({"department": d, "role": "employee"})
+            total_emps = dept_member_count.get(d, 0)
             dashboard_data[d] = {"total_employees": total_emps, "completed_pms": 0, "total_score": 0, "avg_score": 0}
 
     review_query = {"month": month, "status": "Manager Review Completed", "department": {"$in": departments}}
