@@ -371,22 +371,21 @@ def share_pms_with_manager(review_id):
 @token_required
 def get_admin_pms():
     """
-    Admin's PMS page: every review admin/owner built themselves (always
-    visible to them, regardless of shared_with_admin) plus every manager-owned
-    review that's been explicitly shared (manager clicked "Share with Admin").
-    NOT department-scoped like /api/manager/pms — deliberately org-wide, since
-    Admin's page groups by department on the client instead.
+    Admin's PMS page: every review org-wide, full stop — admin/owner outranks
+    the manager/employee "Share with Admin" privacy flag rather than being
+    gated by it. shared_with_admin still gets set when a manager explicitly
+    shares (and still drives what shows on the *manager's* calibration view,
+    unchanged), but it no longer filters what Admin can see or score here —
+    Admin needs every submitted answer and the ability to mark/finalize any
+    manager's score, not just what's been handed to them. NOT department-
+    scoped like /api/manager/pms — deliberately org-wide, since Admin's page
+    groups by department on the client instead.
     """
     if request.user.get("role") not in ("admin", "owner") \
             and not _has_module_grant(request.user, "pms"):
         return jsonify({"message": "Unauthorized"}), 403
 
-    reviews = list(pms_reviews_col.find({
-        "$or": [
-            {"shared_with_admin": True},
-            {"owner_role": {"$in": ["admin", "owner"]}},
-        ]
-    }).sort("self_assessment_date", -1))
+    reviews = list(pms_reviews_col.find({}).sort("self_assessment_date", -1))
     uids    = []
     for r in reviews:
         try:
@@ -422,15 +421,9 @@ def pms_calibration():
             ],
         }
     else:
-        # Admin/owner calibration is scoped to what's actually visible on their
-        # PMS page (own reviews, or manager-shared), same rule as GET /api/admin/pms.
-        query = {
-            "month": month,
-            "$or": [
-                {"shared_with_admin": True},
-                {"owner_role": {"$in": ["admin", "owner"]}},
-            ],
-        }
+        # Admin/owner calibration is org-wide, same as GET /api/admin/pms —
+        # not gated by shared_with_admin.
+        query = {"month": month}
 
     reviews = list(pms_reviews_col.find(query))
     uids    = []
@@ -774,12 +767,7 @@ def pms_dashboard():
             {"owner_role": {"$nin": ["admin", "owner"]}},
             {"shared_with_manager": True},
         ]
-    else:
-        # Admin/owner dashboard is scoped to what's visible on their PMS page.
-        review_query["$or"] = [
-            {"shared_with_admin": True},
-            {"owner_role": {"$in": ["admin", "owner"]}},
-        ]
+    # Admin/owner dashboard is org-wide — not gated by shared_with_admin.
 
     def _to_num(v):
         try:
@@ -822,12 +810,8 @@ def export_pms():
             {"owner_role": {"$nin": ["admin", "owner"]}},
             {"shared_with_manager": True},
         ]
-    else:
-        # Admin/owner export is scoped to what's visible on their PMS page.
-        query["$or"] = [
-            {"shared_with_admin": True},
-            {"owner_role": {"$in": ["admin", "owner"]}},
-        ]
+    # Admin/owner export is org-wide — same as GET /api/admin/pms, not
+    # gated by shared_with_admin.
 
     si = io.StringIO()
     cw = csv.writer(si)
