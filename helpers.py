@@ -502,6 +502,41 @@ def _is_admin(user):
     return user.get("role") in ("admin", "owner")
 
 
+# ── Employee Lock ────────────────────────────────────────────────────────────
+
+def is_employee_locked(emp_doc):
+    """True once an Admin/Owner has locked this employee's profile (routes/
+    employees.py's lock/unlock endpoints). Locked state lives directly on the
+    employee's own users_col doc, not a side table."""
+    return bool((emp_doc or {}).get("locked"))
+
+
+def redact_locked_employee(emp_doc, viewer):
+    """A locked employee's Documents + email/phone are off-limits to anyone
+    who isn't true Admin/Owner — including someone holding a delegated
+    "employees" Grant Access, which is exactly who this exists to stop
+    (_has_module_grant has no concept of "except this one employee", so the
+    override has to happen here, after the normal grant check already let
+    the caller into list_employees()).
+
+    Returns a shallow copy with the sensitive fields blanked and
+    `locked_info_redacted: True` set, so the frontend can render an explicit
+    "restricted" placeholder instead of rendering blank fields as if the
+    employee simply has no email/phone/documents. Non-locked employees, and
+    any viewer who is Admin/Owner, get the doc back unchanged (but every
+    employee doc gets an explicit `locked: bool` either way, so the lock
+    badge itself is visible to everyone, not just the gated content).
+    """
+    out = dict(emp_doc or {})
+    out["locked"] = is_employee_locked(out)
+    if out["locked"] and not _is_admin(viewer):
+        out["email"] = None
+        out["phone"] = None
+        out["documents"] = []
+        out["locked_info_redacted"] = True
+    return out
+
+
 def _dept_list(val):
     """Normalize a raw department field value (plain string, OR a list for
     a manager who heads more than one department) into a flat, non-empty

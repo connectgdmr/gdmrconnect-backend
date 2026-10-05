@@ -16,10 +16,14 @@ from database import (
     users_col, access_grants_col, attendance_col, leaves_col,
     pms_reviews_col, corrections_col, departments_col, ats_candidates_col,
     assets_col, pms_templates_col, lms_courses_col, clients_col,
+    employee_lock_audit_col,
 )
 from decorators import token_required
 from extensions import bcrypt
-from helpers import _is_admin, _mgr_depts, _serialize_emp_status, parse_employment_type, _has_module_grant, is_offboarded, _team_ids_incl_dept_head
+from helpers import (
+    _is_admin, _mgr_depts, _serialize_emp_status, parse_employment_type, _has_module_grant,
+    is_offboarded, _team_ids_incl_dept_head, is_employee_locked, redact_locked_employee,
+)
 from utils import send_email, generate_random_password
 from config import IST
 
@@ -318,7 +322,12 @@ def list_employees():
         u["manager_name"] = managers.get(manager_id) if manager_id else None
         u.setdefault("shift", "morning")
         _serialize_emp_status(u)
-        rows.append(u)
+        # Documents + email/phone are stripped here (not just hidden by the
+        # frontend) for anyone short of true Admin/Owner once this employee
+        # is locked — a delegate's module grant above got them into this
+        # endpoint, but it has no per-employee concept, so the lock override
+        # has to happen per-row, here.
+        rows.append(redact_locked_employee(u, request.user))
 
     return jsonify(rows), 200
 
@@ -689,6 +698,9 @@ def manager_my_employees():
 def edit_employee(emp_id):
     if not (_is_admin(request.user) or _has_module_grant(request.user, "employees", write=True)):
         return jsonify({"message": "Unauthorized"}), 403
+    blocked = _reject_if_locked(ObjectId(emp_id), request.user)
+    if blocked:
+        return blocked
     data   = request.json
     update = {}
     for k in ["name", "department", "position", "location", "email", "phone", "manager_id", "shift", "doj", "employee_code",
@@ -704,6 +716,79 @@ def edit_employee(emp_id):
     if update:
         users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": update})
     return jsonify({"message": "Employee profile updated successfully."}), 200
+
+
+# ── Employee Lock ────────────────────────────────────────────────────────────
+# Admin/Owner only, deliberately never _has_module_grant — a delegate must
+# never be able to lock or unlock an employee, or the control is meaningless.
+
+def _write_lock_audit(action, emp, actor, reason):
+    employee_lock_audit_col.insert_one({
+        "action":        action,
+        "employee_id":   str(emp["_id"]),
+        "employee_name": emp.get("name", ""),
+        "actor_id":      str(actor["_id"]),
+        "actor_name":    actor.get("name", ""),
+        "reason":        reason,
+        "at":            datetime.now(timezone.utc),
+    })
+
+
+@bp.route("/api/admin/employees/<emp_id>/lock", methods=["POST"])
+@token_required
+def lock_employee(emp_id):
+    if not _is_admin(request.user):
+        return jsonify({"message": "Unauthorized — only Admin/Owner can lock an employee's profile."}), 403
+    try:
+        obj = ObjectId(emp_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    emp = users_col.find_one({"_id": obj})
+    if not emp:
+        return jsonify({"message": "Employee not found"}), 404
+
+    reason = (request.json or {}).get("reason", "").strip() if request.json else ""
+    users_col.update_one({"_id": obj}, {"$set": {
+        "locked":         True,
+        "locked_at":      datetime.now(timezone.utc),
+        "locked_by":      str(request.user["_id"]),
+        "locked_by_name": request.user.get("name", ""),
+        "lock_reason":    reason,
+    }})
+    _write_lock_audit("lock", emp, request.user, reason)
+    return jsonify({"message": f"{emp.get('name', 'Employee')}'s profile is now locked."}), 200
+
+
+@bp.route("/api/admin/employees/<emp_id>/unlock", methods=["POST"])
+@token_required
+def unlock_employee(emp_id):
+    if not _is_admin(request.user):
+        return jsonify({"message": "Unauthorized — only Admin/Owner can unlock an employee's profile."}), 403
+    try:
+        obj = ObjectId(emp_id)
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    emp = users_col.find_one({"_id": obj})
+    if not emp:
+        return jsonify({"message": "Employee not found"}), 404
+
+    reason = (request.json or {}).get("reason", "").strip() if request.json else ""
+    users_col.update_one({"_id": obj}, {"$unset": {
+        "locked": "", "locked_at": "", "locked_by": "", "locked_by_name": "", "lock_reason": "",
+    }})
+    _write_lock_audit("unlock", emp, request.user, reason)
+    return jsonify({"message": f"{emp.get('name', 'Employee')}'s profile is now unlocked."}), 200
+
+
+@bp.route("/api/admin/employees/<emp_id>/lock-audit", methods=["GET"])
+@token_required
+def employee_lock_audit(emp_id):
+    if not _is_admin(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    rows = list(employee_lock_audit_col.find({"employee_id": emp_id}).sort("at", -1).limit(100))
+    for r in rows:
+        r["_id"] = str(r["_id"])
+    return jsonify(rows), 200
 
 
 # ── Employee documents (personal file: resume, ID proof, certificates, etc.) ──
@@ -741,6 +826,19 @@ def _upload_employee_doc_file(file, emp_id):
     return url
 
 
+def _reject_if_locked(emp_obj_id, actor):
+    """None if the actor may proceed; otherwise the 403 response tuple to
+    return immediately. True Admin/Owner always passes — a locked employee's
+    record (documents, edits, status/promote/delete) is off-limits to
+    everyone else while locked, delegated Grant Access included."""
+    if _is_admin(actor):
+        return None
+    target = users_col.find_one({"_id": emp_obj_id}, {"locked": 1})
+    if target and is_employee_locked(target):
+        return jsonify({"message": "This employee's profile is locked — contact an Admin."}), 403
+    return None
+
+
 @bp.route("/api/admin/employees/<emp_id>/documents", methods=["POST"])
 @token_required
 def upload_employee_document(emp_id):
@@ -752,6 +850,9 @@ def upload_employee_document(emp_id):
         return jsonify({"message": "Invalid ID"}), 400
     if not users_col.find_one({"_id": obj}, {"_id": 1}):
         return jsonify({"message": "Employee not found"}), 404
+    blocked = _reject_if_locked(obj, request.user)
+    if blocked:
+        return blocked
 
     doc_name = (request.form.get("name") or "").strip()
     file     = request.files.get("file")
@@ -802,6 +903,9 @@ def delete_employee_document(emp_id, doc_id):
         obj = ObjectId(emp_id)
     except Exception:
         return jsonify({"message": "Invalid ID"}), 400
+    blocked = _reject_if_locked(obj, request.user)
+    if blocked:
+        return blocked
     users_col.update_one({"_id": obj}, {"$pull": {"documents": {"id": doc_id}}})
     return jsonify({"message": "Document removed."}), 200
 
@@ -818,6 +922,9 @@ def replace_employee_document(emp_id, doc_id):
         obj = ObjectId(emp_id)
     except Exception:
         return jsonify({"message": "Invalid ID"}), 400
+    blocked = _reject_if_locked(obj, request.user)
+    if blocked:
+        return blocked
 
     emp = users_col.find_one({"_id": obj, "documents.id": doc_id}, {"documents.$": 1})
     if not emp or not emp.get("documents"):
@@ -896,6 +1003,8 @@ def promote_to_manager(emp_id):
     emp = users_col.find_one({"_id": ObjectId(emp_id)})
     if not emp:
         return jsonify({"message": "Employee not found."}), 404
+    if not _is_admin(request.user) and is_employee_locked(emp):
+        return jsonify({"message": "This employee's profile is locked — contact an Admin."}), 403
     if emp.get("role") == "manager":
         return jsonify({"message": "User is already a manager."}), 400
     dept = emp.get("department")
@@ -988,6 +1097,8 @@ def add_extended_leave(emp_id):
     emp, err = _get_emp_or_404(emp_id)
     if err:
         return err
+    if not _is_admin(request.user) and is_employee_locked(emp):
+        return jsonify({"message": "This employee's profile is locked — contact an Admin."}), 403
     data          = request.json or {}
     leave_type    = str(data.get("type", "")).strip()
     from_date_raw = data.get("from_date")
@@ -1021,6 +1132,8 @@ def delete_extended_leave(emp_id, leave_id):
     emp, err = _get_emp_or_404(emp_id)
     if err:
         return err
+    if not _is_admin(request.user) and is_employee_locked(emp):
+        return jsonify({"message": "This employee's profile is locked — contact an Admin."}), 403
     try:
         users_col.update_one(
             {"_id": ObjectId(emp_id)},
@@ -1039,6 +1152,8 @@ def set_resignation(emp_id):
     emp, err = _get_emp_or_404(emp_id)
     if err:
         return err
+    if not _is_admin(request.user) and is_employee_locked(emp):
+        return jsonify({"message": "This employee's profile is locked — contact an Admin."}), 403
     data = request.json or {}
 
     def _parse_date(raw):
@@ -1073,5 +1188,7 @@ def clear_resignation(emp_id):
     emp, err = _get_emp_or_404(emp_id)
     if err:
         return err
+    if not _is_admin(request.user) and is_employee_locked(emp):
+        return jsonify({"message": "This employee's profile is locked — contact an Admin."}), 403
     users_col.update_one({"_id": ObjectId(emp_id)}, {"$set": {"resignation": None}})
     return jsonify(_status_payload(emp_id)), 200

@@ -74,6 +74,13 @@ biometric_devices_col = db["biometric_devices"]
 # (employee_id: None) are what shows up in the "map this device user" queue.
 biometric_enrollments_col = db["biometric_enrollments"]
 
+# ── Employee Lock (routes/employees.py) ─────────────────────────────────────────
+# Append-only history of every lock/unlock: action ("lock"|"unlock"), employee_id,
+# employee_name, actor_id, actor_name, reason, at. The lock/unlock state itself
+# lives directly on the employee's own users_col doc (locked, locked_at,
+# locked_by, locked_by_name, lock_reason) — this collection is history only.
+employee_lock_audit_col = db["employee_lock_audit"]
+
 # ── Departments ───────────────────────────────────────────────────────────────
 departments_col = db["departments"]
 
@@ -268,6 +275,8 @@ try:
     biometric_enrollments_col.create_index([("device_id", 1), ("device_pin", 1)], unique=True, background=True)
     biometric_enrollments_col.create_index("employee_id", background=True)
     pms_performance_notes_col.create_index([("employee_id", 1), ("created_at", -1)], background=True)
+    employee_lock_audit_col.create_index([("employee_id", 1), ("at", -1)], background=True)
+    employee_lock_audit_col.create_index([("at", -1)], background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
