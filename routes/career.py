@@ -60,6 +60,7 @@ def list_jobs():
         j["status"]         = _read_status(j.get("status"))
         j["employment_type"] = j.get("employment_type") or "Full-time"
         j["salary_visible"]  = j.get("salary_visible", True) is not False
+        j["referral_open"]   = j.get("referral_open", True) is not False
         rows.append(j)
     return jsonify(rows), 200
 
@@ -86,6 +87,7 @@ def create_job():
         "salary_min":      _to_int_or_none(data.get("salary_min")),
         "salary_max":      _to_int_or_none(data.get("salary_max")),
         "salary_visible":  bool(data.get("salary_visible", True)),
+        "referral_open":   bool(data.get("referral_open", True)),
         "status":          status,
         "created_by":      str(request.user["_id"]),
         "created_at":      datetime.now(timezone.utc),
@@ -114,6 +116,8 @@ def update_job(job_id):
             update[k] = _to_int_or_none(data.get(k))
     if "salary_visible" in data:
         update["salary_visible"] = bool(data.get("salary_visible"))
+    if "referral_open" in data:
+        update["referral_open"] = bool(data.get("referral_open"))
     if "requirements" in data:
         update["requirements"] = _normalize_requirements(data.get("requirements"))
     if "status" in data:
@@ -231,6 +235,8 @@ def submit_referral():
             return jsonify({"message": "Invalid job ID"}), 400
         if not job:
             return jsonify({"message": "Job not found or no longer open"}), 404
+        if job.get("referral_open", True) is False:
+            return jsonify({"message": "This job is not open for referrals"}), 400
 
     resume_file_url = None
     f = request.files.get("resume")
@@ -308,9 +314,15 @@ def submit_referral():
 def public_career_jobs():
     """Open job listings — no authentication required."""
     rows = []
+    # ?referral=1 (the employee referral page) also drops jobs the admin
+    # hasn't opened for referrals; other callers (e.g. the ATS role picker)
+    # still get every open job.
+    referral_only = request.args.get("referral") == "1"
     # Tolerant match: "active" (current scheme), "Open" (legacy), or a
     # missing status field all count as open — only "closed" is excluded.
     for j in career_jobs_col.find({"status": {"$nin": ["closed", "Closed"]}}).sort("created_at", -1):
+        if referral_only and j.get("referral_open", True) is False:
+            continue
         j["_id"]            = str(j["_id"])
         j["requirements"]   = _normalize_requirements(j.get("requirements"))
         j["employment_type"] = j.get("employment_type") or "Full-time"
