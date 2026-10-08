@@ -59,6 +59,7 @@ def list_jobs():
         j["requirements"]   = _normalize_requirements(j.get("requirements"))
         j["status"]         = _read_status(j.get("status"))
         j["employment_type"] = j.get("employment_type") or "Full-time"
+        j["salary_visible"]  = j.get("salary_visible", True) is not False
         rows.append(j)
     return jsonify(rows), 200
 
@@ -84,6 +85,7 @@ def create_job():
         "requirements":    _normalize_requirements(data.get("requirements")),
         "salary_min":      _to_int_or_none(data.get("salary_min")),
         "salary_max":      _to_int_or_none(data.get("salary_max")),
+        "salary_visible":  bool(data.get("salary_visible", True)),
         "status":          status,
         "created_by":      str(request.user["_id"]),
         "created_at":      datetime.now(timezone.utc),
@@ -110,6 +112,8 @@ def update_job(job_id):
     for k in ["salary_min", "salary_max"]:
         if k in data:
             update[k] = _to_int_or_none(data.get(k))
+    if "salary_visible" in data:
+        update["salary_visible"] = bool(data.get("salary_visible"))
     if "requirements" in data:
         update["requirements"] = _normalize_requirements(data.get("requirements"))
     if "status" in data:
@@ -310,6 +314,10 @@ def public_career_jobs():
         j["_id"]            = str(j["_id"])
         j["requirements"]   = _normalize_requirements(j.get("requirements"))
         j["employment_type"] = j.get("employment_type") or "Full-time"
+        # Admin can hide the salary range from employees/candidates per job;
+        # a missing flag (jobs posted before this option) stays visible.
+        if j.get("salary_visible", True) is False:
+            j["salary_min"] = j["salary_max"] = None
         rows.append(j)
     return jsonify(rows), 200
 
