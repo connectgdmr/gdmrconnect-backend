@@ -127,6 +127,11 @@ messages_col      = db["messages"]
 # ── Achievements ──────────────────────────────────────────────────────────────
 achievements_col = db["achievements"]
 
+# ── Personal Goals / sticky notes (routes/goals.py) ───────────────────────────
+# One doc per goal: user_id, title, notes, type ("daily"|"weekly"), color,
+# deadline ("YYYY-MM-DD", IST), done, done_at, created_at. Private to the owner.
+goals_col = db["goals"]
+
 # ── Company Holidays ────────────────────────────────────────────────────────
 # {date: "YYYY-MM-DD", day: "Thursday", name: "New Year"} — admin-managed via
 # routes/calendar.py (GET/POST/DELETE /api/holidays), the single source of
@@ -277,6 +282,7 @@ try:
     pms_performance_notes_col.create_index([("employee_id", 1), ("created_at", -1)], background=True)
     employee_lock_audit_col.create_index([("employee_id", 1), ("at", -1)], background=True)
     employee_lock_audit_col.create_index([("at", -1)], background=True)
+    goals_col.create_index([("user_id", 1), ("done", 1), ("deadline", 1)], background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
