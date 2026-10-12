@@ -1344,7 +1344,7 @@ def ats_activity():
         "week":            week,
         "trend":           trend,
         "funnel":          funnel,
-        "attention":       attention[:40],
+        "attention":       attention[:200],
         "attention_total": len(attention),
         "events":          [{**e, "at": e["at"].isoformat()} for e in events[:80]],
         "as_of":           now_utc.isoformat(),
