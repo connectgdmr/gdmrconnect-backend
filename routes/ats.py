@@ -9,7 +9,7 @@ import html as _html
 import secrets
 import threading
 import cloudinary.uploader
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
 from pymongo import ReturnDocument
@@ -1157,6 +1157,197 @@ def ats_stats():
         "by_role":              [{"role": k, "count": v} for k, v in by_role.items()],
         "time_to_hire":         time_to_hire,
         "source_effectiveness": source_effectiveness,
+    }), 200
+
+
+# ── Dashboard: daily activity / what needs attention ─────────────────────────
+
+# Stages where a candidate is "in play" — used for the stalled-candidate check.
+_ACTIVE_STAGES = (
+    "Resume Screening", "Screening Call Scheduled", "Screening Call Completed",
+    "Technical Assessment", "Technical Interview", "HR Interview", "Management Interview",
+    "Shortlisted", "Documentation Pending", "Offer Discussion", "Screening", "Interview",
+)
+# Funnel groups, in order. A candidate is counted in the furthest group they
+# have *ever* reached (from status_history), so the funnel reads as conversion
+# rather than "who is sitting where right now".
+_FUNNEL = (
+    ("Applied",      ()),
+    ("Screening",    ("Resume Screening", "Screening Call Scheduled", "Screening Call Completed", "Screening")),
+    ("Assessment / Interviews", ("Technical Assessment", "Technical Interview", "HR Interview", "Management Interview", "Interview")),
+    ("Shortlisted",  ("Shortlisted", "Documentation Pending")),
+    ("Offer",        ("Offer Discussion", "Offer Released", "Offer Accepted")),
+    ("Joined",       ("Joined", "Hired")),
+)
+
+
+def _utc(dt):
+    """Mongo returns naive UTC datetimes; normalise so we can compare/convert."""
+    if not isinstance(dt, datetime):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+@bp.route("/api/admin/ats/activity", methods=["GET"])
+@token_required
+def ats_activity():
+    """
+    Everything the dashboard's "what happened" half needs, in one call:
+    today vs yesterday, a recent activity feed, a daily trend, the hiring
+    funnel and a list of candidates that need attention.
+    """
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+
+    try:
+        days = max(1, min(int(request.args.get("days", 14)), 60))
+    except (TypeError, ValueError):
+        days = 14
+
+    now_utc   = datetime.now(timezone.utc)
+    today_ist = now_utc.astimezone(IST).date()
+    first_day = today_ist - timedelta(days=days - 1)
+
+    cands = list(ats_candidates_col.find(_ats_scope_query(request.user), {
+        "name": 1, "applicant_code": 1, "status": 1, "job_role": 1, "role": 1, "department": 1,
+        "applied_at": 1, "updated_at": 1, "status_history": 1, "recordings": 1, "documents": 1,
+        "source": 1,
+    }))
+
+    # Resolve "by" user ids to names once.
+    by_ids = set()
+    for c in cands:
+        for h in c.get("status_history") or []:
+            if h.get("by"):
+                by_ids.add(h["by"])
+        for r in c.get("recordings") or []:
+            if r.get("added_by"):
+                by_ids.add(r["added_by"])
+    names = {}
+    if by_ids:
+        oids = []
+        for i in by_ids:
+            try:
+                oids.append(ObjectId(i))
+            except Exception:
+                pass
+        for u in users_col.find({"_id": {"$in": oids}}, {"name": 1}):
+            names[str(u["_id"])] = u.get("name") or ""
+
+    def ist_day(dt):
+        d = _utc(dt)
+        return d.astimezone(IST).date() if d else None
+
+    def base(c):
+        return {
+            "candidate_id": str(c["_id"]), "name": c.get("name") or "Unknown",
+            "code": c.get("applicant_code"), "role": c.get("job_role") or c.get("role") or "",
+        }
+
+    events = []
+    for c in cands:
+        hist = sorted(
+            [h for h in (c.get("status_history") or []) if _utc(h.get("at"))],
+            key=lambda h: _utc(h["at"]),
+        )
+        for i, h in enumerate(hist):
+            prev = hist[i - 1]["status"] if i > 0 else None
+            kind = "applied" if (i == 0 and h.get("status") in ("New Application", "Applied")) else "status"
+            events.append({**base(c), "type": kind, "from": prev, "to": h.get("status"),
+                           "by": names.get(h.get("by") or "", ""), "at": _utc(h["at"])})
+        # Candidates with no history (legacy rows) still count as an application.
+        if not hist and _utc(c.get("applied_at")):
+            events.append({**base(c), "type": "applied", "from": None, "to": c.get("status"),
+                           "by": "", "at": _utc(c["applied_at"])})
+        for r in c.get("recordings") or []:
+            if _utc(r.get("added_at")):
+                events.append({**base(c), "type": "recording", "from": None, "to": r.get("type") or "Recording",
+                               "by": names.get(r.get("added_by") or "", ""), "at": _utc(r["added_at"])})
+        for d in c.get("documents") or []:
+            if _utc(d.get("uploaded_at")) and d.get("status") in ("Submitted", "Approved", "Rejected", "Re-upload Requested"):
+                events.append({**base(c), "type": "document", "from": None, "to": d.get("name") or "Document",
+                               "by": "", "at": _utc(d["uploaded_at"])})
+
+    events = [e for e in events if ist_day(e["at"]) and ist_day(e["at"]) >= first_day]
+    events.sort(key=lambda e: e["at"], reverse=True)
+
+    def summarise(day):
+        evs = [e for e in events if ist_day(e["at"]) == day]
+        st  = [e for e in evs if e["type"] == "status"]
+
+        def to(*stages):
+            return sum(1 for e in st if e["to"] in stages)
+
+        return {
+            "new_applications": sum(1 for e in evs if e["type"] == "applied"),
+            "status_changes":   len(st),
+            "interviews":       to("Screening Call Scheduled", "Technical Interview", "HR Interview", "Management Interview"),
+            "shortlisted":      to("Shortlisted"),
+            "offers_released":  to("Offer Released"),
+            "joined":           to("Joined", "Hired"),
+            "rejected":         to("Rejected", "Withdrawn"),
+            "documents":        sum(1 for e in evs if e["type"] == "document"),
+        }
+
+    daily = {first_day + timedelta(days=i): summarise(first_day + timedelta(days=i)) for i in range(days)}
+    trend = [{
+        "date": d.isoformat(), "label": d.strftime("%d %b"),
+        "applications": v["new_applications"], "moves": v["status_changes"],
+    } for d, v in daily.items()]
+    week = {}
+    for i in range(min(7, days)):
+        for k, v in daily[today_ist - timedelta(days=i)].items():
+            week[k] = week.get(k, 0) + v
+
+    # Funnel — furthest group ever reached.
+    group_of = {}
+    for gi, (_, sts) in enumerate(_FUNNEL):
+        for st in sts:
+            group_of[st] = gi
+    funnel_counts = [0] * len(_FUNNEL)
+    for c in cands:
+        reached = 0
+        for st in [h.get("status") for h in (c.get("status_history") or [])] + [c.get("status")]:
+            reached = max(reached, group_of.get(st, 0))
+        for gi in range(reached + 1):
+            funnel_counts[gi] += 1
+    funnel = []
+    for gi, (label, _) in enumerate(_FUNNEL):
+        prev = funnel_counts[gi - 1] if gi else funnel_counts[0]
+        funnel.append({"stage": label, "count": funnel_counts[gi],
+                       "pct_of_prev": round(funnel_counts[gi] / prev * 100) if prev else 0})
+
+    # Needs attention.
+    attention = []
+    for c in cands:
+        st      = c.get("status")
+        hist_at = [_utc(h.get("at")) for h in (c.get("status_history") or []) if _utc(h.get("at"))]
+        last    = max(hist_at) if hist_at else (_utc(c.get("updated_at")) or _utc(c.get("applied_at")))
+        idle    = (now_utc - last).days if last else 0
+        item    = {**base(c), "status": st, "days": idle}
+        if st in ("New Application", "Applied") and idle >= 2:
+            attention.append({**item, "reason": "unreviewed", "label": f"New application not reviewed for {idle} days"})
+        elif st == "Offer Released" and idle >= 5:
+            attention.append({**item, "reason": "offer_pending", "label": f"Offer sent {idle} days ago, no reply yet"})
+        elif st in _ACTIVE_STAGES and idle >= 7:
+            attention.append({**item, "reason": "stalled", "label": f"No movement in {st} for {idle} days"})
+        pending_docs = sum(1 for d in (c.get("documents") or []) if d.get("status") == "Submitted")
+        if pending_docs:
+            attention.append({**item, "reason": "docs_review", "days": 0,
+                              "label": f"{pending_docs} document{'s' if pending_docs != 1 else ''} waiting for review"})
+    order = {"offer_pending": 0, "docs_review": 1, "unreviewed": 2, "stalled": 3}
+    attention.sort(key=lambda a: (order.get(a["reason"], 9), -a["days"]))
+
+    return jsonify({
+        "today":           daily[today_ist],
+        "yesterday":       summarise(today_ist - timedelta(days=1)),
+        "week":            week,
+        "trend":           trend,
+        "funnel":          funnel,
+        "attention":       attention[:40],
+        "attention_total": len(attention),
+        "events":          [{**e, "at": e["at"].isoformat()} for e in events[:80]],
+        "as_of":           now_utc.isoformat(),
     }), 200
 
 
