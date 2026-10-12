@@ -5,6 +5,10 @@ Applicant Tracking System: candidate CRUD, status pipeline, recordings, portfoli
 document request/upload (public token), stats, resume upload, admin doc review.
 """
 import re
+import json
+import time
+import traceback
+import requests
 import html as _html
 import secrets
 import threading
@@ -16,10 +20,10 @@ from pymongo import ReturnDocument
 
 from database import ats_candidates_col, users_col, counters_col
 from decorators import token_required
-from extensions import bcrypt
+from extensions import bcrypt, limiter
 from helpers import _is_admin, _mgr_depts, parse_employment_type, _has_module_grant, _dept_list
 from utils import send_email, generate_random_password
-from config import IST
+from config import IST, GROQ_API_KEY, GROQ_MODEL
 
 bp = Blueprint("ats", __name__)
 
@@ -1188,27 +1192,14 @@ def _utc(dt):
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-@bp.route("/api/admin/ats/activity", methods=["GET"])
-@token_required
-def ats_activity():
-    """
-    Everything the dashboard's "what happened" half needs, in one call:
-    today vs yesterday, a recent activity feed, a daily trend, the hiring
-    funnel and a list of candidates that need attention.
-    """
-    if not _ats_allowed(request.user):
-        return jsonify({"message": "Unauthorized"}), 403
-
-    try:
-        days = max(1, min(int(request.args.get("days", 14)), 60))
-    except (TypeError, ValueError):
-        days = 14
-
+def _activity_payload(user, days=14):
+    """Today/yesterday/week counts, trend, funnel, attention list and the event
+    feed — shared by the dashboard endpoint and the AI overview."""
     now_utc   = datetime.now(timezone.utc)
     today_ist = now_utc.astimezone(IST).date()
     first_day = today_ist - timedelta(days=days - 1)
 
-    cands = list(ats_candidates_col.find(_ats_scope_query(request.user), {
+    cands = list(ats_candidates_col.find(_ats_scope_query(user), {
         "name": 1, "applicant_code": 1, "status": 1, "job_role": 1, "role": 1, "department": 1,
         "applied_at": 1, "updated_at": 1, "status_history": 1, "recordings": 1, "documents": 1,
         "source": 1,
@@ -1338,7 +1329,7 @@ def ats_activity():
     order = {"offer_pending": 0, "docs_review": 1, "unreviewed": 2, "stalled": 3}
     attention.sort(key=lambda a: (order.get(a["reason"], 9), -a["days"]))
 
-    return jsonify({
+    return {
         "today":           daily[today_ist],
         "yesterday":       summarise(today_ist - timedelta(days=1)),
         "week":            week,
@@ -1348,7 +1339,238 @@ def ats_activity():
         "attention_total": len(attention),
         "events":          [{**e, "at": e["at"].isoformat()} for e in events[:300]],
         "as_of":           now_utc.isoformat(),
-    }), 200
+    }
+
+
+@bp.route("/api/admin/ats/activity", methods=["GET"])
+@token_required
+def ats_activity():
+    """
+    Everything the dashboard's "what happened" half needs, in one call:
+    today vs yesterday, a recent activity feed, a daily trend, the hiring
+    funnel and a list of candidates that need attention.
+    """
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        days = max(1, min(int(request.args.get("days", 14)), 60))
+    except (TypeError, ValueError):
+        days = 14
+    return jsonify(_activity_payload(request.user, days)), 200
+
+
+# ── AI overview / ask-your-data ──────────────────────────────────────────────
+#
+# "RAG" here is deliberately simple: for a recruitment database of a few
+# hundred rows there is no need for a vector store. We retrieve (a) the
+# aggregate picture and (b) the candidate records that best match the
+# question by keyword, then let the LLM answer from only that context.
+# Contact details, resume links and CTC are never put in the prompt.
+
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+_AI_CACHE = {}          # scope key -> (timestamp, payload) for the no-question overview
+_AI_CACHE_SECONDS = 600
+_STOP_WORDS = {
+    "the", "and", "for", "who", "what", "why", "how", "are", "was", "with", "have", "has", "any", "all",
+    "show", "list", "give", "tell", "about", "which", "from", "that", "this", "than", "them", "their",
+    "candidates", "candidate", "people", "best", "top", "need", "needs", "can", "should", "our", "most",
+    "is", "in", "of", "to", "me", "we", "do", "be", "on", "at", "it", "an", "by", "or", "my", "get",
+}
+
+_AI_SYSTEM = (
+    "You are a recruitment analyst for GDMR Foundation's HR team. You are given a DATA block taken "
+    "live from their applicant tracking system. Use ONLY that data: never invent candidates, numbers, "
+    "dates or reasons. If the data doesn't answer something, say so plainly. Write for a busy HR "
+    "manager: short, concrete, plain English, no jargon. Refer to candidates by name. Today's date and "
+    "all counts are in the DATA."
+)
+
+
+def _ai_candidate_line(c, now_utc):
+    hist = [h for h in (c.get("status_history") or []) if _utc(h.get("at"))]
+    last = max((_utc(h["at"]) for h in hist), default=_utc(c.get("applied_at")))
+    in_stage = (now_utc - last).days if last else None
+    applied  = _utc(c.get("applied_at"))
+    age      = (now_utc - applied).days if applied else None
+    skills   = c.get("skills") or []
+    if isinstance(skills, str):
+        skills = [s.strip() for s in skills.split(",") if s.strip()]
+    path = " > ".join(h.get("status", "") for h in hist[-5:])
+    bits = [
+        f"{c.get('applicant_code') or '-'} {c.get('name') or 'Unknown'}",
+        f"role: {c.get('job_role') or c.get('role') or '-'}",
+        f"dept: {c.get('department') or '-'}",
+        f"status: {c.get('status') or '-'}" + (f" (for {in_stage}d)" if in_stage is not None else ""),
+        f"exp: {c.get('experience') or c.get('experience_years') or '0'}y",
+        f"location: {c.get('current_location') or '-'}",
+        f"skills: {', '.join(skills[:8]) or '-'}",
+        f"source: {c.get('source') or '-'}",
+        f"applied: {age}d ago" if age is not None else "",
+        f"path: {path}" if path else "",
+        f"notice: {c.get('notice_period')}" if c.get("notice_period") else "",
+        f"remarks: {str(c.get('remarks') or c.get('notes') or '')[:100]}" if (c.get("remarks") or c.get("notes")) else "",
+    ]
+    return " | ".join(b for b in bits if b)
+
+
+def _ai_build_context(user, question):
+    now_utc = datetime.now(timezone.utc)
+    act     = _activity_payload(user, 14)
+    cands   = list(ats_candidates_col.find(_ats_scope_query(user), {
+        "name": 1, "applicant_code": 1, "status": 1, "job_role": 1, "role": 1, "department": 1,
+        "experience": 1, "experience_years": 1, "skills": 1, "current_location": 1, "source": 1,
+        "applied_at": 1, "status_history": 1, "notice_period": 1, "remarks": 1, "notes": 1,
+    }))
+
+    def tally(key_fn):
+        m = {}
+        for c in cands:
+            k = key_fn(c) or "Unknown"
+            m[k] = m.get(k, 0) + 1
+        return ", ".join(f"{k}: {v}" for k, v in sorted(m.items(), key=lambda kv: -kv[1])[:12])
+
+    lines = [
+        f"DATE: {now_utc.astimezone(IST).strftime('%A %d %B %Y')} (IST)",
+        f"TOTAL CANDIDATES: {len(cands)}",
+        f"BY STATUS: {tally(lambda c: c.get('status'))}",
+        f"BY ROLE: {tally(lambda c: c.get('job_role') or c.get('role'))}",
+        f"BY DEPARTMENT: {tally(lambda c: c.get('department'))}",
+        f"BY SOURCE: {tally(lambda c: c.get('source'))}",
+        f"TODAY: {json.dumps(act['today'])}",
+        f"YESTERDAY: {json.dumps(act['yesterday'])}",
+        f"LAST 7 DAYS: {json.dumps(act['week'])}",
+        "FUNNEL (furthest stage ever reached): " + ", ".join(f"{f['stage']}={f['count']}" for f in act["funnel"]),
+        f"NEEDS ATTENTION ({act['attention_total']} items):",
+    ]
+    for a in act["attention"][:25]:
+        lines.append(f"  - {a['name']} ({a.get('role') or '-'}): {a['label']}")
+    lines.append("RECENT ACTIVITY (newest first):")
+    for e in act["events"][:15]:
+        what = f"moved {e['from']} -> {e['to']}" if e["type"] == "status" and e.get("from") else (
+            "applied" if e["type"] == "applied" else f"{e['type']}: {e['to']}")
+        lines.append(f"  - {e['at'][:16]} {e['name']} {what}" + (f" (by {e['by']})" if e.get("by") else ""))
+
+    # Retrieval: rank candidates against the question; with no question, show
+    # the freshest applicants so the model still sees real records.
+    tokens = {t for t in re.findall(r"[a-z0-9+#.]{2,}", (question or "").lower()) if t not in _STOP_WORDS}
+    scored = []
+    for c in cands:
+        skills = c.get("skills") or []
+        blob = " ".join(str(v or "") for v in (
+            c.get("name"), c.get("job_role"), c.get("role"), c.get("department"), c.get("status"),
+            c.get("current_location"), c.get("source"), c.get("remarks"), c.get("notes"),
+            " ".join(skills) if isinstance(skills, list) else skills,
+        )).lower()
+        score = sum(2 if t in blob else 0 for t in tokens)
+        scored.append((score, _utc(c.get("applied_at")) or now_utc, c))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    top = [c for s, _, c in scored[:15] if s > 0] if tokens else []
+    if len(top) < 8:
+        seen = {id(c) for c in top}
+        top += [c for _, _, c in scored if id(c) not in seen][: 8 - len(top)]
+    lines.append(f"CANDIDATE RECORDS ({'best matches for the question' if tokens and scored and scored[0][0] > 0 else 'most recent'}):")
+    for c in top:
+        lines.append("  - " + _ai_candidate_line(c, now_utc))
+    return "\n".join(lines)
+
+
+def _groq_chat(system, user_msg, max_tokens=1500):
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    body = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
+        "temperature": 0.3, "max_tokens": max_tokens, "reasoning_effort": "low",
+    }
+    resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=45)
+    if resp.status_code == 400:      # model/API version without reasoning_effort
+        body.pop("reasoning_effort")
+        resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=45)
+    if not resp.ok:
+        print(f"[ats-ai] Groq returned {resp.status_code}: {resp.text[:500]}")
+    resp.raise_for_status()
+    return (resp.json()["choices"][0]["message"].get("content") or "").strip()
+
+
+def _parse_json_block(text):
+    """Models sometimes wrap JSON in fences or add a sentence — pull out the object."""
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except ValueError:
+        return None
+
+
+def _clean_list(v, limit=6):
+    return [str(x).strip()[:300] for x in (v if isinstance(v, list) else []) if str(x).strip()][:limit]
+
+
+@bp.route("/api/admin/ats/ai-overview", methods=["POST"])
+@token_required
+@limiter.limit("10 per minute")
+def ats_ai_overview():
+    """
+    No question  -> a structured overview (headline / highlights / risks / actions).
+    With question -> a plain-text answer grounded in the matching records.
+    """
+    if not _ats_allowed(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    if not GROQ_API_KEY:
+        return jsonify({"message": "AI is not configured on the server."}), 503
+
+    data     = request.get_json(silent=True) or {}
+    question = str(data.get("question") or "").strip()
+    if len(question) > 400:
+        return jsonify({"message": "Question is too long (max 400 characters)."}), 400
+    fresh = bool(data.get("refresh"))
+
+    scope_key = json.dumps(_ats_scope_query(request.user), sort_keys=True, default=str)
+    if not question and not fresh:
+        hit = _AI_CACHE.get(scope_key)
+        if hit and time.time() - hit[0] < _AI_CACHE_SECONDS:
+            return jsonify({**hit[1], "cached": True}), 200
+
+    try:
+        context = _ai_build_context(request.user, question)
+        if question:
+            text = _groq_chat(
+                _AI_SYSTEM + " Answer the question in at most 120 words of plain text (no markdown, no JSON). "
+                "If you list people, put each on its own line starting with '- '.",
+                f"DATA:\n{context}\n\nQUESTION: {question}",
+            )
+            if not text:
+                raise ValueError("empty answer")
+            return jsonify({"mode": "answer", "answer": text, "as_of": datetime.now(timezone.utc).isoformat()}), 200
+
+        text = _groq_chat(
+            _AI_SYSTEM + " Reply with ONE JSON object only, no other text, exactly this shape: "
+            '{"headline": "one sentence on how recruitment is going", '
+            '"highlights": ["what went well / what happened recently (max 4)"], '
+            '"risks": ["problems, bottlenecks or things being missed (max 4)"], '
+            '"actions": ["specific next steps naming candidates or stages (max 4)"]}. '
+            "Each item under 30 words.",
+            f"DATA:\n{context}\n\nWrite the overview.",
+        )
+        parsed = _parse_json_block(text)
+        if parsed:
+            payload = {
+                "mode": "overview",
+                "headline":   str(parsed.get("headline") or "").strip()[:300],
+                "highlights": _clean_list(parsed.get("highlights")),
+                "risks":      _clean_list(parsed.get("risks")),
+                "actions":    _clean_list(parsed.get("actions")),
+            }
+        else:   # model ignored the format — still show something useful
+            payload = {"mode": "overview", "headline": text[:600], "highlights": [], "risks": [], "actions": []}
+        payload["as_of"] = datetime.now(timezone.utc).isoformat()
+        _AI_CACHE[scope_key] = (time.time(), payload)
+        return jsonify(payload), 200
+    except requests.exceptions.Timeout:
+        return jsonify({"message": "The AI took too long to respond. Please try again."}), 504
+    except Exception as exc:
+        print(f"[ats-ai] failed: {exc}\n{traceback.format_exc()}")
+        return jsonify({"message": "Couldn't generate the overview right now. Please try again."}), 502
 
 
 @bp.route("/api/admin/ats/candidates/upload", methods=["POST"])
