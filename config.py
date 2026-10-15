@@ -30,6 +30,16 @@ REQUIRE_ADMIN_MFA = os.getenv("REQUIRE_ADMIN_MFA", "").strip().lower() in ("1", 
 # Set STRICT_SECRET=1 to refuse to start when SECRET_KEY is shorter than 32 characters.
 STRICT_SECRET = os.getenv("STRICT_SECRET", "").strip().lower() in ("1", "true", "yes")
 
+# Relieving cum Service Certificate (routes/certificates.py) — wording/numbering from the approved template.
+COE_PREFIX        = os.getenv("COE_PREFIX", "EMC")
+# Number the NEXT certificate gets. The approved template's sample code is EMC11, so numbering
+# starts at 12; set COE_START_NUMBER on Railway if HR has already issued more letters by hand.
+# Only read the first time a certificate is generated.
+COE_START_NUMBER  = int(os.getenv("COE_START_NUMBER", "12") or 12)
+COE_SIGNATORY_NAME        = os.getenv("COE_SIGNATORY_NAME", "Jofin Mejo Jacob")
+COE_SIGNATORY_DESIGNATION = os.getenv("COE_SIGNATORY_DESIGNATION", "Head Of Human Resources")
+COE_DEFAULT_POSTING       = os.getenv("COE_DEFAULT_POSTING", "Thiruvananthapuram office")
+
 # ── Database ──────────────────────────────────────────────────────────────────
 MONGO_URI = os.getenv("MONGO_URI")
 

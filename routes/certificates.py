@@ -23,6 +23,7 @@ How it works
   are logged (status + time only) and expire after a year.
 """
 import io
+import os
 import re
 import secrets
 from datetime import datetime, timezone, timedelta
@@ -31,7 +32,8 @@ from bson import ObjectId
 from pymongo import ReturnDocument
 from flask import Blueprint, request, jsonify, send_file
 
-from config import IST, DASHBOARD_URL
+from config import (IST, DASHBOARD_URL, COE_PREFIX, COE_START_NUMBER, COE_SIGNATORY_NAME,
+                    COE_SIGNATORY_DESIGNATION, COE_DEFAULT_POSTING)
 from database import certificates_col, certificate_audit_col, certificate_verifications_col, users_col, counters_col
 from decorators import token_required
 from extensions import limiter
@@ -40,6 +42,8 @@ from helpers import _is_admin, _has_module_grant
 bp = Blueprint("certificates", __name__)
 
 ORG_NAME = "GDMR Foundation"
+CERT_TITLE = "Relieving cum Service Certificate"
+SALUTATIONS = {"Mr.": ("he", "his", "him"), "Ms.": ("she", "her", "her"), "Mx.": ("they", "their", "them")}
 STATUSES = ("active", "revoked", "superseded")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
 
@@ -87,11 +91,10 @@ def _verify_url(token):
 
 
 def _next_reference():
-    year = _today().year
-    doc = counters_col.find_one_and_update(
-        {"_id": f"coe_{year}"}, {"$inc": {"seq": 1}}, upsert=True, return_document=ReturnDocument.AFTER
-    )
-    return f"GDMR-COE-{year}-{doc['seq']:04d}"
+    """EMC12, EMC13, … — one running number (not reset each year), as on the approved template."""
+    counters_col.update_one({"_id": "coe_seq"}, {"$setOnInsert": {"seq": COE_START_NUMBER - 1}}, upsert=True)
+    doc = counters_col.find_one_and_update({"_id": "coe_seq"}, {"$inc": {"seq": 1}}, return_document=ReturnDocument.AFTER)
+    return f"{COE_PREFIX}{doc['seq']}"
 
 
 def _audit(cert, action, user, reason=None, prev=None, new=None, extra=None):
@@ -108,7 +111,7 @@ def _serialize(c, names=None):
     names = names or {}
     out = {k: c.get(k) for k in (
         "reference_no", "employee_id", "employee_name", "employee_code", "designation", "department",
-        "date_of_joining", "last_working_date", "issue_date", "signatory_name", "signatory_designation",
+        "date_of_joining", "last_working_date", "issue_date", "signatory_name", "signatory_designation", "salutation", "posted_at",
         "status", "replaces", "superseded_by", "reissue_reason", "revoke_reason", "verify_count",
     )}
     out["_id"] = str(c["_id"])
@@ -182,6 +185,16 @@ def eligible_employees():
 
 # ── admin: list / generate / reissue / revoke / audit / pdf ──────────────────
 
+@bp.route("/api/admin/certificates/defaults", methods=["GET"])
+@token_required
+def certificate_defaults():
+    """Pre-fill values for the Generate form (set on the server; HR can still change them per certificate)."""
+    if not _can_view(request.user):
+        return _deny()
+    return jsonify({"signatory_name": COE_SIGNATORY_NAME, "signatory_designation": COE_SIGNATORY_DESIGNATION,
+                    "posted_at": COE_DEFAULT_POSTING, "salutations": list(SALUTATIONS), "title": CERT_TITLE}), 200
+
+
 @bp.route("/api/admin/certificates", methods=["GET"])
 @token_required
 def list_certificates():
@@ -198,7 +211,7 @@ def list_certificates():
     return jsonify([_serialize(c, names) for c in certs]), 200
 
 
-def _issue(user, emp, signatory_name, signatory_designation, replaces=None, reissue_reason=None):
+def _issue(user, emp, signatory_name, signatory_designation, salutation, posted_at, replaces=None, reissue_reason=None):
     snap, err = _employee_snapshot(emp)
     if err:
         return None, err
@@ -209,12 +222,26 @@ def _issue(user, emp, signatory_name, signatory_designation, replaces=None, reis
         "employee_id": str(emp["_id"]),
         "issue_date": _today().isoformat(),
         "signatory_name": signatory_name, "signatory_designation": signatory_designation,
+        "salutation": salutation, "posted_at": posted_at,
         "status": "active", "issued_by": str(user["_id"]), "issued_by_name": user.get("name") or "",
         "issued_at": datetime.now(timezone.utc), "verify_count": 0,
         "replaces": replaces["reference_no"] if replaces else None, "reissue_reason": reissue_reason,
     }
     cert["_id"] = certificates_col.insert_one(cert).inserted_id
     return cert, None
+
+
+def _letter_fields(data, fallback=None):
+    """Mr./Ms./Mx. (picked by HR — the system never guesses it) and where the person was posted."""
+    fb = fallback or {}
+    sal = str(data.get("salutation") or fb.get("salutation") or "").strip()
+    if sal not in SALUTATIONS:
+        return None, None, "Please choose Mr., Ms. or Mx. for the certificate."
+    if "posted_at" in data:
+        posted = str(data.get("posted_at") or "").strip()[:80]
+    else:
+        posted = fb.get("posted_at", COE_DEFAULT_POSTING)
+    return sal, posted, None
 
 
 def _signatory(data, fallback=None):
@@ -240,10 +267,13 @@ def generate_certificate():
     name, desg, err = _signatory(data)
     if err:
         return jsonify({"message": err}), 400
+    sal, posted, err = _letter_fields(data)
+    if err:
+        return jsonify({"message": err}), 400
     existing = certificates_col.find_one({"employee_id": str(emp["_id"]), "status": "active"})
     if existing:
         return jsonify({"message": f"{emp.get('name')} already has an active certificate ({existing['reference_no']}). Use Reissue to replace it."}), 409
-    cert, err = _issue(request.user, emp, name, desg)
+    cert, err = _issue(request.user, emp, name, desg, sal, posted)
     if err:
         return jsonify({"message": err}), 400
     _audit(cert, "generated", request.user, new="active")
@@ -274,10 +304,13 @@ def reissue_certificate(cert_id):
     name, desg, err = _signatory(data, fallback=old)
     if err:
         return jsonify({"message": err}), 400
+    sal, posted, err = _letter_fields(data, fallback=old)
+    if err:
+        return jsonify({"message": err}), 400
     emp = users_col.find_one({"_id": ObjectId(old["employee_id"])})
     if not emp:
         return jsonify({"message": "The employee record no longer exists."}), 404
-    new, err = _issue(request.user, emp, name, desg, replaces=old, reissue_reason=reason)
+    new, err = _issue(request.user, emp, name, desg, sal, posted, replaces=old, reissue_reason=reason)
     if err:
         return jsonify({"message": err}), 400
     now = datetime.now(timezone.utc)
@@ -329,104 +362,123 @@ def certificate_audit(cert_id):
 # ── PDF ──────────────────────────────────────────────────────────────────────
 
 def build_pdf(cert):
-    """Render the certificate PDF from the stored record (never from live employee data)."""
+    """
+    Render the "Relieving cum Service Certificate" PDF from the stored record (never from live
+    employee data), laid out like the approved template: code + date top-left, logo top-right,
+    underlined centred title, two paragraphs, signature block, address footer and red bar.
+    The QR code sits in the free space at the bottom-left.
+    """
     import segno
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
     from reportlab.pdfgen import canvas
     from reportlab.lib.styles import ParagraphStyle
-    from reportlab.platypus import Paragraph, Table, TableStyle
-    from reportlab.lib.enums import TA_CENTER
+    from reportlab.platypus import Paragraph
+    from reportlab.pdfbase.pdfmetrics import stringWidth
 
     W, H = A4
+    LM, TEXT_W = 72, 443
+    RED, INK, MUTED = colors.HexColor("#ed2224"), colors.black, colors.HexColor("#555555")
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
-    c.setTitle(f"Experience Certificate {cert['reference_no']}")
+    c.setTitle(f"{CERT_TITLE} {cert['reference_no']}")
     c.setAuthor(ORG_NAME)
-    RED, INK, MUTED = colors.HexColor("#ed2224"), colors.HexColor("#111111"), colors.HexColor("#555555")
 
-    # frame
-    c.setStrokeColor(RED); c.setLineWidth(1.6); c.rect(28, 28, W - 56, H - 56)
-    c.setLineWidth(0.5); c.rect(34, 34, W - 68, H - 68)
+    # letterhead logo — top-right, flush with the top edge like the approved template
+    logo = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "gdmr-logo.png")
+    lw = 92
+    lh = lw * 478 / 466
+    if os.path.exists(logo):
+        c.drawImage(logo, W - lw - 9, H - lh, width=lw, height=lh)
 
-    # header / branding
-    c.setFillColor(RED); c.rect(W / 2 - 22, H - 118, 44, 56, stroke=0, fill=1)
-    c.setFillColor(colors.white); c.setFont("Helvetica-Bold", 13); c.drawCentredString(W / 2, H - 94, "gdmr")
-    c.setFillColor(INK); c.setFont("Helvetica-Bold", 14); c.drawCentredString(W / 2, H - 138, "GDMR FOUNDATION")
-    c.setFillColor(MUTED); c.setFont("Helvetica-Oblique", 8.5); c.drawCentredString(W / 2, H - 151, "a precious cornerstone, a sure foundation")
+    # code + date of issue
+    issue = _parse_day(cert["issue_date"])
+    c.setFillColor(INK)
+    c.setFont("Helvetica", 10.5)
+    c.drawString(LM, H - 49, cert["reference_no"])
+    c.drawString(LM, H - 127, issue.strftime("%d.%m.%Y") if issue else "")
 
-    # title
-    c.setFillColor(INK); c.setFont("Helvetica-Bold", 22); c.drawCentredString(W / 2, H - 205, "EXPERIENCE CERTIFICATE")
-    c.setStrokeColor(RED); c.setLineWidth(1.2); c.line(W / 2 - 70, H - 214, W / 2 + 70, H - 214)
-
-    # ref + date
-    c.setFont("Helvetica", 10); c.setFillColor(INK)
-    c.drawString(64, H - 250, f"Reference No: {cert['reference_no']}")
-    c.drawRightString(W - 64, H - 250, f"Date of issue: {_fmt(_parse_day(cert['issue_date']))}")
+    # title (bold, underlined, centred)
+    c.setFont("Helvetica-Bold", 12.5)
+    c.drawCentredString(W / 2, H - 209, CERT_TITLE)
+    tw = stringWidth(CERT_TITLE, "Helvetica-Bold", 12.5)
+    c.setLineWidth(0.9)
+    c.line(W / 2 - tw / 2, H - 212.5, W / 2 + tw / 2, H - 212.5)
 
     # body
-    body = ParagraphStyle("b", fontName="Helvetica", fontSize=11.5, leading=19, textColor=INK, alignment=0)
-    name = cert["employee_name"]; code = cert.get("employee_code")
-    dept = cert.get("department")
-    text = (f"This is to certify that <b>{_esc(name)}</b>"
-            + (f" (Employee ID: <b>{_esc(code)}</b>)" if code else "")
-            + f" was employed with {ORG_NAME} as <b>{_esc(cert['designation'])}</b>"
-            + (f" in the <b>{_esc(dept)}</b> department" if dept else "")
-            + f" from <b>{_fmt(_parse_day(cert['date_of_joining']))}</b> to <b>{_fmt(_parse_day(cert['last_working_date']))}</b>.")
-    p = Paragraph(text, body); pw, ph = p.wrap(W - 128, 200); p.drawOn(c, 64, H - 290 - ph)
-    y = H - 290 - ph - 22
+    sal = cert.get("salutation") if cert.get("salutation") in SALUTATIONS else "Mx."
+    subj, poss, obj = SALUTATIONS[sal]
+    start, end = _fmt(_parse_day(cert["date_of_joining"])), _fmt(_parse_day(cert["last_working_date"]))
+    posted = (cert.get("posted_at") or "").strip()
+    p1 = (f"This is to certify that {sal} {_esc(cert['employee_name'])} was employed with {ORG_NAME} from {start} to {end}. "
+          f"During {poss} tenure with the organization, {subj} worked in the capacity of {_esc(cert['designation'])}"
+          + (f" and was posted at our {_esc(posted)}" if posted else "") + ".")
+    p2 = f"We appreciate {poss} contributions to the organization and wish {obj} the very best in all {poss} future endeavors."
+    body = ParagraphStyle("body", fontName="Helvetica", fontSize=12, leading=19.5, textColor=INK)
+    y = H - 248
+    for text in (p1, p2):
+        para = Paragraph(text, body)
+        _, ph = para.wrap(TEXT_W, 400)
+        para.drawOn(c, LM, y - ph)
+        y -= ph + 12
 
-    # details table
-    rows = [["Employee name", name], ["Employee ID", code or "—"], ["Designation", cert["designation"]],
-            ["Department", dept or "—"], ["Date of joining", _fmt(_parse_day(cert["date_of_joining"]))],
-            ["Last working date", _fmt(_parse_day(cert["last_working_date"]))]]
-    cell = ParagraphStyle("c", fontName="Helvetica", fontSize=10, leading=13, textColor=INK)
-    cellb = ParagraphStyle("cb", parent=cell, fontName="Helvetica-Bold")
-    t = Table([[Paragraph(_esc(a), cellb), Paragraph(_esc(b), cell)] for a, b in rows], colWidths=[130, W - 128 - 130])
-    t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cccccc")), ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f6f6f6")),
-                           ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
-    tw, th = t.wrap(W - 128, 400); t.drawOn(c, 64, y - th)
-    y = y - th - 28
-    closing = Paragraph("This certificate is issued on the above date. We wish them every success in their future endeavours.", body)
-    cw, ch = closing.wrap(W - 128, 100); closing.drawOn(c, 64, y - ch)
+    # signature block
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(LM, H - 446, f"For {ORG_NAME},")
+    c.drawString(LM, H - 487, cert["signatory_name"])
+    desg = cert["signatory_designation"].strip()
+    c.drawString(LM, H - 510, desg if desg.endswith(".") else desg + ".")
 
-    # signatory
-    sy = 190
-    c.setStrokeColor(INK); c.setLineWidth(0.6); c.line(W - 64 - 190, sy + 30, W - 64, sy + 30)
-    c.setFont("Helvetica-Bold", 10.5); c.setFillColor(INK); c.drawRightString(W - 64, sy + 15, cert["signatory_name"])
-    c.setFont("Helvetica", 9.5); c.drawRightString(W - 64, sy + 2, cert["signatory_designation"])
-    c.drawRightString(W - 64, sy - 11, f"For {ORG_NAME}")
-
-    # QR — drawn as vector squares (crisp at any print size) with a quiet zone
+    # QR — drawn as vector squares (crisp at any print size) with a white quiet zone
     url = _verify_url(cert["token"])
     qr = segno.make(url, error="m", micro=False)
-    mod = 3.6                       # pt per module; ~34 modules -> ~3.4 cm, well above scan minimums
     n = qr.symbol_size(border=0)[0]
+    mod = 2.7
     size = n * mod
-    qx, qy = 64, 78
-    c.setFillColor(colors.white); c.rect(qx - 8, qy - 8, size + 16, size + 16, stroke=0, fill=1)   # quiet zone
+    qx, qy = LM, 78
+    c.setFillColor(colors.white)
+    c.rect(qx - 7, qy - 7, size + 14, size + 14, stroke=0, fill=1)
     c.setFillColor(colors.black)
     for r, row in enumerate(qr.matrix):
         for col, bit in enumerate(row):
             if bit:
                 c.rect(qx + col * mod, qy + (n - 1 - r) * mod, mod + 0.15, mod + 0.15, stroke=0, fill=1)
-    c.setFillColor(INK); c.setFont("Helvetica-Bold", 9.5); c.drawString(qx + size + 18, qy + size - 12, "Scan to verify this certificate")
-    c.setFont("Helvetica", 8.5); c.setFillColor(MUTED)
-    c.drawString(qx + size + 18, qy + size - 26, "No login or app needed. The online record is the")
-    c.drawString(qx + size + 18, qy + size - 38, "official source — if it does not show “Verified”,")
-    c.drawString(qx + size + 18, qy + size - 50, "this document should not be relied upon.")
-    c.setFont("Helvetica", 7.5)
+    tx = qx + size + 16
+    c.setFillColor(INK)
+    c.setFont("Helvetica-Bold", 8.5)
+    c.drawString(tx, qy + size - 10, "Scan to verify this certificate")
+    c.setFont("Helvetica", 7.6)
+    c.setFillColor(MUTED)
+    c.drawString(tx, qy + size - 22, "No login or app needed. The online record is the")
+    c.drawString(tx, qy + size - 32, "official source — if it does not show “Verified”,")
+    c.drawString(tx, qy + size - 42, "this document should not be relied upon.")
     short = DASHBOARD_URL.rstrip("/").replace("https://", "").replace("http://", "") + "/verify/…"
-    c.drawString(qx + size + 18, qy + 2, f"{short}   Ref: {cert['reference_no']}")
+    c.setFont("Helvetica", 7)
+    c.drawString(tx, qy + 2, f"{short}    Code: {cert['reference_no']}")
+
+    # letterhead footer: address, contact line, red bar
+    line1 = "GDMR BUILDING, T.C 31/118, RNRA 1, P.S NATARAJAPILLAI ROAD, PERURKADA, THIRUVANANTHAPURAM, KERALA. 695005"
+    line2 = "www.gdmrfoundation.com  |  info@gdmrfoundation.com  |  +91 9400539422"
+    fs = min(8.2, (W - 20) / stringWidth(line1, "Helvetica", 1))
+    c.setFillColor(INK)
+    c.setFont("Helvetica", fs)
+    c.drawCentredString(W / 2, 34, line1)
+    c.drawCentredString(W / 2, 22.5, line2)
+    c.setFillColor(RED)
+    c.rect(0, 0, W, 11, stroke=0, fill=1)
 
     # status watermark for withdrawn certificates
     if cert["status"] != "active":
-        c.saveState(); c.translate(W / 2, H / 2); c.rotate(35)
-        c.setFillColor(colors.Color(0.85, 0.1, 0.1, alpha=0.18)); c.setFont("Helvetica-Bold", 78)
+        c.saveState()
+        c.translate(W / 2, H / 2)
+        c.rotate(35)
+        c.setFillColor(colors.Color(0.85, 0.1, 0.1, alpha=0.18))
+        c.setFont("Helvetica-Bold", 78)
         c.drawCentredString(0, 0, "REVOKED" if cert["status"] == "revoked" else "SUPERSEDED")
         c.restoreState()
 
-    c.showPage(); c.save()
+    c.showPage()
+    c.save()
     buf.seek(0)
     return buf
 
@@ -446,7 +498,7 @@ def certificate_pdf(cert_id):
     _audit(cert, "downloaded", request.user, new=cert["status"])
     safe = re.sub(r"[^A-Za-z0-9_-]+", "_", cert["employee_name"]).strip("_") or "Employee"
     return send_file(build_pdf(cert), mimetype="application/pdf", as_attachment=True,
-                     download_name=f"Experience_Certificate_{safe}_{cert['reference_no']}.pdf")
+                     download_name=f"Relieving_Service_Certificate_{safe}_{cert['reference_no']}.pdf")
 
 
 # ── PUBLIC verification (no login) ───────────────────────────────────────────
@@ -475,7 +527,7 @@ def public_verify(token):
     certificates_col.update_one({"_id": cert["_id"]}, {"$inc": {"verify_count": 1}, "$set": {"last_verified_at": now}})
     certificate_verifications_col.insert_one({"reference_no": cert["reference_no"], "status": status, "at": now})
 
-    out = {"status": status, "organisation": ORG_NAME, "reference_no": cert["reference_no"],
+    out = {"status": status, "organisation": ORG_NAME, "certificate_title": CERT_TITLE, "reference_no": cert["reference_no"],
            "issue_date": cert.get("issue_date"), "checked_at": now.isoformat()}
     if status == "verified":
         out.update({
