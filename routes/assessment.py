@@ -303,14 +303,20 @@ def start_assessment_by_token(token):
 
 @bp.route("/api/assessment/submit", methods=["POST"])
 def submit_assessment():
-    data      = request.json or {}
+    data      = request.get_json(silent=True)
+    data      = data if isinstance(data, dict) else {}
     token     = data.get("token", "")
     answers   = data.get("answers", [])
     forced    = bool(data.get("forced",    False))
     timed_out = bool(data.get("timed_out", False))
 
-    if not token:
+    # SECURITY: the token must be plain text. A JSON object such as {"$ne": ""}
+    # used to be passed straight into the database query and matched somebody
+    # else's pending test, letting a stranger submit it.
+    if not isinstance(token, str) or not token or len(token) > 200:
         return jsonify({"message": "token is required"}), 400
+    if not isinstance(answers, list) or len(answers) > 500 or not all(isinstance(a, dict) for a in answers):
+        return jsonify({"message": "answers must be a list."}), 400
 
     invite = candidates_col.find_one({"token": token})
     if not invite:
@@ -332,7 +338,7 @@ def submit_assessment():
     correct   = 0
     for ans in answers:
         qi = ans.get("question_index")
-        if qi is None or qi >= len(questions):
+        if not isinstance(qi, int) or isinstance(qi, bool) or qi < 0 or qi >= len(questions):
             continue
         q = questions[qi]
         if q.get("type") == "mcq":

@@ -11,7 +11,7 @@ from bson import ObjectId
 from database import (lms_courses_col, lms_progress_col,
                       access_grants_col, users_col)
 from decorators import token_required
-from helpers import _is_admin, _mgr_depts, _today_ist
+from helpers import _is_admin, _mgr_depts, _today_ist, safe_http_url
 from config import IST
 from utils import send_email
 
@@ -92,6 +92,11 @@ def _normalize_modules(modules):
                 l["_id"] = str(ObjectId())
             elif l.get("_id"):
                 l["_id"] = str(l["_id"])
+            # Lesson links are shown to learners as clickable hrefs: keep only real
+            # http(s) links (a "javascript:" link would run in the learner's session).
+            for key in ("url", "resource_url", "link"):
+                if l.get(key) and not safe_http_url(l.get(key)):
+                    l[key] = ""
     return modules
 
 

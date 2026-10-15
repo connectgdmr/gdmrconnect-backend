@@ -22,7 +22,7 @@ from pymongo import ReturnDocument
 from database import ats_candidates_col, users_col, counters_col
 from decorators import token_required
 from extensions import bcrypt, limiter
-from helpers import _is_admin, _mgr_depts, parse_employment_type, _has_module_grant, _dept_list
+from helpers import _is_admin, _mgr_depts, parse_employment_type, _has_module_grant, _dept_list, safe_http_url
 from utils import send_email, generate_random_password
 from config import IST, GROQ_API_KEY, GROQ_MODEL
 
@@ -542,6 +542,8 @@ def ats_create_candidate():
     email = str(data.get("email", "")).strip()
     if not name:
         return jsonify({"message": "name is required"}), 400
+    if str(data.get("resume_url") or "").strip() and not safe_http_url(str(data.get("resume_url"))):
+        return jsonify({"message": "The resume link must start with http:// or https://"}), 400
     if email and not EMAIL_RE.match(email):
         return jsonify({"message": "Please enter a valid email address."}), 400
     phone = str(data.get("phone", "")).strip()
@@ -618,6 +620,8 @@ def ats_update_candidate(candidate_id):
         return jsonify({"message": "Candidate not found"}), 404
 
     data = request.json or {}
+    if str(data.get("resume_url") or "").strip() and not safe_http_url(str(data.get("resume_url"))):
+        return jsonify({"message": "The resume link must start with http:// or https://"}), 400
     if "email" in data and data["email"] and not EMAIL_RE.match(str(data["email"]).strip()):
         return jsonify({"message": "Please enter a valid email address."}), 400
     if "phone" in data and data["phone"] and not PHONE_RE.match(str(data["phone"]).strip().replace(" ", "")):
@@ -1004,6 +1008,8 @@ def ats_add_recording(candidate_id):
     url  = str(data.get("url", "")).strip()
     if not url:
         return jsonify({"message": "url is required"}), 400
+    if not safe_http_url(url):
+        return jsonify({"message": "The link must start with http:// or https://"}), 400
     entry  = {
         "type":     str(data.get("type", "")).strip(),
         "url":      url,
@@ -1029,6 +1035,8 @@ def ats_add_portfolio(candidate_id):
     url = str((request.json or {}).get("url", "")).strip()
     if not url:
         return jsonify({"message": "url is required"}), 400
+    if not safe_http_url(url):
+        return jsonify({"message": "The link must start with http:// or https://"}), 400
     result = ats_candidates_col.update_one({"_id": obj}, {"$addToSet": {"portfolio_links": url}})
     if result.matched_count == 0:
         return jsonify({"message": "Candidate not found"}), 404

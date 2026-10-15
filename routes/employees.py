@@ -89,20 +89,45 @@ def delete_admin(admin_id):
 
 @bp.route("/api/register-admin", methods=["POST"])
 def register_admin():
-    """Bootstrap + capped admin registration — max 3 admin accounts allowed."""
+    """
+    Create an admin account.
+
+    SECURITY: this used to need no login at all, so anyone could create an
+    admin while fewer than 3 existed. Now:
+      * first-ever setup (no admin or owner exists yet): open, so a brand-new
+        deployment can create its first admin;
+      * otherwise: only a logged-in admin/owner can add another one.
+    """
+    if users_col.count_documents({"role": {"$in": ["admin", "owner"]}}) == 0:
+        return _register_admin_core()
+    return _register_admin_authed()
+
+
+@token_required
+def _register_admin_authed():
+    if not _is_admin(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    return _register_admin_core()
+
+
+def _register_admin_core():
+    """Capped admin registration — max 3 admin accounts allowed."""
     admin_count = users_col.count_documents({"role": "admin"})
     if admin_count >= 3:
         return jsonify({"message": "Maximum of 3 admin accounts allowed."}), 403
 
-    data     = request.json
-    email    = data.get("email")
-    name     = data.get("name", "Admin")
+    data     = request.get_json(silent=True) or {}
+    from helpers import is_strong_password, _sanitize, _valid_email
+    # Strings only: a JSON object here would otherwise be used inside the database query.
+    email    = _sanitize(data.get("email"), 254).lower()
+    name     = _sanitize(data.get("name"), 120) or "Admin"
     password = data.get("password")
 
-    if not email or not password:
+    if not email or not isinstance(password, str) or not password:
         return jsonify({"message": "Email and password are required."}), 400
+    if not _valid_email(email):
+        return jsonify({"message": "Please enter a valid email address."}), 400
 
-    from helpers import is_strong_password
     if not is_strong_password(password):
         return jsonify({"message": "Password must be at least 8 characters with uppercase, lowercase, number, and special character."}), 400
 

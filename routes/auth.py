@@ -21,8 +21,11 @@ bp = Blueprint("auth", __name__)
 
 def _login_rate_key():
     """Key login rate limiting by email so CGNAT users (Jio etc.) don't share a bucket."""
-    data  = request.get_json(silent=True, force=True) or {}
-    email = (data.get("email") or "").strip().lower()
+    data  = request.get_json(silent=True, force=True)
+    email = data.get("email") if isinstance(data, dict) else None
+    # Only a string counts as an email here — anything else (an object, a list)
+    # must not crash the rate limiter, it just falls back to the caller's IP.
+    email = email.strip().lower() if isinstance(email, str) else ""
     return email if email else get_remote_address()
 
 
@@ -38,9 +41,10 @@ def _forgot_pw_key():
 @bp.route("/api/login", methods=["POST"])
 @limiter.limit("10 per minute", key_func=_login_rate_key)
 def login():
-    data     = request.get_json(silent=True) or {}
-    email    = _sanitize(data.get("email") or "", max_len=254).lower()
-    password = data.get("password") or ""
+    data     = request.get_json(silent=True)
+    data     = data if isinstance(data, dict) else {}
+    email    = _sanitize(data.get("email"), max_len=254).lower()
+    password = data.get("password") if isinstance(data.get("password"), str) else ""
 
     if not email or not password:
         return jsonify({"message": "Email and password are required."}), 400
@@ -63,9 +67,18 @@ def login():
     # Account lockout check
     now          = datetime.now(timezone.utc)
     locked_until = user.get("locked_until")
-    if locked_until and locked_until > now:
-        mins_left = max(1, int((locked_until - now).total_seconds() / 60) + 1)
-        return jsonify({"message": f"Account locked due to too many failed attempts. Try again in {mins_left} minute(s)."}), 423
+    if locked_until:
+        # MongoDB hands datetimes back WITHOUT a timezone (naive UTC). Comparing
+        # that with an aware "now" raised TypeError, so a locked account crashed
+        # on every login attempt — forever, even after the 15 minutes were up.
+        if locked_until.tzinfo is None:
+            locked_until = locked_until.replace(tzinfo=timezone.utc)
+        if locked_until > now:
+            mins_left = max(1, int((locked_until - now).total_seconds() / 60) + 1)
+            return jsonify({"message": f"Account locked due to too many failed attempts. Try again in {mins_left} minute(s)."}), 423
+        # The lock has expired: start the count again so one more typo doesn't re-lock immediately.
+        users_col.update_one({"_id": user["_id"]}, {"$set": {"failed_login_attempts": 0, "locked_until": None}})
+        user["failed_login_attempts"] = 0
 
     if not bcrypt.check_password_hash(user["password"], password):
         attempts    = user.get("failed_login_attempts", 0) + 1

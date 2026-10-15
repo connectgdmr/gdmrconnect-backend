@@ -72,6 +72,26 @@ def _valid_email(email):
     return bool(re.match(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$", email))
 
 
+def safe_http_url(value, max_len=500):
+    """
+    The link if it is an absolute http(s) URL, else None. Used wherever a user
+    can type a link that is later shown as a clickable href — a "javascript:",
+    "data:" or "vbscript:" link there would run script in whoever clicks it
+    (stored XSS), so those are refused at the door.
+    """
+    from urllib.parse import urlparse
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v or len(v) > max_len or any(ord(ch) < 32 or ord(ch) == 127 for ch in v):
+        return None
+    try:
+        p = urlparse(v)
+    except ValueError:
+        return None
+    return v if p.scheme in ("http", "https") and p.netloc else None
+
+
 # ── Employee status serialiser ────────────────────────────────────────────────
 
 def _serialize_emp_status(user_doc):

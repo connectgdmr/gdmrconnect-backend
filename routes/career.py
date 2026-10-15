@@ -12,7 +12,7 @@ from bson import ObjectId
 
 from database import career_jobs_col, referrals_col, users_col
 from decorators import token_required
-from helpers import _is_admin, _has_module_grant, resolve_employee_manager_emails, all_owner_emails
+from helpers import _is_admin, _has_module_grant, resolve_employee_manager_emails, all_owner_emails, safe_http_url
 from utils import send_email
 from config import HR_EMAIL
 
@@ -221,6 +221,10 @@ def submit_referral():
 
     if not candidate_name or not candidate_email:
         return jsonify({"message": "candidate_name and candidate_email are required"}), 400
+    # SECURITY: this link is shown to admins as a clickable href. Only real
+    # web links are accepted — a "javascript:" link would run in the admin's session.
+    if resume_link and not safe_http_url(resume_link):
+        return jsonify({"message": "The resume link must start with http:// or https://"}), 400
 
     # job_id is optional — a referral isn't always for a currently-posted
     # opening; without this an employee had no way to refer someone when
