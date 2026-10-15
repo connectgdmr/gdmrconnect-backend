@@ -15,11 +15,12 @@ import os
 import gzip
 import cloudinary
 from flask import Flask, request, jsonify, send_from_directory
+from werkzeug.exceptions import HTTPException
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
 
-from config import SECRET_KEY
+from config import SECRET_KEY, CORS_ORIGINS, STRICT_SECRET
 from extensions import bcrypt, limiter
 from database import db, mongo_client  # db import is also for side-effect (indexes, migration)
 
@@ -35,8 +36,17 @@ def create_app():
             "SECRET_KEY environment variable is not set or is using the insecure default. "
             "Set a strong random value (32+ chars) in your Railway environment variables."
         )
+    # A short secret makes login tokens guessable offline. We don't crash a working
+    # deployment over it, but say so loudly; STRICT_SECRET=1 turns it into a hard error.
+    if len(SECRET_KEY) < 32:
+        msg = "SECRET_KEY is shorter than 32 characters — replace it with a long random value (e.g. 64 hex characters)."
+        if STRICT_SECRET:
+            raise RuntimeError(msg)
+        print("WARNING: " + msg)
     app.config["SECRET_KEY"]        = SECRET_KEY
     app.config["BCRYPT_LOG_ROUNDS"] = 12
+    # Largest request the server will read at all (uploads are limited more tightly per route).
+    app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
     # ── Reverse-proxy (Railway) ───────────────────────────────────────────────
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -53,7 +63,7 @@ def create_app():
     # ── CORS ──────────────────────────────────────────────────────────────────
     CORS(app, resources={
         r"/*": {
-            "origins":             "*",
+            "origins":             CORS_ORIGINS,   # only our own website(s) — see config.CORS_ORIGINS
             "supports_credentials": False,
             "allow_headers":       ["Content-Type", "Authorization"],
             "methods":             ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -71,6 +81,40 @@ def create_app():
         print("Cloudinary configured successfully.")
     except Exception as e:
         print(f"Warning: Cloudinary configuration failed. Error: {e}")
+
+    # ── request size, security headers, clean errors ─────────────────────────
+    @app.before_request
+    def _limit_json_size():
+        # A JSON body is a few KB in normal use; refuse anything over 2 MB before parsing it.
+        if request.is_json and (request.content_length or 0) > 2 * 1024 * 1024:
+            return jsonify({"message": "Request too large."}), 413
+
+    @app.after_request
+    def _security_headers(response):
+        h = response.headers
+        h.setdefault("X-Content-Type-Options", "nosniff")
+        h.setdefault("X-Frame-Options", "DENY")
+        h.setdefault("Referrer-Policy", "no-referrer")
+        h.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        if request.is_secure:
+            h.setdefault("Strict-Transport-Security", "max-age=31536000")
+        if response.content_type and response.content_type.startswith("application/json"):
+            h.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+        if request.path.startswith("/api/"):
+            h.setdefault("Cache-Control", "no-store")   # private data should not sit in shared caches
+        return response
+
+    @app.errorhandler(HTTPException)
+    def _http_error(e):
+        if not e.code or e.code < 400:
+            return e
+        return jsonify({"message": e.name}), e.code
+
+    @app.errorhandler(Exception)
+    def _unexpected_error(e):
+        # Log the details for us, show the caller nothing technical.
+        app.logger.exception("Unhandled error on %s %s", request.method, request.path)
+        return jsonify({"message": "Something went wrong. Please try again."}), 500
 
     # ── gzip compression ──────────────────────────────────────────────────────
     @app.after_request
@@ -144,6 +188,7 @@ def create_app():
     from routes.ats           import bp as ats_bp
     from routes.achievements  import bp as achievements_bp
     from routes.goals         import bp as goals_bp
+    from routes.mfa           import bp as mfa_bp
     from routes.certificates  import bp as certificates_bp
     from routes.chat          import bp as chat_bp
     from routes.calendar      import bp as calendar_bp
@@ -154,7 +199,7 @@ def create_app():
         leaves_bp, assistant_bp, assets_bp, announcements_bp,
         notifications_bp, stats_bp, assessment_bp, lms_bp,
         career_bp, payroll_bp, work_plans_bp, clients_bp,
-        ats_bp, achievements_bp, goals_bp, certificates_bp, chat_bp, calendar_bp,
+        ats_bp, achievements_bp, goals_bp, certificates_bp, mfa_bp, chat_bp, calendar_bp,
         attendance_reports_bp, biometric_bp,
     ):
         app.register_blueprint(bp)

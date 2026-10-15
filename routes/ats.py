@@ -1657,6 +1657,10 @@ def ats_upload_resume():
     if len(data) > _RESUME_MAX_BYTES:
         return jsonify({"message": "That file is too large (max 10 MB)."}), 400
     file.seek(0)
+    from helpers import validate_upload
+    bad = validate_upload(file)      # contents must really be a PDF / Word file, not just named like one
+    if bad:
+        return jsonify({"message": bad}), 400
 
     try:
         import cloudinary.uploader as _cu

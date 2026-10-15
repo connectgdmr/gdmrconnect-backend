@@ -22,7 +22,7 @@ from decorators import token_required
 from extensions import bcrypt
 from helpers import (
     _is_admin, _mgr_depts, _serialize_emp_status, parse_employment_type, _has_module_grant,
-    is_offboarded, _team_ids_incl_dept_head, is_employee_locked, redact_locked_employee,
+    is_offboarded, _team_ids_incl_dept_head, is_employee_locked, redact_locked_employee, USER_HIDDEN, validate_upload,
 )
 from utils import send_email, generate_random_password
 from config import IST
@@ -333,7 +333,7 @@ def list_employees():
             {"resignation": None},
         ]
 
-    all_users = list(users_col.find(emp_query, {"password": 0}))
+    all_users = list(users_col.find(emp_query, USER_HIDDEN))
     # Owners can be assigned as a manager too (see update_manager_role, which
     # promotes manager -> owner) — list_managers() already includes both
     # roles for the "Assigned Manager" dropdown; this lookup must match or
@@ -372,7 +372,7 @@ def list_managers():
     # Managers List page, and there's no legitimate reason to assign
     # someone to, or list as active, a manager who's already left.
     managers = []
-    for m in users_col.find({"role": {"$in": ["manager", "owner"]}}, {"password": 0}):
+    for m in users_col.find({"role": {"$in": ["manager", "owner"]}}, USER_HIDDEN):
         if is_offboarded(m):
             continue
         m["_id"] = str(m["_id"])
@@ -708,7 +708,7 @@ def manager_my_employees():
     except Exception:
         team_oids = []
     rows = []
-    for u in users_col.find({"_id": {"$in": team_oids}}, {"password": 0}):
+    for u in users_col.find({"_id": {"$in": team_oids}}, USER_HIDDEN):
         if is_offboarded(u):
             continue
         u["_id"] = str(u["_id"])
@@ -824,6 +824,9 @@ def _upload_employee_doc_file(file, emp_id):
     """Push an employee-file upload to Cloudinary and return its secure URL.
     Raises ValueError with a message an admin can act on when the provider
     rejects the file (usually: too large), instead of leaking a raw 500."""
+    bad = validate_upload(file)
+    if bad:
+        raise ValueError(bad)
     filename = (getattr(file, "filename", "") or "").lower()
     is_pdf = filename.endswith(".pdf") or (getattr(file, "mimetype", "") or "").lower() == "application/pdf"
     # PDFs go up as `raw`: as `auto`/`image` Cloudinary ingests them for
@@ -1088,7 +1091,7 @@ def delete_manager(man_id):
 
 def _get_emp_or_404(emp_id):
     try:
-        emp = users_col.find_one({"_id": ObjectId(emp_id)}, {"password": 0})
+        emp = users_col.find_one({"_id": ObjectId(emp_id)}, USER_HIDDEN)
     except Exception:
         return None, (jsonify({"message": "Invalid employee ID."}), 400)
     if not emp:

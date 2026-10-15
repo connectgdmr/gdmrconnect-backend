@@ -28,21 +28,32 @@ def token_required(f):
             return jsonify({"message": "Authentication Token is missing! Please log in."}), 401
 
         try:
+            # "exp" is mandatory: a token without an expiry would never stop working.
             data = jwt.decode(
-                token, current_app.config["SECRET_KEY"], algorithms=["HS256"]
+                token, current_app.config["SECRET_KEY"], algorithms=["HS256"],
+                options={"require": ["exp"]},
             )
+            # A half-finished two-step login ("mfa" token) must never work as a session.
+            if data.get("typ") == "mfa":
+                return jsonify({"message": "Token is invalid!"}), 401
             user_id = data.get("user_id")
             current_user = users_col.find_one({"_id": ObjectId(user_id)})
 
             if not current_user:
                 return jsonify({"message": "Invalid token. User not found in database."}), 401
 
+            # Revocation: bumping a user's token_version (password change/reset,
+            # "log out everywhere", admin force-logout) kills every older token.
+            if int(data.get("tv", 0)) != int(current_user.get("token_version", 0)):
+                return jsonify({"message": "Session expired. Please log in again."}), 401
+
             request.user = current_user
 
         except jwt.ExpiredSignatureError:
             return jsonify({"message": "Session expired. Please log in again."}), 401
-        except Exception as e:
-            return jsonify({"message": "Token is invalid!", "error": str(e)}), 401
+        except Exception:
+            # Deliberately no exception text in the response (it only helps attackers).
+            return jsonify({"message": "Token is invalid!"}), 401
 
         return f(*args, **kwargs)
     return decorated

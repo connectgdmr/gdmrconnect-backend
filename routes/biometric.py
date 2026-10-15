@@ -24,12 +24,14 @@ through the exact same helpers.record_attendance_punch() a photo check-in
 uses — same shift-timing rules, same attendance_col, same dedup index —
 just with method="fingerprint"/"face" instead of "photo".
 """
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
 
 from database import biometric_devices_col, biometric_enrollments_col, users_col
 from decorators import token_required
+from extensions import limiter
+from flask_limiter.util import get_remote_address
 from helpers import _is_admin, _has_module_grant, record_attendance_punch, infer_punch_type
 from config import IST, BACKEND_PUBLIC_URL
 
@@ -79,7 +81,25 @@ def _is_recently_active(last_seen_at):
 # created for it) — the safety net for this open trust model.
 # =============================================================================
 
+def _device_key():
+    """Rate-limit per device serial (falls back to the caller's address)."""
+    return request.args.get("SN") or get_remote_address()
+
+
+def _ip_allowed(device):
+    """If an admin has listed allowed_ips on the device, only those addresses may talk as it."""
+    allowed = device.get("allowed_ips") or []
+    return (not allowed) or (request.remote_addr in allowed)
+
+
+_MAX_PUSH_BYTES = 1024 * 1024        # a punch-log upload is a few KB; 1 MB is generous
+_MAX_PUSH_LINES = 1000
+_PUNCH_MAX_AGE = timedelta(days=31)  # a device that was offline can catch up, but not backdate forever
+_PUNCH_MAX_FUTURE = timedelta(hours=6)
+
+
 @bp.route("/iclock/cdata", methods=["GET"])
+@limiter.limit("120 per minute", key_func=_device_key)
 def device_handshake():
     """Handshake + periodic heartbeat. A device calls this on boot and every
     few minutes after — the first successful call is what flips a device
@@ -89,10 +109,10 @@ def device_handshake():
         return "ERROR", 400
 
     device = biometric_devices_col.find_one({"serial_number": serial})
-    if not device:
+    if not device or not _ip_allowed(device):
         return "ERROR", 403
 
-    updates = {"last_seen_at": datetime.now(timezone.utc)}
+    updates = {"last_seen_at": datetime.now(timezone.utc), "last_seen_ip": request.remote_addr}
     if device.get("status") == "pending":
         updates["status"] = "connected"
     biometric_devices_col.update_one({"_id": device["_id"]}, {"$set": updates})
@@ -100,6 +120,7 @@ def device_handshake():
 
 
 @bp.route("/iclock/cdata", methods=["POST"])
+@limiter.limit("120 per minute", key_func=_device_key)
 def device_push():
     """Punch logs (table=ATTLOG) and locally-enrolled users (table=OPERLOG).
     Exact line layouts are ADMS's — see the field comments below; may need
@@ -107,12 +128,14 @@ def device_push():
     serial = request.args.get("SN")
     table  = (request.args.get("table") or "").upper()
     device = biometric_devices_col.find_one({"serial_number": serial}) if serial else None
-    if not device:
+    if not device or not _ip_allowed(device):
         return "ERROR", 403
+    if (request.content_length or 0) > _MAX_PUSH_BYTES:
+        return "ERROR", 413
 
-    biometric_devices_col.update_one({"_id": device["_id"]}, {"$set": {"last_seen_at": datetime.now(timezone.utc)}})
+    biometric_devices_col.update_one({"_id": device["_id"]}, {"$set": {"last_seen_at": datetime.now(timezone.utc), "last_seen_ip": request.remote_addr}})
     device_id = str(device["_id"])
-    body      = request.get_data(as_text=True) or ""
+    body      = "\n".join((request.get_data(as_text=True) or "").splitlines()[:_MAX_PUSH_LINES])
 
     if table == "ATTLOG":
         # Each line: PIN <tab> "YYYY-MM-DD HH:MM:SS" <tab> Status <tab> Verify <tab> ...
@@ -132,6 +155,9 @@ def device_push():
             except ValueError:
                 continue
             punch_time_utc = IST.localize(punch_local).astimezone(timezone.utc)
+            now_utc = datetime.now(timezone.utc)
+            if punch_time_utc > now_utc + _PUNCH_MAX_FUTURE or punch_time_utc < now_utc - _PUNCH_MAX_AGE:
+                continue   # implausible timestamp (wrong device clock, or a forged punch) — never record it
 
             enrollment = biometric_enrollments_col.find_one({"device_id": device_id, "device_pin": pin})
             if not enrollment or not enrollment.get("employee_id"):

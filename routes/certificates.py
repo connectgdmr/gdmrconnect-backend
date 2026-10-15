@@ -467,7 +467,8 @@ def public_verify(token):
     cert = certificates_col.find_one({"token": token}) if _TOKEN_RE.match(token or "") else None
     now = datetime.now(timezone.utc)
     if not cert:
-        certificate_verifications_col.insert_one({"reference_no": None, "status": "invalid", "at": now})
+        # Not logged on purpose: anyone can scan made-up codes, and a log row per
+        # guess would let a script fill the database. The rate limit covers abuse.
         return _no_store(jsonify({"status": "invalid", "organisation": ORG_NAME})), 200
 
     status = {"active": "verified", "revoked": "revoked", "superseded": "superseded"}.get(cert["status"], "invalid")

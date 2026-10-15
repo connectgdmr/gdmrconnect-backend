@@ -323,6 +323,10 @@ def upload_client_file(client_id):
     parent_id = request.form.get("parent_id") or None
     if parent_id and _resolve_parent(client_id, parent_id) is False:
         return jsonify({"message": "Invalid parent folder"}), 400
+    from helpers import validate_upload
+    bad = validate_upload(file)
+    if bad:
+        return jsonify({"message": bad}), 400
 
     file.seek(0, 2)
     size = file.tell()

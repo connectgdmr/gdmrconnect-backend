@@ -474,6 +474,10 @@ def apply_leave():
     attachment_url = None
     file = request.files.get("attachment")
     if file:
+        from helpers import validate_upload
+        bad = validate_upload(file)
+        if bad:
+            return jsonify({"message": bad}), 400
         try:
             upload_result  = cloudinary.uploader.upload(file, folder="leave_attachments")
             attachment_url = upload_result.get("secure_url")

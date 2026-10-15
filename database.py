@@ -138,6 +138,15 @@ goals_col = db["goals"]
 # approved HRIS fields, status ("active"|"revoked"|"superseded"), links to the
 # certificate it replaces / was replaced by, issued_by, revoke details.
 certificates_col = db["certificates"]
+
+# ── Login protection (routes/auth.py) ───────────────────────────────────────────
+# Failed-login counters keyed by email for EVERY email typed (existing or not), so
+# the lock behaves identically and does not reveal which accounts exist. Expires
+# a day after the last attempt.
+login_throttle_col = db["login_throttle"]
+# Password-reset links: token_hash (sha256 of the emailed token), user_id, expires_at,
+# used. The password is only changed when the owner opens the link.
+password_resets_col = db["password_resets"]
 # Append-only history of every generate / reissue / supersede / revoke / download.
 certificate_audit_col = db["certificate_audit"]
 # One tiny doc per public scan (reference, result, time only); expires after a year.
@@ -295,6 +304,9 @@ try:
     employee_lock_audit_col.create_index([("at", -1)], background=True)
     goals_col.create_index([("user_id", 1), ("done", 1), ("deadline", 1)], background=True)
     certificates_col.create_index("reference_no", unique=True, background=True)
+    login_throttle_col.create_index("updated_at", expireAfterSeconds=24 * 3600, background=True)
+    password_resets_col.create_index("token_hash", unique=True, background=True)
+    password_resets_col.create_index("expires_at", expireAfterSeconds=0, background=True)
     certificates_col.create_index("token", unique=True, background=True)
     certificates_col.create_index([("employee_id", 1), ("status", 1)], background=True)
     certificate_audit_col.create_index([("certificate_id", 1), ("at", 1)], background=True)

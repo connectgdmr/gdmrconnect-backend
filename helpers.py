@@ -72,6 +72,51 @@ def _valid_email(email):
     return bool(re.match(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$", email))
 
 
+# Projection for any query that returns user records to the browser: never send the
+# password hash, two-step secrets/backup codes or the token version.
+USER_HIDDEN = {"password": 0, "mfa_secret": 0, "mfa_pending_secret": 0, "mfa_backup_hashes": 0,
+               "mfa_last_step": 0, "token_version": 0}
+
+_BLOCKED_EXT = {".html", ".htm", ".xhtml", ".svg", ".js", ".mjs", ".exe", ".dll", ".bat", ".cmd", ".com", ".msi", ".scr",
+                ".sh", ".ps1", ".vbs", ".jar", ".php", ".py", ".apk"}
+_BLOCKED_START = (b"MZ", b"\x7fELF", b"\xca\xfe\xba\xbe", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"#!")
+_TEXT_START = (b"<!doctype", b"<html", b"<script", b"<svg", b"<?xml", b"<?php")
+_OLE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_EXT_SIGNATURE = {      # a file called X must really look like X
+    ".pdf": lambda h: h.startswith(b"%PDF-"),
+    ".png": lambda h: h.startswith(b"\x89PNG\r\n\x1a\n"),
+    ".jpg": lambda h: h.startswith(b"\xff\xd8\xff"), ".jpeg": lambda h: h.startswith(b"\xff\xd8\xff"),
+    ".gif": lambda h: h.startswith((b"GIF87a", b"GIF89a")),
+    ".webp": lambda h: h[:4] == b"RIFF" and h[8:12] == b"WEBP",
+    ".docx": lambda h: h.startswith(b"PK\x03\x04"), ".xlsx": lambda h: h.startswith(b"PK\x03\x04"),
+    ".pptx": lambda h: h.startswith(b"PK\x03\x04"), ".zip": lambda h: h.startswith(b"PK\x03\x04"),
+    ".doc": lambda h: h.startswith(_OLE), ".xls": lambda h: h.startswith(_OLE), ".ppt": lambda h: h.startswith(_OLE),
+}
+
+
+def validate_upload(file):
+    """
+    Look at the file's real first bytes, not just its name or the browser-supplied
+    type. Returns a message for the user when the file is refused, else None.
+    Refused: programs/scripts/web pages (which could run if opened), and files whose
+    contents don't match their extension (e.g. HTML renamed to .pdf).
+    """
+    import os as _os
+    name = (getattr(file, "filename", "") or "").lower()
+    ext = _os.path.splitext(name)[1]
+    stream = getattr(file, "stream", file)
+    head = stream.read(2048)
+    stream.seek(0)
+    if not head:
+        return "The file is empty."
+    if ext in _BLOCKED_EXT or head.startswith(_BLOCKED_START) or head.lstrip()[:16].lower().startswith(_TEXT_START):
+        return "This type of file is not allowed."
+    check = _EXT_SIGNATURE.get(ext)
+    if check and not check(head):
+        return f"This file doesn't look like a real {ext[1:].upper()} file."
+    return None
+
+
 def safe_http_url(value, max_len=500):
     """
     The link if it is an absolute http(s) URL, else None. Used wherever a user

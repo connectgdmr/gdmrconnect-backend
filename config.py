@@ -18,6 +18,18 @@ SECRET_KEY  = os.getenv("SECRET_KEY")
 CRON_SECRET = os.getenv("CRON_SECRET")
 REDIS_URL   = os.getenv("REDIS_URL", "memory://")
 
+# Websites allowed to call this API from a browser (CORS). Comma-separated env
+# var CORS_ORIGINS adds to the defaults — e.g. a Vercel preview URL.
+CORS_ORIGINS = [o.strip() for o in (
+    "https://www.gdmrconnect.com,https://gdmrconnect.com,http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173"
+    + ("," + os.getenv("CORS_ORIGINS", "") if os.getenv("CORS_ORIGINS") else "")
+).split(",") if o.strip()]
+# Set REQUIRE_ADMIN_MFA=1 to make the login response tell the app that admins/owners
+# should turn on two-step verification (the app then prompts them).
+REQUIRE_ADMIN_MFA = os.getenv("REQUIRE_ADMIN_MFA", "").strip().lower() in ("1", "true", "yes")
+# Set STRICT_SECRET=1 to refuse to start when SECRET_KEY is shorter than 32 characters.
+STRICT_SECRET = os.getenv("STRICT_SECRET", "").strip().lower() in ("1", "true", "yes")
+
 # ── Database ──────────────────────────────────────────────────────────────────
 MONGO_URI = os.getenv("MONGO_URI")
 

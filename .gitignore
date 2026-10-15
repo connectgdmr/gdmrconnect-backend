@@ -1,3 +1,11 @@
 .env
+.env.*
 __pycache__/
 *.pyc
+# Employee photos / uploaded files must never be committed (files go to Cloudinary)
+uploads/attendance_photos/
+uploads/*.jpg
+uploads/*.jpeg
+uploads/*.png
+*.pem
+*.key

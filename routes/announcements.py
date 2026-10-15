@@ -400,6 +400,10 @@ def upload_my_profile_picture():
         return jsonify({"message": "file is required"}), 400
     if file.mimetype not in _PROFILE_PIC_TYPES:
         return jsonify({"message": "Please upload a JPEG, PNG, WEBP, or GIF image."}), 400
+    from helpers import validate_upload
+    bad = validate_upload(file)
+    if bad or not (file.filename or "").lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+        return jsonify({"message": bad or "Please upload a JPEG, PNG, WEBP, or GIF image."}), 400
 
     file.seek(0, 2)
     if file.tell() > 5 * 1024 * 1024:
