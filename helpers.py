@@ -693,6 +693,7 @@ GRANTABLE_MODULES = {
     "career":        "Jobs",
     "ats":           "Recruitment",
     "payroll":       "Payroll",
+    "certificates":  "Experience Certificates",
 }
 
 

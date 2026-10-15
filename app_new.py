@@ -144,6 +144,7 @@ def create_app():
     from routes.ats           import bp as ats_bp
     from routes.achievements  import bp as achievements_bp
     from routes.goals         import bp as goals_bp
+    from routes.certificates  import bp as certificates_bp
     from routes.chat          import bp as chat_bp
     from routes.calendar      import bp as calendar_bp
     from routes.attendance_reports import bp as attendance_reports_bp
@@ -153,7 +154,7 @@ def create_app():
         leaves_bp, assistant_bp, assets_bp, announcements_bp,
         notifications_bp, stats_bp, assessment_bp, lms_bp,
         career_bp, payroll_bp, work_plans_bp, clients_bp,
-        ats_bp, achievements_bp, goals_bp, chat_bp, calendar_bp,
+        ats_bp, achievements_bp, goals_bp, certificates_bp, chat_bp, calendar_bp,
         attendance_reports_bp, biometric_bp,
     ):
         app.register_blueprint(bp)

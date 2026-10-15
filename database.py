@@ -132,6 +132,17 @@ achievements_col = db["achievements"]
 # deadline ("YYYY-MM-DD", IST), done, done_at, created_at. Private to the owner.
 goals_col = db["goals"]
 
+# ── Experience Certificates with QR verification (routes/certificates.py) ───────
+# One doc per issued certificate: reference_no (GDMR-COE-YYYY-NNNN, unique), token
+# (random, unique — the only thing in the QR URL), employee_id + a snapshot of the
+# approved HRIS fields, status ("active"|"revoked"|"superseded"), links to the
+# certificate it replaces / was replaced by, issued_by, revoke details.
+certificates_col = db["certificates"]
+# Append-only history of every generate / reissue / supersede / revoke / download.
+certificate_audit_col = db["certificate_audit"]
+# One tiny doc per public scan (reference, result, time only); expires after a year.
+certificate_verifications_col = db["certificate_verifications"]
+
 # ── Company Holidays ────────────────────────────────────────────────────────
 # {date: "YYYY-MM-DD", day: "Thursday", name: "New Year"} — admin-managed via
 # routes/calendar.py (GET/POST/DELETE /api/holidays), the single source of
@@ -283,6 +294,11 @@ try:
     employee_lock_audit_col.create_index([("employee_id", 1), ("at", -1)], background=True)
     employee_lock_audit_col.create_index([("at", -1)], background=True)
     goals_col.create_index([("user_id", 1), ("done", 1), ("deadline", 1)], background=True)
+    certificates_col.create_index("reference_no", unique=True, background=True)
+    certificates_col.create_index("token", unique=True, background=True)
+    certificates_col.create_index([("employee_id", 1), ("status", 1)], background=True)
+    certificate_audit_col.create_index([("certificate_id", 1), ("at", 1)], background=True)
+    certificate_verifications_col.create_index("at", expireAfterSeconds=365 * 24 * 3600, background=True)
     print("MongoDB indexes ensured.")
 except Exception as _idx_err:
     print(f"Warning: Could not create indexes: {_idx_err}")
