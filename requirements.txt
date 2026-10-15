@@ -13,3 +13,5 @@ cloudinary
 apscheduler
 openpyxl
 reportlab
+pypdf
+python-docx

@@ -9,6 +9,7 @@ import json
 import time
 import traceback
 import requests
+import resume_parser
 import html as _html
 import secrets
 import threading
@@ -1573,14 +1574,81 @@ def ats_ai_overview():
         return jsonify({"message": "Couldn't generate the overview right now. Please try again."}), 502
 
 
+_RESUME_MAX_BYTES = 10 * 1024 * 1024
+_RESUME_LLM_SYSTEM = (
+    "You extract structured data from a resume for an HR system. Contact details were removed on purpose. "
+    "Reply with ONE JSON object only, exactly this shape: "
+    '{"name": "", "job_title": "the role they apply for, or their most recent job title", '
+    '"education": "highest qualification, short, e.g. MBA or B.Com", '
+    '"experience_years": 0, "current_company": "most recent employer, or empty", '
+    '"current_location": "city only, or empty", "notice_period": "only if stated, else empty", '
+    '"skills": ["up to 12 concrete skills"]}. '
+    "experience_years is a number of years of professional work (0 for freshers and students). "
+    "Use an empty string or empty list whenever something is not clearly stated. Never guess."
+)
+
+
+def _resume_llm_fields(text):
+    """Optional AI pass over contact-masked resume text. Returns {} on any problem."""
+    if not GROQ_API_KEY:
+        return {}
+    try:
+        raw = _groq_chat(_RESUME_LLM_SYSTEM, "RESUME TEXT:\n" + resume_parser.mask_contacts(text)[:7000], max_tokens=900)
+        data = _parse_json_block(raw) or {}
+    except Exception as exc:
+        print(f"[resume] AI pass failed: {exc}")
+        return {}
+    out = {}
+    for key in ("name", "job_title", "education", "current_company", "current_location", "notice_period"):
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            out[key] = v.strip()[:80]
+    try:
+        yrs = float(data.get("experience_years"))
+        if 0 <= yrs <= 45:
+            out["experience"] = str(int(yrs)) if yrs == int(yrs) else str(round(yrs, 1))
+    except (TypeError, ValueError):
+        pass
+    skills = [str(x).strip()[:32] for x in (data.get("skills") if isinstance(data.get("skills"), list) else []) if str(x).strip()]
+    if skills:
+        out["skills"] = skills[:12]
+    return out
+
+
+def _find_duplicate(user, email, phone):
+    """An existing candidate (within the caller's scope) with the same email or phone, if any."""
+    ors = []
+    if email:
+        ors.append({"email": {"$regex": "^" + re.escape(email) + "$", "$options": "i"}})
+    if phone:
+        ors.append({"phone": {"$regex": re.escape(phone) + "$"}})
+    if not ors:
+        return None
+    hit = ats_candidates_col.find_one({"$and": [_ats_scope_query(user), {"$or": ors}]}, {"name": 1, "applicant_code": 1, "status": 1})
+    return {"_id": str(hit["_id"]), "name": hit.get("name"), "code": hit.get("applicant_code"), "status": hit.get("status")} if hit else None
+
+
 @bp.route("/api/admin/ats/candidates/upload", methods=["POST"])
 @token_required
+@limiter.limit("20 per minute")
 def ats_upload_resume():
+    """
+    Store a resume and return suggestions for the Add Candidate form. The
+    suggestions are never saved anywhere — the recruiter reviews and confirms
+    them in the form before the candidate is created.
+    """
     if not _ats_allowed(request.user, write=True):
         return jsonify({"message": "Unauthorized"}), 403
     file = request.files.get("file")
-    if not file:
+    if not file or not file.filename:
         return jsonify({"message": "file is required"}), 400
+    fname = file.filename.lower()
+    if not fname.endswith((".pdf", ".doc", ".docx")):
+        return jsonify({"message": "Please upload a PDF or Word (.docx) resume."}), 400
+    data = file.read()
+    if len(data) > _RESUME_MAX_BYTES:
+        return jsonify({"message": "That file is too large (max 10 MB)."}), 400
+    file.seek(0)
 
     try:
         import cloudinary.uploader as _cu
@@ -1594,22 +1662,28 @@ def ats_upload_resume():
     except Exception as e:
         return jsonify({"message": f"Upload failed: {str(e)}"}), 500
 
-    parsed = {"name": "", "email": "", "phone": "", "skills": []}
-    try:
-        import pdfplumber, io as _io
-        file.seek(0)
-        with pdfplumber.open(_io.BytesIO(file.read())) as pdf:
-            text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-        emails = re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)
-        phones = re.findall(r"(?:\+91[\s-]?)?[6-9]\d{9}", text)
-        lines  = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if emails: parsed["email"] = emails[0]
-        if phones: parsed["phone"] = phones[0]
-        if lines:  parsed["name"]  = lines[0]
-    except Exception:
-        pass
+    parsed, status, ai_used = {}, "ok", False
+    if fname.endswith(".doc"):
+        status = "unsupported"          # legacy binary Word — can't be read without extra tooling
+    else:
+        text = resume_parser.extract_text(data, fname)
+        if len(text.strip()) < 40:
+            status = "unreadable"       # scanned image, or an empty/corrupt file
+        else:
+            parsed = resume_parser.heuristics(text)
+            ai = _resume_llm_fields(text)
+            ai_used = bool(ai)
+            for key, val in ai.items():            # AI refines everything except contact details
+                if key == "name" and parsed.get("name"):
+                    continue
+                if key == "skills" and len(val) < 3 and parsed.get("skills"):
+                    continue
+                parsed[key] = val
 
-    return jsonify({"resume_url": resume_url, "parsed": parsed}), 200
+    return jsonify({
+        "resume_url": resume_url, "parsed": parsed, "parse_status": status, "ai_used": ai_used,
+        "duplicate": _find_duplicate(request.user, parsed.get("email", ""), parsed.get("phone", "")),
+    }), 200
 
 
 @bp.route("/api/admin/ats/candidates/<candidate_id>/document", methods=["PUT"])
