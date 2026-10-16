@@ -137,7 +137,7 @@ def _user_names(ids):
 
 # ── eligibility + snapshot ───────────────────────────────────────────────────
 
-def _employee_snapshot(emp):
+def _employee_snapshot(emp, allow_future=False):
     """
     Approved HRIS data for a certificate, or (None, reason) when the employee
     isn't eligible: needs a joining date and a recorded last working day that
@@ -151,7 +151,7 @@ def _employee_snapshot(emp):
         return None, "This employee has no date of joining recorded."
     if not lwd:
         return None, "No last working day is recorded for this employee. Record the resignation first."
-    if lwd > _today():
+    if lwd > _today() and not allow_future:      # allow_future: only for listing people who are serving notice
         return None, f"The last working day ({_fmt(lwd)}) hasn't passed yet."
     if lwd < doj:
         return None, "The last working day is before the date of joining — please correct the employee record."
@@ -176,10 +176,12 @@ def eligible_employees():
     rows = []
     for e in users_col.find({"role": {"$in": ["employee", "manager"]}, "resignation.last_working_day": {"$ne": None}},
                             {"name": 1, "doj": 1, "position": 1, "department": 1, "employee_code": 1, "resignation": 1, "role": 1}):
-        snap, _ = _employee_snapshot(e)
+        snap, _ = _employee_snapshot(e, allow_future=True)
         if snap:
-            rows.append({"_id": str(e["_id"]), **snap, "has_active_certificate": str(e["_id"]) in active_for})
-    rows.sort(key=lambda r: r["employee_name"].lower())
+            on_notice = snap["last_working_date"] > _today().isoformat()
+            rows.append({"_id": str(e["_id"]), **snap, "on_notice": on_notice,
+                         "has_active_certificate": str(e["_id"]) in active_for})
+    rows.sort(key=lambda r: (r["on_notice"], r["employee_name"].lower()))     # ready first, serving-notice after
     return jsonify(rows), 200
 
 

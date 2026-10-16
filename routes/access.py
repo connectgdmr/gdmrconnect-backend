@@ -9,7 +9,7 @@ from bson import ObjectId
 
 from database import access_grants_col, users_col
 from decorators import token_required
-from helpers import _is_admin, utc_to_ist, GRANTABLE_MODULES
+from helpers import _is_admin, utc_to_ist, GRANTABLE_MODULES, is_offboarded
 from config import IST
 
 bp = Blueprint("access", __name__)
@@ -43,6 +43,8 @@ def grant_access():
     emp = users_col.find_one({"_id": ObjectId(emp_id)})
     if not emp or _is_admin(emp):
         return jsonify({"message": "Invalid employee or employee is already an admin."}), 400
+    if is_offboarded(emp):
+        return jsonify({"message": "This employee has left the organisation — access can't be granted."}), 400
 
     # "modules" replaces the old single "module" string — an admin can now
     # delegate any combination of features in one grant. Still accepts a
