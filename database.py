@@ -5,7 +5,10 @@ MongoDB connection, all collection references, index creation,
 and one-time startup migrations.  Import collections from here.
 """
 from pymongo import MongoClient
-from config import MONGO_URI, MONGO_DB_NAME
+from config import MONGO_URI, MONGO_DB_NAME, DEMO_INMEMORY
+if DEMO_INMEMORY:
+    import mongomock
+    MongoClient = mongomock.MongoClient
 
 # ── Connection ────────────────────────────────────────────────────────────────
 try:

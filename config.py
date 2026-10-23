@@ -17,6 +17,8 @@ IST = pytz.timezone("Asia/Kolkata")
 # A second, disposable deployment can run this same code against its OWN database
 # (MONGO_DB_NAME) filled with fake data (tools/seed_demo.py). Production never sets these.
 DEMO_MODE     = os.getenv("DEMO_MODE", "").strip().lower() in ("1", "true", "yes")
+# DEMO_INMEMORY=1 (with DEMO_MODE=1): no MongoDB needed — the demo keeps its fake data in memory and re-seeds itself on every start.
+DEMO_INMEMORY = DEMO_MODE and os.getenv("DEMO_INMEMORY", "").strip().lower() in ("1", "true", "yes")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "attendance_db").strip() or "attendance_db"
 DEMO_PLACEHOLDER_URL = os.getenv("DEMO_PLACEHOLDER_URL", "https://placehold.co/600x600/1b4052/ffffff?text=Demo")
 
