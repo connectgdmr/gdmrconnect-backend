@@ -38,5 +38,7 @@ timeout = 120
 
 
 def when_ready(server):
+    if os.environ.get("DEMO_MODE", "").strip().lower() in ("1", "true", "yes"):
+        return                      # demo deployment: no cron jobs / reminder emails
     from jobs.scheduler import start_scheduler
     start_scheduler()

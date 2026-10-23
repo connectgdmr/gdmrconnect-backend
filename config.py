@@ -13,6 +13,13 @@ load_dotenv()
 # ── Timezone ──────────────────────────────────────────────────────────────────
 IST = pytz.timezone("Asia/Kolkata")
 
+# ── Demo (sales-demo deployment only; inert unless DEMO_MODE=1) ───────────────
+# A second, disposable deployment can run this same code against its OWN database
+# (MONGO_DB_NAME) filled with fake data (tools/seed_demo.py). Production never sets these.
+DEMO_MODE     = os.getenv("DEMO_MODE", "").strip().lower() in ("1", "true", "yes")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "attendance_db").strip() or "attendance_db"
+DEMO_PLACEHOLDER_URL = os.getenv("DEMO_PLACEHOLDER_URL", "https://placehold.co/600x600/1b4052/ffffff?text=Demo")
+
 # ── Security ──────────────────────────────────────────────────────────────────
 SECRET_KEY  = os.getenv("SECRET_KEY")
 CRON_SECRET = os.getenv("CRON_SECRET")
@@ -36,8 +43,8 @@ COE_PREFIX        = os.getenv("COE_PREFIX", "EMC")
 # starts at 12; set COE_START_NUMBER on Railway if HR has already issued more letters by hand.
 # Only read the first time a certificate is generated.
 COE_START_NUMBER  = int(os.getenv("COE_START_NUMBER", "12") or 12)
-COE_SIGNATORY_NAME        = os.getenv("COE_SIGNATORY_NAME", "Jofin Mejo Jacob")
-COE_SIGNATORY_DESIGNATION = os.getenv("COE_SIGNATORY_DESIGNATION", "Head Of Human Resources")
+COE_SIGNATORY_NAME        = os.getenv("COE_SIGNATORY_NAME", "Sarah Mitchell" if DEMO_MODE else "Jofin Mejo Jacob")
+COE_SIGNATORY_DESIGNATION = os.getenv("COE_SIGNATORY_DESIGNATION", "Managing Director" if DEMO_MODE else "Head Of Human Resources")
 COE_DEFAULT_POSTING       = os.getenv("COE_DEFAULT_POSTING", "Thiruvananthapuram office")
 
 # ── Database ──────────────────────────────────────────────────────────────────

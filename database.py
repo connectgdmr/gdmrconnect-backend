@@ -5,7 +5,7 @@ MongoDB connection, all collection references, index creation,
 and one-time startup migrations.  Import collections from here.
 """
 from pymongo import MongoClient
-from config import MONGO_URI
+from config import MONGO_URI, MONGO_DB_NAME
 
 # ── Connection ────────────────────────────────────────────────────────────────
 try:
@@ -18,8 +18,8 @@ try:
         maxPoolSize=50,
     )
     _client.admin.command("ping")
-    db = _client["attendance_db"]
-    print("MongoDB Connected Successfully to Database: attendance_db.")
+    db = _client[MONGO_DB_NAME]
+    print(f"MongoDB Connected Successfully to Database: {MONGO_DB_NAME}.")
 except Exception as _e:
     print(f"CRITICAL ERROR: Failed to connect to MongoDB. Error: {_e}")
     db = None

@@ -82,6 +82,20 @@ def create_app():
     except Exception as e:
         print(f"Warning: Cloudinary configuration failed. Error: {e}")
 
+    # ── Demo deployment: no real uploads leave the box ────────────────────────
+    from config import DEMO_MODE, DEMO_PLACEHOLDER_URL
+    if DEMO_MODE:
+        import cloudinary.uploader as _cu
+        def _fake_upload(*_a, **_k):
+            return {"secure_url": DEMO_PLACEHOLDER_URL, "url": DEMO_PLACEHOLDER_URL, "public_id": "demo/placeholder"}
+        _cu.upload = _fake_upload
+        _cu.destroy = lambda *_a, **_k: {"result": "ok"}
+        print("DEMO_MODE on: uploads stubbed, emails suppressed, scheduler off.")
+
+        @app.route("/api/demo-info")
+        def _demo_info():
+            return jsonify({"demo": True}), 200
+
     # ── request size, security headers, clean errors ─────────────────────────
     @app.before_request
     def _limit_json_size():

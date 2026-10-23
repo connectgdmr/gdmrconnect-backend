@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timedelta, time, timezone
 from bson import ObjectId
 from pymongo.errors import DuplicateKeyError
-from config import IST
+from config import IST, DEMO_MODE
 from database import attendance_col, users_col, access_grants_col, holidays_col, departments_col, leaves_col
 
 
@@ -404,7 +404,9 @@ def record_attendance_punch(user, punch_time_utc, punch_type, method,
         status_indicator = "Unknown"
         day_type         = "full"
 
-        if employee_shift == "morning":
+        if DEMO_MODE:                       # demo: punch works at any time of day
+            status_indicator, day_type = "Present (On-Time)", "full"
+        elif employee_shift == "morning":
             TIME_1000, TIME_1015, TIME_1300, TIME_1400 = time(10, 0), time(10, 15), time(13, 0), time(14, 0)
             if current_time < TIME_1000:
                 status_indicator, day_type = "Present (On-Time)", "full"
@@ -473,7 +475,9 @@ def record_attendance_punch(user, punch_time_utc, punch_type, method,
         final_day_type   = checkin.get("day_type", "full")
         status_indicator = "On Time"
 
-        if employee_shift == "morning":
+        if DEMO_MODE:
+            status_indicator = "On Time"
+        elif employee_shift == "morning":
             HALF_DAY_OUT_START, HALF_DAY_OUT_END   = time(13, 0), time(14, 0)
             FULL_DAY_OUT_START, LATE_CHECKOUT_START = time(18, 0), time(20, 0)
 

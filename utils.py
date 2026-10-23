@@ -23,6 +23,9 @@ def send_email(
         cc_emails:  Optional list of CC addresses (strings).
         reply_to:   Optional Reply-To address.
     """
+    if os.getenv("DEMO_MODE", "").strip().lower() in ("1", "true", "yes"):
+        print(f"[demo] email suppressed: {subject!r}")
+        return True                 # demo deployment never sends real email
     api_key = os.getenv("BREVO_API_KEY")
     if not api_key:
         print("[Brevo] ERROR: BREVO_API_KEY environment variable is not set.")

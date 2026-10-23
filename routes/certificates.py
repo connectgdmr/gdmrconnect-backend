@@ -40,8 +40,9 @@ from extensions import limiter
 from helpers import _is_admin, _has_module_grant
 
 bp = Blueprint("certificates", __name__)
+_DEMO = os.getenv("DEMO_MODE", "").strip().lower() in ("1", "true", "yes")   # sales-demo deployment only
 
-ORG_NAME = "GDMR Foundation"
+ORG_NAME = "aieque Trademark Services L.L.C" if _DEMO else "GDMR Foundation"
 CERT_TITLE = "Relieving cum Service Certificate"
 SALUTATIONS = {"Mr.": ("he", "his", "him"), "Ms.": ("she", "her", "her"), "Mx.": ("they", "their", "them")}
 STATUSES = ("active", "revoked", "superseded")
@@ -387,7 +388,7 @@ def build_pdf(cert):
     c.setAuthor(ORG_NAME)
 
     # letterhead logo — top-right, flush with the top edge like the approved template
-    logo = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "gdmr-logo.png")
+    logo = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "aieque-logo.png" if _DEMO else "gdmr-logo.png")
     lw = 92
     lh = lw * 478 / 466
     if os.path.exists(logo):
@@ -459,8 +460,8 @@ def build_pdf(cert):
     c.drawString(tx, qy + 2, f"{short}    Code: {cert['reference_no']}")
 
     # letterhead footer: address, contact line, red bar
-    line1 = "GDMR BUILDING, T.C 31/118, RNRA 1, P.S NATARAJAPILLAI ROAD, PERURKADA, THIRUVANANTHAPURAM, KERALA. 695005"
-    line2 = "www.gdmrfoundation.com  |  info@gdmrfoundation.com  |  +91 9400539422"
+    line1 = "DUBAI, UNITED ARAB EMIRATES" if _DEMO else "GDMR BUILDING, T.C 31/118, RNRA 1, P.S NATARAJAPILLAI ROAD, PERURKADA, THIRUVANANTHAPURAM, KERALA. 695005"
+    line2 = "www.aieque.com" if _DEMO else "www.gdmrfoundation.com  |  info@gdmrfoundation.com  |  +91 9400539422"
     fs = min(8.2, (W - 20) / stringWidth(line1, "Helvetica", 1))
     c.setFillColor(INK)
     c.setFont("Helvetica", fs)
