@@ -12,8 +12,8 @@ from datetime import datetime, timezone, timedelta
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
 
-from database import work_plans_col, attendance_col
-from helpers import _sanitize
+from database import work_plans_col, attendance_col, users_col, leaves_col, work_tasks_col
+from helpers import _sanitize, is_offboarded, is_weekend_day, get_company_holiday_dates
 from decorators import token_required
 from helpers import (
     _is_admin, _mgr_depts, _is_task_done, _has_module_grant,
@@ -128,7 +128,7 @@ def evening_update():
     today_iso = _today_ist().isoformat()
     for at in open_assigned_for(uid):
         tid = str(at["_id"])
-        already = any(u.get("user_id") == uid and u.get("date") == today_iso for u in at.get("updates") or [])
+        already = any(u.get("user_id") == uid and u.get("date") == today_iso and u.get("type") != "comment" for u in at.get("updates") or [])
         x = assigned_in.get(tid)
         if not x:
             if not already:
@@ -416,6 +416,92 @@ def admin_work_plans():
     checkins = _checkin_map([p["employee_id"] for p in plans], date_str)
     rows     = [_serialize_plan(p, checkin=checkins.get(p["employee_id"])) for p in plans]
     return jsonify(rows), 200
+
+
+@bp.route("/api/admin/work-overview", methods=["GET"])
+@token_required
+def admin_work_overview():
+    """One row per person in scope for a day — including people who have NOT planned — so a manager/owner sees
+    at a glance who is planned, who still needs to plan, who is on leave and who is not in."""
+    role          = request.user.get("role")
+    has_delegated = _has_module_grant(request.user, "work-by-team")
+    if role not in ("admin", "owner", "manager") and not has_delegated:
+        return jsonify({"message": "Unauthorized"}), 403
+
+    date_str = str(request.args.get("date") or _today_ist().isoformat())[:10]
+    uq = {"role": {"$in": ["employee", "manager"]}}
+    if role == "manager" and not has_delegated:
+        uq["department"] = {"$in": _mgr_depts(request.user)}
+    people = [u for u in users_col.find(uq, {"name": 1, "department": 1, "role": 1, "resignation": 1}) if not is_offboarded(u)]
+    ids = [str(u["_id"]) for u in people]
+
+    plans    = {p["employee_id"]: p for p in work_plans_col.find({"employee_id": {"$in": ids}, "date": date_str})}
+    checkins = _checkin_map(ids, date_str)
+    on_leave = {lv["user_id"] for lv in leaves_col.find({"user_id": {"$in": ids}, "status": "Approved", "from_date": {"$lte": date_str}, "to_date": {"$gte": date_str}}, {"user_id": 1})}
+    day_off  = is_weekend_day(date_str, get_company_holiday_dates())
+
+    rows, totals = [], {"planned": 0, "needs_plan": 0, "on_leave": 0, "not_in": 0, "off": 0, "tasks": 0, "done": 0, "evening_done": 0}
+    for u in sorted(people, key=lambda x: (str((x.get("department") if not isinstance(x.get("department"), list) else (x.get("department") or [""])[0]) or ""), x.get("name", ""))):
+        uid  = str(u["_id"])
+        plan = plans.get(uid)
+        if plan and plan.get("status") == "submitted":
+            status = "planned"
+        elif uid in checkins:
+            status = "needs_plan"
+        elif uid in on_leave:
+            status = "on_leave"
+        elif day_off:
+            status = "off"
+        else:
+            status = "not_in"
+        totals[status] += 1
+        tasks = [t for t in ((plan or {}).get("tasks") or []) if str(t.get("title", "")).strip()]
+        if status == "planned":
+            totals["tasks"] += len(tasks)
+            totals["done"]  += sum(1 for t in tasks if _is_task_done(t))
+            totals["evening_done"] += 1 if plan.get("evening_submitted_at") else 0
+        dept = u.get("department")
+        rows.append({
+            "user_id": uid, "name": u.get("name", ""), "role": u.get("role"),
+            "department": (dept[0] if isinstance(dept, list) and dept else dept) or "",
+            "check_in_time": checkins.get(uid), "status": status,
+            "plan": _serialize_plan(plan, checkin=checkins.get(uid)) if plan else None,
+        })
+
+    today = _today_ist().isoformat()
+    overdue = work_tasks_col.count_documents({"assignees.user_id": {"$in": ids}, "status": {"$ne": "Completed"}, "deadline": {"$lt": today}})
+    totals["assigned_overdue"] = overdue
+    return jsonify({"date": date_str, "people": rows, "totals": totals}), 200
+
+
+@bp.route("/api/admin/work-plans/<plan_id>/task/<task_id>/comment", methods=["POST"])
+@token_required
+def comment_work_task(plan_id, task_id):
+    """A manager/owner/admin leaves a short comment on one task of someone's plan (shown to that person)."""
+    role          = request.user.get("role")
+    has_delegated = _has_module_grant(request.user, "work-by-team")
+    if role not in ("admin", "owner", "manager") and not has_delegated:
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        obj = ObjectId(plan_id)
+    except Exception:
+        return jsonify({"message": "Invalid plan ID"}), 400
+    plan = work_plans_col.find_one({"_id": obj})
+    if not plan:
+        return jsonify({"message": "Plan not found"}), 404
+    if role == "manager" and not has_delegated and plan.get("department") not in _mgr_depts(request.user):
+        return jsonify({"message": "Unauthorized"}), 403
+    text = _sanitize((request.get_json(silent=True) or {}).get("comment"), 600)
+    now  = datetime.now(timezone.utc)
+    hit  = False
+    for t in plan.get("tasks") or []:
+        if str(t.get("id") or t.get("_id", "")) == str(task_id):
+            t["manager_comment"] = {"text": text, "by": request.user.get("name", ""), "at": now.isoformat()} if text else None
+            hit = True
+    if not hit:
+        return jsonify({"message": "Task not found in plan"}), 404
+    work_plans_col.update_one({"_id": obj}, {"$set": {"tasks": plan["tasks"], "updated_at": now}})
+    return jsonify({"message": "Comment saved"}), 200
 
 
 @bp.route("/api/admin/work-analytics", methods=["GET"])

@@ -93,7 +93,7 @@ def _serialize(t, viewer_id=None):
         me = next((a for a in out["assignees"] if a.get("user_id") == viewer_id), None)
         out["created_by_me"] = t.get("created_by") == viewer_id
         out["my_status"] = me.get("status") if me else None
-        out["updated_today"] = bool(me and any(u.get("user_id") == viewer_id and u.get("date") == today for u in t.get("updates") or []))
+        out["updated_today"] = bool(me and any(u.get("user_id") == viewer_id and u.get("date") == today and u.get("type") != "comment" for u in t.get("updates") or []))
     return out
 
 
@@ -302,6 +302,31 @@ def delete_work_task(task_id):
         return err
     work_tasks_col.delete_one({"_id": t["_id"]})
     return jsonify({"message": "Deleted"}), 200
+
+
+@bp.route("/api/work-tasks/<task_id>/comment", methods=["POST"])
+@token_required
+def comment_on_task(task_id):
+    """Admins/owners, the person who created the work, and managers of the assignees' departments can comment."""
+    user = request.user
+    try:
+        t = work_tasks_col.find_one({"_id": ObjectId(task_id)})
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    if not t:
+        return jsonify({"message": "Task not found"}), 404
+    allowed = _is_admin(user) or t.get("created_by") == _uid(user)
+    if not allowed and user.get("role") == "manager":
+        mine = {d.lower() for d in _mgr_depts(user)}
+        allowed = any(mine & {x.lower() for x in a.get("department_list", [])} for a in t.get("assignees", []))
+    if not allowed:
+        return jsonify({"message": "Only the creator, a manager of the assignees, or an admin can comment."}), 403
+    text = _sanitize((request.get_json(silent=True) or {}).get("comment"), 600)
+    if not text:
+        return jsonify({"message": "Write a comment first."}), 400
+    entry = {"type": "comment", "user_id": _uid(user), "name": user.get("name", ""), "date": _today_ist().isoformat(), "remarks": text, "status": "", "at": datetime.now(timezone.utc)}
+    work_tasks_col.update_one({"_id": t["_id"]}, {"$push": {"updates": entry}})
+    return jsonify(_serialize(work_tasks_col.find_one({"_id": t["_id"]}), _uid(user))), 200
 
 
 @bp.route("/api/work-tasks/<task_id>/update", methods=["POST"])
