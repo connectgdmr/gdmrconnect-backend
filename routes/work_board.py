@@ -217,7 +217,7 @@ def work_update():
     if not status:
         return jsonify({"message": "Choose a status."}), 400
     if kind == "assigned":
-        ok, msg, code = apply_daily_update(user, str(data.get("id")), status, remarks)
+        ok, msg, code = apply_daily_update(user, str(data.get("id")), status, remarks, require_remarks=False)
         return (jsonify({"message": "Updated"}), 200) if ok else (jsonify({"message": msg}), code)
     if kind == "plan":
         try:
@@ -229,8 +229,6 @@ def work_update():
         hit = False
         for t in plan.get("tasks") or []:
             if str(t.get("id") or t.get("_id", "")) == str(data.get("id")):
-                if not _done(status) and len(remarks) < 3 and status.lower() != "pending":
-                    return jsonify({"message": "Add a short remark (what you did / what is pending)."}), 400
                 t["status"], t["remarks"] = status, remarks
                 hit = True
         if not hit:

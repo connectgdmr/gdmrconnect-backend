@@ -98,7 +98,7 @@ def _notify(assignees, task, creator):
         threading.Thread(target=send_email, args=(email, f"New work assigned: {task['title']} (due {task['deadline']})", body), daemon=True).start()
 
 
-def apply_daily_update(user, task_id, status, remarks):
+def apply_daily_update(user, task_id, status, remarks, require_remarks=True):
     """Record `user`'s status + remarks on an assigned task. Returns (ok, message, http_status)."""
     try:
         oid = ObjectId(task_id)
@@ -112,7 +112,7 @@ def apply_daily_update(user, task_id, status, remarks):
     remarks = _sanitize(remarks, 1000)
     if status not in STATUSES:
         return False, f"Status must be one of: {', '.join(STATUSES)}.", 400
-    if status != "Completed" and len(remarks) < 3:
+    if require_remarks and status != "Completed" and len(remarks) < 3:
         return False, "Please add a remark (what you did today / what is pending) for tasks that are not completed.", 400
     now = datetime.now(timezone.utc)
     today = _today_ist().isoformat()
