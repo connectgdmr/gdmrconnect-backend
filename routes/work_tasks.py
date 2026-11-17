@@ -119,7 +119,7 @@ def apply_daily_update(user, task_id, status, remarks):
     assignees = task["assignees"]
     for a in assignees:
         if a.get("user_id") == uid:
-            a["status"], a["remarks"], a["updated_at"] = status, remarks, now
+            a["status"], a["remarks"], a["updated_at"], a["seen"] = status, remarks, now, True
     overall = "Completed" if all(a.get("status") == "Completed" for a in assignees) else "Open"
     entry = {"user_id": uid, "name": user.get("name", ""), "date": today, "status": status, "remarks": remarks, "at": now}
     work_tasks_col.update_one({"_id": oid}, {"$set": {"assignees": assignees, "status": overall, "updated_at": now}, "$push": {"updates": entry}})
@@ -209,7 +209,8 @@ def create_work_task():
         if not target or not _can_assign_to(user, target):
             return jsonify({"message": "You can't assign work to one of the selected people."}), 403
         a = {"user_id": i, "name": target.get("name", ""), "department": _dept_label(target),
-             "department_list": _mgr_depts(target), "status": "Pending", "remarks": "", "updated_at": None}
+             "department_list": _mgr_depts(target), "status": "Pending", "remarks": "", "updated_at": None,
+             "seen": i == uid, "assigned_at": datetime.now(timezone.utc)}          # unseen until the assignee opens the Work page
         assignees.append(a)
         notify.append({**a, "email": target.get("email")})
 
@@ -278,7 +279,7 @@ def edit_work_task(task_id):
             if not target or not _can_assign_to(request.user, target):
                 return jsonify({"message": "You can't assign work to one of the selected people."}), 403
             a = {"user_id": i, "name": target.get("name", ""), "department": _dept_label(target), "department_list": _mgr_depts(target),
-                 "status": "Pending", "remarks": "", "updated_at": None}
+                 "status": "Pending", "remarks": "", "updated_at": None, "seen": i == _uid(request.user), "assigned_at": datetime.now(timezone.utc)}
             new_list.append(a)
             notify.append({**a, "email": target.get("email")})
         upd["assignees"] = new_list

@@ -65,6 +65,7 @@ def _assigned_item(t, uid, today):
         "comment": _last_comment(t.get("updates")), "done": _done(status),
         "overdue": bool(not _done(status) and dl and dl < today), "due_today": bool(not _done(status) and dl == today), "updated_today": updated_today,
         "others": [a["name"] for a in t.get("assignees", []) if a.get("user_id") != uid][:6],
+        "is_new": me.get("seen") is False,
     }
 
 
@@ -84,7 +85,7 @@ def _plan_items(plan, today):
             "title": t.get("title", ""), "deadline": dl, "status": t.get("status") or "Pending", "remarks": t.get("remarks", ""), "client": t.get("client", ""),
             "by": None, "priority": t.get("priority", "Medium"), "comment": ({"text": mc.get("text", ""), "by": mc.get("by", "")} if isinstance(mc, dict) and mc.get("text") else None),
             "done": dn, "overdue": bool(not dn and dl < today), "due_today": bool(not dn and dl == today), "updated_today": bool(plan.get("evening_submitted_at")) or bool(t.get("remarks")),
-            "others": [],
+            "others": [], "is_new": False,
         })
     return out
 
@@ -237,6 +238,33 @@ def work_update():
         work_plans_col.update_one({"_id": plan["_id"]}, {"$set": {"tasks": plan["tasks"], "updated_at": datetime.now(timezone.utc)}})
         return jsonify({"message": "Updated"}), 200
     return jsonify({"message": "kind must be 'assigned' or 'plan'."}), 400
+
+
+# ── "new work for you" alerts: drive the blinking sidebar tab and the pop-up notification ──
+
+@bp.route("/api/work/alerts", methods=["GET"])
+@token_required
+def work_alerts():
+    uid = str(request.user["_id"])
+    items = []
+    for t in work_tasks_col.find({"assignees": {"$elemMatch": {"user_id": uid, "seen": False}}}).sort("created_at", -1).limit(20):
+        items.append({"id": str(t["_id"]), "title": t.get("title", ""), "by": t.get("created_by_name", ""), "deadline": t.get("deadline"), "priority": t.get("priority", "Medium")})
+    return jsonify({"count": len(items), "items": items}), 200
+
+
+@bp.route("/api/work/alerts/seen", methods=["POST"])
+@token_required
+def work_alerts_seen():
+    """The person has opened the Work page: everything assigned to them so far counts as seen."""
+    uid = str(request.user["_id"])
+    n = 0
+    for t in work_tasks_col.find({"assignees": {"$elemMatch": {"user_id": uid, "seen": False}}}):
+        for a in t.get("assignees", []):
+            if a.get("user_id") == uid and a.get("seen") is False:
+                a["seen"] = True
+                n += 1
+        work_tasks_col.update_one({"_id": t["_id"]}, {"$set": {"assignees": t["assignees"]}})
+    return jsonify({"marked": n}), 200
 
 
 # ── a person's work history ─────────────────────────────────────────────────
