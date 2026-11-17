@@ -4,10 +4,7 @@ routes/work_tasks.py — GDMR Connect
 Assigned work. Anyone (admin, manager, employee) can create a piece of work, a DEADLINE is mandatory, and it can
 be assigned to other people. Each assignee posts a status + remarks every day; the history is kept.
 
-Who can be assigned (see _assignable_filter):
-  - admin / owner : any active person
-  - manager       : their department(s), their direct reports, and themselves
-  - employee      : people in their own department(s), their manager, and themselves
+Who can be assigned: any active colleague (see _can_assign_to).
 """
 import threading
 import requests
@@ -48,21 +45,10 @@ def _dept_label(u):
 
 
 def _can_assign_to(user, target):
+    """Anyone can give work to any colleague who is still with the company (and to themselves)."""
     if str(target["_id"]) == _uid(user):
         return True
-    if is_offboarded(target):
-        return False
-    if _is_admin(user):
-        return True
-    mine = {d.lower() for d in _mgr_depts(user)}
-    theirs = {d.lower() for d in _mgr_depts(target)}
-    if mine & theirs:
-        return True
-    if user.get("role") == "manager" and target.get("manager_id") == _uid(user):
-        return True
-    if user.get("role") != "manager" and target.get("role") == "manager" and user.get("manager_id") == str(target["_id"]):
-        return True
-    return False
+    return not is_offboarded(target)
 
 
 def _serialize(t, viewer_id=None):
