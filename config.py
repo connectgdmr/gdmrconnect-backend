@@ -22,6 +22,13 @@ DEMO_INMEMORY = DEMO_MODE and os.getenv("DEMO_INMEMORY", "").strip().lower() in 
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "attendance_db").strip() or "attendance_db"
 DEMO_PLACEHOLDER_URL = os.getenv("DEMO_PLACEHOLDER_URL", "https://placehold.co/600x600/1b4052/ffffff?text=Demo")
 
+# ── Work updates ──────────────────────────────────────────────────────────────
+# Employees/managers must submit today's work plan and an end-of-day status update (with remarks) before a
+# photo check-out is accepted. Set WORK_UPDATE_ENFORCE=0 to turn the check-out gate off.
+WORK_UPDATE_ENFORCE = os.getenv("WORK_UPDATE_ENFORCE", "1").strip().lower() not in ("0", "false", "no")
+# Emails nudging people who have not submitted their plan (morning) / end-of-day update (evening).
+WORK_REMINDERS = os.getenv("WORK_REMINDERS", "1").strip().lower() not in ("0", "false", "no")
+
 # ── Security ──────────────────────────────────────────────────────────────────
 SECRET_KEY  = os.getenv("SECRET_KEY")
 CRON_SECRET = os.getenv("CRON_SECRET")

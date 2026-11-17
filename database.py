@@ -106,6 +106,8 @@ payroll_loans_col     = db["payroll_loans"]
 
 # ── Work Plans ────────────────────────────────────────────────────────────────
 work_plans_col = db["work_plans"]
+# Assigned work: created by anyone, deadline mandatory, one or more assignees who post a daily status + remarks.
+work_tasks_col = db["work_tasks"]
 
 # ── Clients ───────────────────────────────────────────────────────────────────
 clients_col       = db["clients"]
@@ -238,6 +240,8 @@ except Exception as _emp_code_err:
 
 # ── Indexes (background=True — no write-lock) ─────────────────────────────────
 try:
+    work_tasks_col.create_index("assignees.user_id", background=True)
+    work_tasks_col.create_index("deadline", background=True)
     users_col.create_index("email", background=True)
     users_col.create_index("role", background=True)
     users_col.create_index("department", background=True)

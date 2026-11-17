@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timedelta, time, timezone
 from bson import ObjectId
 from pymongo.errors import DuplicateKeyError
-from config import IST, DEMO_MODE
+from config import IST, DEMO_MODE, WORK_UPDATE_ENFORCE
 from database import attendance_col, users_col, access_grants_col, holidays_col, departments_col, leaves_col
 
 
@@ -336,6 +336,23 @@ def infer_punch_type(uid, date_str):
     return None
 
 
+def evening_update_block(user, date_str):
+    """Message explaining why a photo check-out must wait for the work update, or None when it may go ahead.
+    Rule: today's work plan must be submitted AND the end-of-day status update (status + remarks per task) done."""
+    if not WORK_UPDATE_ENFORCE or DEMO_MODE:
+        return None
+    from database import work_plans_col
+    plan = work_plans_col.find_one({"employee_id": str(user["_id"]), "date": date_str})
+    has_tasks = bool(plan and any(str(t.get("title", "")).strip() for t in (plan.get("tasks") or [])))
+    if not plan or plan.get("status") != "submitted" or not has_tasks:
+        return ("Work update required: you haven't submitted today's work plan. Open Dashboard → \"What are you working on\", "
+                "submit your plan, then do the end-of-day update before checking out.")
+    if not plan.get("evening_submitted_at"):
+        return ("Work update required: please update the status and remarks of today's work "
+                "(Dashboard → \"End-of-day update\") before checking out.")
+    return None
+
+
 def record_attendance_punch(user, punch_time_utc, punch_type, method,
                              photo_url=None, upload_photo=None, location=None):
     """
@@ -471,6 +488,11 @@ def record_attendance_punch(user, punch_time_utc, punch_type, method,
             return False, "You must Check-In first before Checking Out.", 400
         if attendance_col.find_one({"user_id": uid, "type": "checkout", "date": today_str}):
             return False, "Already checked out for today!", 400
+
+        if method == "photo":      # a fingerprint device has no screen to show this on, so it is never blocked
+            blocked_msg = evening_update_block(user, today_str)
+            if blocked_msg:
+                return False, blocked_msg, 400
 
         final_day_type   = checkin.get("day_type", "full")
         status_indicator = "On Time"

@@ -5,8 +5,8 @@ APScheduler background jobs:
   - PMS review reminders          (10:00 AM IST daily)
   - Access-grant expiry sweeper   (every 30 min)
   - Daily work-plan summaries     (11:00 AM IST)
-  - Owner HTML daily digest       (11:30 AM IST)
-  - Weekly work-plan reports      (Monday 9:00 AM IST)
+  - Dept-wise AI work reports     (morning 11:30, evening 19:00, weekly Mon 9:30, monthly 1st 9:45; see jobs/work_reports.py)
+  - Plan / end-of-day update reminders (10:45, 17:30)
   - LMS course-expiry reminders   (9:05 AM IST daily)
   - PMS compliance / attendance blocking check (9:30 AM IST daily)
   - PMS recurring template auto-assignment (8:00 AM IST daily)
@@ -554,8 +554,14 @@ def start_scheduler():
         scheduler.add_job(func=send_pms_reminders,        trigger="cron",     hour=10, minute=0)
         scheduler.add_job(func=auto_expire_grants,         trigger="interval", minutes=30)
         scheduler.add_job(func=send_daily_work_summaries,  trigger="cron",     hour=11, minute=0)
-        scheduler.add_job(func=send_owner_daily_digest,    trigger="cron",     hour=11, minute=30)
-        scheduler.add_job(func=send_weekly_work_reports,   trigger="cron",     day_of_week="mon", hour=9, minute=0)
+        # Department-wise AI status mails (jobs/work_reports.py) replace the old owner digest + weekly report.
+        from jobs import work_reports as wr
+        scheduler.add_job(func=wr.send_plan_reminders,     trigger="cron",     hour=10, minute=45)
+        scheduler.add_job(func=wr.send_morning_report,     trigger="cron",     hour=11, minute=30)
+        scheduler.add_job(func=wr.send_update_reminders,   trigger="cron",     hour=17, minute=30)
+        scheduler.add_job(func=wr.send_evening_report,     trigger="cron",     hour=19, minute=0)
+        scheduler.add_job(func=wr.send_weekly_report,      trigger="cron",     day_of_week="mon", hour=9, minute=30)
+        scheduler.add_job(func=wr.send_monthly_report,     trigger="cron",     hour=9, minute=45)   # runs daily, acts only on the 1st
         scheduler.add_job(func=send_lms_expiry_reminders,  trigger="cron",     hour=9, minute=5)
         scheduler.add_job(func=run_pms_compliance_check,   trigger="cron",     hour=9, minute=30)
         scheduler.add_job(func=run_pms_recurring_assignments, trigger="cron",  hour=8, minute=0)

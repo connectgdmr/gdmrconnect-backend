@@ -286,6 +286,28 @@ def seed(app, db, log=print):
     api("post", "/api/admin/payroll/loans", {"employee_id": mid(staff[1]), "type": "advance", "amount": 3000, "emi_per_month": 1000, "repayment_months": 3,
                                             "disbursed_date": D(-20), "reason": "Relocation advance"})
 
+
+    # assigned work: deadline mandatory, daily status + remarks from each assignee
+    def work(creator, title, deadline_off, assignees, client, priority="Medium", desc=""):
+        r = api("post", "/api/work-tasks", {"title": title, "deadline": D(deadline_off), "assignee_ids": [mid(a) for a in assignees], "client": client,
+                                            "priority": priority, "description": desc}, who=creator)
+        return (r.get_json(silent=True) or {}).get("_id")
+
+    def post_update(person, task_id, status, remarks):
+        if task_id:
+            api("post", f"/api/work-tasks/{task_id}/update", {"status": status, "remarks": remarks}, who=person)
+
+    t1 = work(mgr_ops, "File UAE trademark for Falcon Logistics (Class 39)", 4, [staff[0], staff[4]], "Falcon Logistics", "High", "Prepare and file the application; confirm class and specification with the client.")
+    post_update(staff[0], t1, "In Progress", "Specification drafted, waiting for client approval on class 39 wording.")
+    post_update(staff[4], t1, "Started", "Registry search completed, no conflicts found.")
+    t2 = work(mgr_cs, "Renewal reminders — Q4 accounts", 2, [staff[5], staff[6]], "Al Noor Textiles", "Medium")
+    post_update(staff[5], t2, "In Progress", "12 of 20 reminders sent.")
+    t3 = work(admin, "Quarterly IP portfolio review pack", 9, [mgr_ops, mgr_cs], "", "Medium", "Summarise filings, renewals and oppositions by client.")
+    t4 = work(staff[0], "Update docket with new office actions", 1, [staff[1], staff[2]], "Pearl Coast Hotels", "High")
+    post_update(staff[1], t4, "Blocked", "Waiting for registry portal access to be restored.")
+    t5 = work(mgr_fin, "Reconcile October fee invoices", 3, [staff[10], staff[11]], "", "Medium")
+    post_update(staff[10], t5, "Completed", "All 48 invoices reconciled.")
+
     # jobs + ATS pipeline
     jobs = [
         ("Trademark Attorney", "Legal & Compliance", "Dubai, UAE", 14000, 22000),
