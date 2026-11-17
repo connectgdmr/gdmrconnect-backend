@@ -239,6 +239,64 @@ def work_update():
     return jsonify({"message": "kind must be 'assigned' or 'plan'."}), 400
 
 
+# ── a person's work history ─────────────────────────────────────────────────
+
+def _can_see_person(user, target):
+    if str(target["_id"]) == str(user["_id"]):
+        return True
+    if user.get("role") in ("admin", "owner") or _has_module_grant(user, "work-by-team"):
+        return True
+    if user.get("role") == "manager":
+        mine = {d.lower() for d in _mgr_depts(user)}
+        theirs = {d.lower() for d in _mgr_depts(target)}
+        return bool(mine & theirs) or target.get("manager_id") == str(user["_id"])
+    return False
+
+
+@bp.route("/api/work/history", methods=["GET"])
+@token_required
+def work_history():
+    """Day-by-day record of one person's work: what was on their plan and every status/remark they posted on assigned work.
+    Anyone can open their own; managers their department/team; admins and owners anyone."""
+    user = request.user
+    try:
+        target = users_col.find_one({"_id": ObjectId(request.args.get("user_id") or str(user["_id"]))})
+    except Exception:
+        target = None
+    if not target:
+        return jsonify({"message": "Person not found"}), 404
+    if not _can_see_person(user, target):
+        return jsonify({"message": "Unauthorized"}), 403
+    try:
+        days = max(1, min(int(request.args.get("days", 30)), 90))
+    except (TypeError, ValueError):
+        days = 30
+    tid = str(target["_id"])
+    start = (_today_ist() - timedelta(days=days)).isoformat()
+    by_date = {}
+
+    def add(date, entry):
+        by_date.setdefault(date, []).append(entry)
+
+    for plan in work_plans_col.find({"employee_id": tid, "date": {"$gte": start}}):
+        for t in plan.get("tasks") or []:
+            if str(t.get("title", "")).strip():
+                add(plan["date"], {"kind": "plan", "title": t.get("title", ""), "status": t.get("status") or "Pending", "remarks": t.get("remarks", ""),
+                                   "deadline": t.get("deadline") or plan["date"], "client": t.get("client", "")})
+    for task in work_tasks_col.find({"assignees.user_id": tid}):
+        for u in task.get("updates") or []:
+            if u.get("user_id") == tid and u.get("type") != "comment" and str(u.get("date", "")) >= start:
+                add(u["date"], {"kind": "assigned", "title": task.get("title", ""), "status": u.get("status", ""), "remarks": u.get("remarks", ""),
+                                "deadline": task.get("deadline"), "client": task.get("client", "")})
+    rows = [{"date": d, "entries": e, "completed": sum(1 for x in e if _done(x["status"]))} for d, e in sorted(by_date.items(), reverse=True)]
+    dept = target.get("department")
+    return jsonify({
+        "person": {"name": target.get("name", ""), "department": (dept[0] if isinstance(dept, list) and dept else dept) or "", "role": target.get("role")},
+        "days": days, "history": rows,
+        "totals": {"days_with_work": len(rows), "entries": sum(len(r["entries"]) for r in rows), "completed": sum(r["completed"] for r in rows)},
+    }), 200
+
+
 # ── plain-English summary ───────────────────────────────────────────────────
 
 _CACHE = {}
