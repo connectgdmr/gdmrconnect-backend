@@ -200,6 +200,7 @@ def create_app():
     from routes.work_plans    import bp as work_plans_bp
     from routes.clients       import bp as clients_bp
     from routes.work_tasks    import bp as work_tasks_bp
+    from routes.work_board    import bp as work_board_bp
     from routes.ats           import bp as ats_bp
     from routes.achievements  import bp as achievements_bp
     from routes.goals         import bp as goals_bp
@@ -213,7 +214,7 @@ def create_app():
         auth_bp, employees_bp, access_bp, pms_bp, pms_compliance_bp, attendance_bp,
         leaves_bp, assistant_bp, assets_bp, announcements_bp,
         notifications_bp, stats_bp, assessment_bp, lms_bp,
-        career_bp, payroll_bp, work_plans_bp, work_tasks_bp, clients_bp,
+        career_bp, payroll_bp, work_plans_bp, work_tasks_bp, work_board_bp, clients_bp,
         ats_bp, achievements_bp, goals_bp, certificates_bp, mfa_bp, chat_bp, calendar_bp,
         attendance_reports_bp, biometric_bp,
     ):

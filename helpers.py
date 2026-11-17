@@ -338,19 +338,20 @@ def infer_punch_type(uid, date_str):
 
 def evening_update_block(user, date_str):
     """Message explaining why a photo check-out must wait for the work update, or None when it may go ahead.
-    Rule: today's work plan must be submitted AND the end-of-day status update (status + remarks per task) done."""
+    Rule (routes/work_board.day_update_state): the person must have work for the day (plan tasks and/or assigned work),
+    and must have updated its status + remarks (end-of-day update for the plan, a daily update on each open assigned item)."""
     if not WORK_UPDATE_ENFORCE or DEMO_MODE:
         return None
-    from database import work_plans_col
-    plan = work_plans_col.find_one({"employee_id": str(user["_id"]), "date": date_str})
-    has_tasks = bool(plan and any(str(t.get("title", "")).strip() for t in (plan.get("tasks") or [])))
-    if not plan or plan.get("status") != "submitted" or not has_tasks:
-        return ("Work update required: you haven't submitted today's work plan. Open Dashboard → \"What are you working on\", "
-                "submit your plan, then do the end-of-day update before checking out.")
-    if not plan.get("evening_submitted_at"):
-        return ("Work update required: please update the status and remarks of today's work "
-                "(Dashboard → \"End-of-day update\") before checking out.")
-    return None
+    from routes.work_board import day_update_state
+    state, detail = day_update_state(str(user["_id"]), date_str)
+    if state == "ok":
+        return None
+    if state == "no_work":
+        return ("Work update required: you haven't added any work today. Open Work → Add work (or submit your work plan on the Dashboard), "
+                "then update its status before checking out.")
+    if state == "assigned":
+        return ("Work update required: please post today's status and remarks on: " + ", ".join(detail[:5]) + ". Open Work → Update my day.")
+    return ("Work update required: please do your end-of-day update (status and remarks for each task) before checking out. Open Work → Update my day.")
 
 
 def record_attendance_punch(user, punch_time_utc, punch_type, method,

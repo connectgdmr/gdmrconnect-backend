@@ -66,6 +66,12 @@ def upsert_my_work_plan():
             if not task.get("id"):
                 task["id"] = secrets.token_hex(8)
             task["remarks"] = _sanitize(task.get("remarks"), 1000)
+            dl = str(task.get("deadline") or "")[:10]
+            try:
+                datetime.strptime(dl, "%Y-%m-%d")
+            except ValueError:
+                dl = date_str                      # every piece of work has a deadline: default to the plan's day
+            task["deadline"] = dl
 
     now        = datetime.now(timezone.utc)
     set_fields = {
@@ -101,11 +107,12 @@ def evening_update():
     data     = request.get_json(silent=True) or {}
     date_str = str(data.get("date") or _today_ist().isoformat())[:10]
     plan     = work_plans_col.find_one({"employee_id": uid, "date": date_str})
-    if not plan or plan.get("status") != "submitted":
-        return jsonify({"message": "Submit today's work plan first, then do the end-of-day update."}), 400
+    has_plan = bool(plan and plan.get("status") == "submitted")
+    if not has_plan and not open_assigned_for(uid):
+        return jsonify({"message": "Add today's work first (Work → Add work, or submit your work plan), then do the end-of-day update."}), 400
 
     incoming = {str(x.get("id")): x for x in (data.get("tasks") or []) if isinstance(x, dict)}
-    tasks, problems = plan.get("tasks") or [], []
+    tasks, problems = ((plan.get("tasks") if has_plan else None) or []), []
     for t in tasks:
         if not str(t.get("title", "")).strip():
             continue
@@ -141,6 +148,8 @@ def evening_update():
         return jsonify({"message": "Please fix these before submitting:\n• " + "\n• ".join(problems), "problems": problems}), 400
 
     now = datetime.now(timezone.utc)
+    if not has_plan:
+        return jsonify({"ok": True, "assigned_only": True}), 200
     work_plans_col.update_one({"_id": plan["_id"]}, {"$set": {
         "tasks": tasks, "evening_submitted_at": now, "evening_summary": _sanitize(data.get("summary"), 1500), "updated_at": now}})
     return jsonify(_serialize_plan(work_plans_col.find_one({"_id": plan["_id"]}))), 200
