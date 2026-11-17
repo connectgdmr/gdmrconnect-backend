@@ -177,14 +177,19 @@ def is_offboarded(user_doc):
     canonical backend implementation.
     """
     resignation = (user_doc or {}).get("resignation") or {}
+    if not isinstance(resignation, dict):          # malformed record: treat as still employed rather than crash
+        return False
     notice_date = resignation.get("notice_date")
     lwd = resignation.get("last_working_day")
     if not notice_date or not lwd:
         return False
-    if isinstance(lwd, datetime):
-        lwd_date = lwd.date()
-    else:
-        lwd_date = datetime.strptime(str(lwd)[:10], "%Y-%m-%d").date()
+    try:
+        if isinstance(lwd, datetime):
+            lwd_date = lwd.date()
+        else:
+            lwd_date = datetime.strptime(str(lwd)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return False
     return lwd_date < _today_ist()
 
 

@@ -171,13 +171,13 @@ def _team(user, date_str):
     day_off = is_weekend_day(date_str, get_company_holiday_dates())
     rows = []
     totals = {"people": 0, "working": 0, "updated": 0, "no_work": 0, "not_in": 0, "on_leave": 0, "off": 0, "open": 0, "overdue": 0, "done": 0, "blocked": 0}
-    for u in sorted(people, key=lambda x: (str((x.get("department")[0] if isinstance(x.get("department"), list) and x.get("department") else x.get("department")) or ""), x.get("name", ""))):
+    for u in sorted(people, key=lambda x: (str((x.get("department")[0] if isinstance(x.get("department"), list) and x.get("department") else x.get("department")) or ""), str(x.get("name") or ""))):
         uid = str(u["_id"])
         items, plan = built[uid]["items"], built[uid]["plan"]
         st = _person_status(uid, items, plan, uid in checkins, uid in on_leave, day_off)
         d = u.get("department")
         openi = [i for i in items if not i["done"]]
-        row = {"user_id": uid, "name": u.get("name", ""), "role": u.get("role"), "department": (d[0] if isinstance(d, list) and d else d) or "Unassigned",
+        row = {"user_id": uid, "name": str(u.get("name") or "Unnamed"), "role": u.get("role"), "department": str((d[0] if isinstance(d, list) and d else d) or "Unassigned"),
                "status": st, "check_in_time": checkins.get(uid), "items": items, "plan_id": str(plan["_id"]) if plan else None,
                "plan_comment": (plan or {}).get("manager_comment"), "open": len(openi), "overdue": sum(1 for i in openi if i["overdue"]),
                "done": sum(1 for i in items if i["done"]), "day_note": (plan or {}).get("evening_summary", "")}
@@ -247,8 +247,8 @@ def _can_see_person(user, target):
     if user.get("role") in ("admin", "owner") or _has_module_grant(user, "work-by-team"):
         return True
     if user.get("role") == "manager":
-        mine = {d.lower() for d in _mgr_depts(user)}
-        theirs = {d.lower() for d in _mgr_depts(target)}
+        mine = {str(d).lower() for d in _mgr_depts(user)}
+        theirs = {str(d).lower() for d in _mgr_depts(target)}
         return bool(mine & theirs) or target.get("manager_id") == str(user["_id"])
     return False
 

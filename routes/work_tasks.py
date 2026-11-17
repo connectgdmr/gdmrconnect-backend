@@ -40,8 +40,8 @@ def _valid_date(s):
 def _dept_label(u):
     d = u.get("department")
     if isinstance(d, list):
-        return ", ".join(x for x in d if x)
-    return d or ""
+        return ", ".join(str(x) for x in d if x)
+    return str(d) if d else ""
 
 
 def _can_assign_to(user, target):
@@ -144,8 +144,13 @@ def assignable_people():
     user = request.user
     rows = []
     for u in users_col.find({"role": {"$in": ["employee", "manager", "admin", "owner"]}}, {"name": 1, "department": 1, "role": 1, "manager_id": 1, "resignation": 1, "email": 1}):
-        if _can_assign_to(user, u):
-            rows.append({"_id": str(u["_id"]), "name": u.get("name", ""), "department": _dept_label(u), "role": u.get("role"), "me": str(u["_id"]) == _uid(user)})
+        try:
+            name = str(u.get("name") or "").strip()
+            if not name or not _can_assign_to(user, u):
+                continue
+            rows.append({"_id": str(u["_id"]), "name": name, "department": _dept_label(u), "role": u.get("role"), "me": str(u["_id"]) == _uid(user)})
+        except Exception as e:                       # a malformed user record is skipped, never fatal
+            print(f"[work_tasks] skipped user {u.get('_id')} in assignable list: {e}")
     rows.sort(key=lambda r: (not r["me"], r["name"].lower()))
     return jsonify(rows), 200
 
@@ -299,8 +304,8 @@ def _can_view(user, t):
     if _is_admin(user) or t.get("created_by") == uid or any(a.get("user_id") == uid for a in t.get("assignees", [])):
         return True
     if user.get("role") == "manager":
-        mine = {d.lower() for d in _mgr_depts(user)}
-        return any(mine & {x.lower() for x in a.get("department_list", [])} for a in t.get("assignees", []))
+        mine = {str(d).lower() for d in _mgr_depts(user)}
+        return any(mine & {str(x).lower() for x in a.get("department_list", [])} for a in t.get("assignees", []))
     return False
 
 
@@ -387,8 +392,8 @@ def comment_on_task(task_id):
         return jsonify({"message": "Task not found"}), 404
     allowed = _is_admin(user) or t.get("created_by") == _uid(user)
     if not allowed and user.get("role") == "manager":
-        mine = {d.lower() for d in _mgr_depts(user)}
-        allowed = any(mine & {x.lower() for x in a.get("department_list", [])} for a in t.get("assignees", []))
+        mine = {str(d).lower() for d in _mgr_depts(user)}
+        allowed = any(mine & {str(x).lower() for x in a.get("department_list", [])} for a in t.get("assignees", []))
     if not allowed:
         return jsonify({"message": "Only the creator, a manager of the assignees, or an admin can comment."}), 403
     text = _sanitize((request.get_json(silent=True) or {}).get("comment"), 600)
