@@ -10,6 +10,7 @@ Who can be assigned (see _assignable_filter):
   - employee      : people in their own department(s), their manager, and themselves
 """
 import threading
+import requests
 from datetime import datetime, timezone, timedelta
 from flask import Blueprint, request, jsonify
 from bson import ObjectId
@@ -18,6 +19,7 @@ from database import work_tasks_col, users_col
 from decorators import token_required
 from helpers import _is_admin, _mgr_depts, _today_ist, is_offboarded, _sanitize
 from utils import send_email
+from config import GROQ_API_KEY, GROQ_MODEL
 
 bp = Blueprint("work_tasks", __name__)
 
@@ -169,7 +171,7 @@ def list_work_tasks():
     view = request.args.get("view", "mine")
     if view == "created":
         q = {"created_by": uid}
-    elif view == "team":
+    elif view in ("team", "ongoing"):
         if _is_admin(user):
             q = {}
         elif user.get("role") == "manager":
@@ -177,6 +179,8 @@ def list_work_tasks():
             q = {"$or": [{"created_by": uid}, {"assignees.department_list": {"$in": depts}}, {"assignees.user_id": uid}]}
         else:
             return jsonify({"message": "Unauthorized"}), 403
+        if view == "ongoing":
+            q = {"$and": [q, {"status": {"$ne": "Completed"}}]}
     else:
         q = {"assignees.user_id": uid}
     rows = [_serialize(t, uid) for t in work_tasks_col.find(q).sort([("status", -1), ("deadline", 1)]).limit(500)]
@@ -302,6 +306,86 @@ def delete_work_task(task_id):
         return err
     work_tasks_col.delete_one({"_id": t["_id"]})
     return jsonify({"message": "Deleted"}), 200
+
+
+def _can_view(user, t):
+    uid = _uid(user)
+    if _is_admin(user) or t.get("created_by") == uid or any(a.get("user_id") == uid for a in t.get("assignees", [])):
+        return True
+    if user.get("role") == "manager":
+        mine = {d.lower() for d in _mgr_depts(user)}
+        return any(mine & {x.lower() for x in a.get("department_list", [])} for a in t.get("assignees", []))
+    return False
+
+
+def _days_left(deadline):
+    d = _valid_date(deadline)
+    return (d - _today_ist()).days if d else None
+
+
+def _rule_insight(t):
+    left = _days_left(t.get("deadline"))
+    people = t.get("assignees", [])
+    done = [a for a in people if a.get("status") == "Completed"]
+    parts = []
+    if left is None:
+        parts.append("No valid deadline is set.")
+    elif left < 0:
+        parts.append(f"This is {abs(left)} day(s) overdue.")
+    elif left == 0:
+        parts.append("This is due today.")
+    else:
+        parts.append(f"{left} day(s) left until the deadline.")
+    parts.append(f"{len(done)} of {len(people)} assignee(s) have finished their part.")
+    blocked = [a for a in people if a.get("status") == "Blocked"]
+    if blocked:
+        parts.append("Blocked: " + "; ".join(f"{a['name']}" + (f" ({a['remarks']})" if a.get("remarks") else "") for a in blocked) + ". Needs a follow-up.")
+    silent = [a["name"] for a in people if a.get("status") != "Completed" and not a.get("updated_at")]
+    if silent:
+        parts.append("No update yet from " + ", ".join(silent) + ".")
+    return " ".join(parts)
+
+
+def _ai_insight(t):
+    if not GROQ_API_KEY:
+        return None
+    lines = [f"Work: {t.get('title')}", f"Deadline: {t.get('deadline')} ({_days_left(t.get('deadline'))} days left)", f"Priority: {t.get('priority')}"]
+    for a in t.get("assignees", []):
+        lines.append(f"- {a.get('name')} ({a.get('department')}): {a.get('status')}" + (f" — {a.get('remarks')}" if a.get("remarks") else ""))
+    for u in (t.get("updates") or [])[-8:]:
+        if u.get("type") != "comment":
+            lines.append(f"Update {u.get('date')} {u.get('name')}: {u.get('status')} — {u.get('remarks')}")
+    prompt = ("You advise a manager. From the facts below write 2-3 plain sentences: how this work is going, the main risk (if any), "
+              "and one concrete next step. Name people only when needed. No headings or bullets, no invented facts.\n\n" + "\n".join(lines))
+    try:
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                          json={"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 180}, timeout=12)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip() or None
+    except Exception as e:
+        print(f"[work_tasks] AI insight failed: {e}")
+        return None
+
+
+@bp.route("/api/work-tasks/<task_id>/insight", methods=["GET"])
+@token_required
+def task_insight(task_id):
+    """Short plain-English read on how a piece of work is going. Cached per task until it gets a new update or the day changes."""
+    try:
+        t = work_tasks_col.find_one({"_id": ObjectId(task_id)})
+    except Exception:
+        return jsonify({"message": "Invalid ID"}), 400
+    if not t or not _can_view(request.user, t):
+        return jsonify({"message": "Task not found"}), 404
+    today, n = _today_ist().isoformat(), len(t.get("updates") or [])
+    cached = t.get("insight") or {}
+    if cached.get("text") and cached.get("n") == n and cached.get("date") == today:
+        return jsonify({"insight": cached["text"], "ai": cached.get("ai", False)}), 200
+    text = _ai_insight(t)
+    ai = bool(text)
+    text = text or _rule_insight(t)
+    work_tasks_col.update_one({"_id": t["_id"]}, {"$set": {"insight": {"text": text, "n": n, "date": today, "ai": ai}}})
+    return jsonify({"insight": text, "ai": ai}), 200
 
 
 @bp.route("/api/work-tasks/<task_id>/comment", methods=["POST"])
