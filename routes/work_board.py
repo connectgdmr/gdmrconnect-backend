@@ -299,19 +299,30 @@ def work_history():
         days = 30
     tid = str(target["_id"])
     start = (_today_ist() - timedelta(days=days)).isoformat()
+    end = "9999-12-31"
+    # an explicit time frame (used by the export): from / to as YYYY-MM-DD, at most one year
+    f, t_ = request.args.get("from"), request.args.get("to")
+    if f and t_:
+        try:
+            d1, d2 = datetime.strptime(f[:10], "%Y-%m-%d").date(), datetime.strptime(t_[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return jsonify({"message": "Use dates like 2026-01-31."}), 400
+        if d2 < d1 or (d2 - d1).days > 366:
+            return jsonify({"message": "Choose a time frame of up to one year."}), 400
+        start, end, days = d1.isoformat(), d2.isoformat(), (d2 - d1).days + 1
     by_date = {}
 
     def add(date, entry):
         by_date.setdefault(date, []).append(entry)
 
-    for plan in work_plans_col.find({"employee_id": tid, "date": {"$gte": start}}):
+    for plan in work_plans_col.find({"employee_id": tid, "date": {"$gte": start, "$lte": end}}):
         for t in plan.get("tasks") or []:
             if str(t.get("title", "")).strip():
                 add(plan["date"], {"kind": "plan", "title": t.get("title", ""), "status": t.get("status") or "Pending", "remarks": t.get("remarks", ""),
                                    "deadline": t.get("deadline") or plan["date"], "client": t.get("client", "")})
     for task in work_tasks_col.find({"assignees.user_id": tid}):
         for u in task.get("updates") or []:
-            if u.get("user_id") == tid and u.get("type") != "comment" and str(u.get("date", "")) >= start:
+            if u.get("user_id") == tid and u.get("type") != "comment" and start <= str(u.get("date", "")) <= end:
                 add(u["date"], {"kind": "assigned", "title": task.get("title", ""), "status": u.get("status", ""), "remarks": u.get("remarks", ""),
                                 "deadline": task.get("deadline"), "client": task.get("client", "")})
     rows = [{"date": d, "entries": e, "completed": sum(1 for x in e if _done(x["status"]))} for d, e in sorted(by_date.items(), reverse=True)]
