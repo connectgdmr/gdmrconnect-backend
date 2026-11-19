@@ -222,6 +222,9 @@ def create_work_task():
         "status": "Open", "assignees": assignees, "updates": [],
     }
     doc["_id"] = work_tasks_col.insert_one(doc).inserted_id
+    if doc["client"]:
+        from routes.clients import ensure_client
+        ensure_client(doc["client"], user)
     _notify(notify, doc, user)
     return jsonify(_serialize(doc, uid)), 201
 
@@ -262,6 +265,9 @@ def edit_work_task(task_id):
         upd["priority"] = data["priority"]
     if "client" in data:
         upd["client"] = _sanitize(data.get("client"), 200)
+        if upd["client"]:
+            from routes.clients import ensure_client
+            ensure_client(upd["client"], request.user)
     if isinstance(data.get("assignee_ids"), list):
         ids = list(dict.fromkeys(str(i) for i in data["assignee_ids"]))[:25]
         if not ids:

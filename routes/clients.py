@@ -64,11 +64,65 @@ def _normalize_departments(raw):
     return [str(d).strip() for d in raw if str(d).strip()]
 
 
+# ── Work <-> Clients sync ────────────────────────────────────────────────────
+# A client typed on a work item must also exist on the Clients page, filed under the person's department(s).
+
+def ensure_client(name, user=None, created_by=None):
+    """Create the client if no client with this name (any case) exists yet. Never raises."""
+    import re
+    name = str(name or "").strip()
+    if not name:
+        return
+    try:
+        if clients_col.find_one({"name": {"$regex": "^" + re.escape(name) + "$", "$options": "i"}}):
+            return
+        if user is None and created_by:
+            from database import users_col
+            try:
+                user = users_col.find_one({"_id": ObjectId(created_by)})
+            except Exception:
+                user = None
+        clients_col.insert_one({
+            "name": name, "description": "", "departments": _mgr_depts(user) if user else [],
+            "created_by": str((user or {}).get("_id", created_by or "")), "created_at": datetime.now(timezone.utc), "auto": True,
+        })
+    except Exception:
+        pass
+
+
+_LAST_BACKFILL = [0.0]
+
+
+def backfill_work_clients(min_gap=300):
+    """Add any client named on an existing work item that is missing from the Clients page (throttled)."""
+    import time
+    from database import work_tasks_col
+    if time.time() - _LAST_BACKFILL[0] < min_gap:
+        return
+    _LAST_BACKFILL[0] = time.time()
+    try:
+        have = {str(c.get("name", "")).strip().lower() for c in clients_col.find({}, {"name": 1})}
+        seen = {}
+        for t in work_tasks_col.find({"client": {"$nin": [None, ""]}}, {"client": 1, "created_by": 1}):
+            seen.setdefault(str(t["client"]).strip(), t.get("created_by"))
+        for p in work_plans_col.find({"tasks.client": {"$nin": [None, ""]}}, {"tasks.client": 1, "employee_id": 1}):
+            for t in p.get("tasks", []):
+                if t.get("client"):
+                    XX
+        for name, by in seen.items():
+            if name and name.lower() not in have:
+                ensure_client(name, created_by=by)
+                have.add(name.lower())
+    except Exception:
+        pass
+
+
 # ── Client directory ─────────────────────────────────────────────────────────
 
 @bp.route("/api/clients", methods=["GET"])
 @token_required
 def list_clients():
+    backfill_work_clients()
     scope = _dept_scope(request.user)
     query = {} if scope is None else {"departments": {"$in": scope}}
     rows = []
