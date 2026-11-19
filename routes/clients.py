@@ -67,25 +67,31 @@ def _normalize_departments(raw):
 # ── Work <-> Clients sync ────────────────────────────────────────────────────
 # A client typed on a work item must also exist on the Clients page, filed under the person's department(s).
 
-def ensure_client(name, user=None, created_by=None):
-    """Create the client if no client with this name (any case) exists yet. Never raises."""
+def _depts_of(user):
+    return _mgr_depts(user) if user else []
+
+
+def ensure_client(name, users=None, created_by=None):
+    """Make sure the client exists. New clients are filed under the department(s) of everyone on the work item (creator and
+    assignees) so each of them sees it on the Clients page; a client that was auto-created earlier gets any missing ones.
+    Never raises."""
     import re
     name = str(name or "").strip()
     if not name:
         return
     try:
-        if clients_col.find_one({"name": {"$regex": "^" + re.escape(name) + "$", "$options": "i"}}):
+        if isinstance(users, dict):
+            users = [users]
+        users = [u for u in (users or []) if u]
+        depts = list(dict.fromkeys(d for u in users for d in _depts_of(u)))
+        row = clients_col.find_one({"name": {"$regex": "^" + re.escape(name) + "$", "$options": "i"}})
+        if row:
+            if row.get("auto") and depts:
+                clients_col.update_one({"_id": row["_id"]}, {"$addToSet": {"departments": {"$each": depts}}})
             return
-        if user is None and created_by:
-            from database import users_col
-            try:
-                user = users_col.find_one({"_id": ObjectId(created_by)})
-            except Exception:
-                user = None
-        clients_col.insert_one({
-            "name": name, "description": "", "departments": _mgr_depts(user) if user else [],
-            "created_by": str((user or {}).get("_id", created_by or "")), "created_at": datetime.now(timezone.utc), "auto": True,
-        })
+        by = str(users[0].get("_id", "")) if users else str(created_by or "")
+        clients_col.insert_one({"name": name, "description": "", "departments": depts, "created_by": by,
+                                "created_at": datetime.now(timezone.utc), "auto": True})
     except Exception:
         pass
 
@@ -96,23 +102,32 @@ _LAST_BACKFILL = [0.0]
 def backfill_work_clients(min_gap=300):
     """Add any client named on an existing work item that is missing from the Clients page (throttled)."""
     import time
-    from database import work_tasks_col
+    from database import work_tasks_col, users_col
     if time.time() - _LAST_BACKFILL[0] < min_gap:
         return
     _LAST_BACKFILL[0] = time.time()
     try:
-        have = {str(c.get("name", "")).strip().lower() for c in clients_col.find({}, {"name": 1})}
-        seen = {}
-        for t in work_tasks_col.find({"client": {"$nin": [None, ""]}}, {"client": 1, "created_by": 1}):
-            seen.setdefault(str(t["client"]).strip(), t.get("created_by"))
+        people = {}                     # name(lower) -> {"name": display, "uids": set of user ids on that work}
+        def note(name, uids):
+            name = str(name or "").strip()
+            if name:
+                e = people.setdefault(name.lower(), {"name": name, "uids": set()})
+                e["uids"].update(str(u) for u in uids if u)
+        for t in work_tasks_col.find({"client": {"$nin": [None, ""]}}, {"client": 1, "created_by": 1, "assignees.user_id": 1}):
+            note(t["client"], [t.get("created_by")] + [a.get("user_id") for a in t.get("assignees", [])])
         for p in work_plans_col.find({"tasks.client": {"$nin": [None, ""]}}, {"tasks.client": 1, "employee_id": 1}):
             for t in p.get("tasks", []):
-                if t.get("client"):
-                    XX
-        for name, by in seen.items():
-            if name and name.lower() not in have:
-                ensure_client(name, created_by=by)
-                have.add(name.lower())
+                note(t.get("client"), [p.get("employee_id")])
+        cache = {}
+        def user(uid):
+            if uid not in cache:
+                try:
+                    cache[uid] = users_col.find_one({"_id": ObjectId(uid)}, {"department": 1})
+                except Exception:
+                    cache[uid] = None
+            return cache[uid]
+        for e in people.values():
+            ensure_client(e["name"], [user(u) for u in e["uids"]])
     except Exception:
         pass
 

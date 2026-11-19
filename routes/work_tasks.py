@@ -224,7 +224,7 @@ def create_work_task():
     doc["_id"] = work_tasks_col.insert_one(doc).inserted_id
     if doc["client"]:
         from routes.clients import ensure_client
-        ensure_client(doc["client"], user)
+        ensure_client(doc["client"], [user] + [users_col.find_one({"_id": ObjectId(x["user_id"])}) for x in assignees])
     _notify(notify, doc, user)
     return jsonify(_serialize(doc, uid)), 201
 
