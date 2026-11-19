@@ -132,6 +132,35 @@ def backfill_work_clients(min_gap=300):
         pass
 
 
+def _my_work_client_ids(user, scope):
+    """Clients named on work the user created / is assigned / planned. A client auto-created from work (or never given a
+    department) is filed under the user's department so it shows normally; a client someone set up deliberately for other
+    departments stays as it is but is still listed for the user because their own work points at it."""
+    import re
+    from database import work_tasks_col
+    uid = str(user.get("_id", ""))
+    try:
+        names = {}
+        for t in work_tasks_col.find({"client": {"$nin": [None, ""]}, "$or": [{"created_by": uid}, {"assignees.user_id": uid}]}, {"client": 1}):
+            names[str(t["client"]).strip().lower()] = str(t["client"]).strip()
+        for p in work_plans_col.find({"employee_id": uid, "tasks.client": {"$nin": [None, ""]}}, {"tasks.client": 1}):
+            for t in p.get("tasks", []):
+                if t.get("client"):
+                    names[str(t["client"]).strip().lower()] = str(t["client"]).strip()
+        ids, mine = [], {d.lower() for d in scope}
+        for n in names.values():
+            row = clients_col.find_one({"name": {"$regex": "^" + re.escape(n) + "$", "$options": "i"}})
+            if not row:
+                continue
+            have = {str(d).lower() for d in row.get("departments", [])}
+            if scope and not (have & mine) and (row.get("auto") or not have):
+                clients_col.update_one({"_id": row["_id"]}, {"$addToSet": {"departments": {"$each": list(scope)}}})
+            ids.append(row["_id"])
+        return ids
+    except Exception:
+        return []
+
+
 # ── Client directory ─────────────────────────────────────────────────────────
 
 @bp.route("/api/clients", methods=["GET"])
@@ -140,6 +169,10 @@ def list_clients():
     backfill_work_clients()
     scope = _dept_scope(request.user)
     query = {} if scope is None else {"departments": {"$in": scope}}
+    if scope is not None:
+        linked = _my_work_client_ids(request.user, scope)
+        if linked:
+            query = {"$or": [query, {"_id": {"$in": linked}}]}
     rows = []
     for c in clients_col.find(query).sort("name", 1):
         name = c.get("name", "")
