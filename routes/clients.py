@@ -51,6 +51,14 @@ def _can_read_client(user, client_departments):
     return scope is None or bool(set(scope) & set(client_departments or []))
 
 
+def _can_open_client(user, client):
+    """Read access to one client: by department/grant, or because the client is named on the user's own work (those are
+    listed for them, so opening them has to work too)."""
+    if _can_read_client(user, client.get("departments", [])):
+        return True
+    return client.get("_id") in _my_work_client_ids(user)
+
+
 def _can_write_client(user, client_departments):
     """Create/edit/delete this client, or add folders/files/updates to it."""
     if _is_admin(user) or _has_module_grant(user, "clients", write=True):
@@ -126,6 +134,21 @@ def _name_re(name):
     return {"$regex": "^" + re.escape(str(name or "").strip()) + "$", "$options": "i"}
 
 
+def _rename_on_work(old, new):
+    """Work items refer to a client by name, so a rename has to follow them or the folder would suddenly show 0 items."""
+    from database import work_tasks_col
+    try:
+        work_tasks_col.update_many({"client": _name_re(old)}, {"$set": {"client": new}})
+        for p in work_plans_col.find({"tasks.client": _name_re(old)}, {"tasks": 1}):
+            tasks = p.get("tasks", [])
+            for t in tasks:
+                if str(t.get("client") or "").strip().lower() == str(old).strip().lower():
+                    t["client"] = new
+            work_plans_col.update_one({"_id": p["_id"]}, {"$set": {"tasks": tasks}})
+    except Exception:
+        pass
+
+
 def _client_work_items(name, limit=None):
     """Every work item tagged with this client: Daily-plan tasks AND work added through Add work / assigned work.
     Newest first. This is the single source for both the folder's work-item count and its list."""
@@ -189,7 +212,7 @@ def get_client(client_id):
     client = clients_col.find_one({"_id": obj})
     if not client:
         return jsonify({"message": "Client not found"}), 404
-    if not _can_read_client(request.user, client.get("departments", [])):
+    if not _can_open_client(request.user, client):
         return jsonify({"message": "Unauthorized"}), 403
 
     name = client.get("name", "")
@@ -226,6 +249,8 @@ def create_client():
         # default to all of their own if none were explicitly given.
         departments = [d for d in raw_depts if d in own] or own
 
+    if clients_col.find_one({"name": _name_re(name)}):
+        return jsonify({"message": "A client with that name already exists"}), 409
     try:
         res = clients_col.insert_one({
             "name":        name,
@@ -261,6 +286,8 @@ def update_client(client_id):
         new_name = str(data["name"]).strip()
         if not new_name:
             return jsonify({"message": "name cannot be empty"}), 400
+        if clients_col.find_one({"name": _name_re(new_name), "_id": {"$ne": obj}}):
+            return jsonify({"message": "A client with that name already exists"}), 409
         update["name"] = new_name
     if "description" in data:
         update["description"] = str(data["description"]).strip()
@@ -281,6 +308,8 @@ def update_client(client_id):
         clients_col.update_one({"_id": obj}, {"$set": update})
     except Exception:
         return jsonify({"message": "A client with that name already exists"}), 409
+    if update.get("name") and update["name"] != client.get("name"):
+        _rename_on_work(client.get("name", ""), update["name"])
 
     updated = clients_col.find_one({"_id": obj})
     return jsonify({
@@ -326,7 +355,7 @@ def _load_client_or_403(client_id, write=False):
     if not client:
         return None, (jsonify({"message": "Client not found"}), 404)
     allowed = _can_write_client(request.user, client.get("departments", [])) if write \
-        else _can_read_client(request.user, client.get("departments", []))
+        else _can_open_client(request.user, client)
     if not allowed:
         return None, (jsonify({"message": "Unauthorized"}), 403)
     return client, None
@@ -501,7 +530,7 @@ def list_updates(client_id):
         return err
 
     try:
-        limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+        limit = min(max(int(request.args.get("limit", 300)), 1), 1000)
     except (TypeError, ValueError):
         limit = 50
     name = client.get("name", "")
