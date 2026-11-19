@@ -65,7 +65,8 @@ def _normalize_departments(raw):
 
 
 # ── Work <-> Clients sync ────────────────────────────────────────────────────
-# A client typed on a work item must also exist on the Clients page, filed under the person's department(s).
+# A client typed on a work item when it is created / its client is changed also gets a Clients entry. This happens only at that
+# explicit moment - never on read - so deleting a client is final.
 
 def _depts_of(user):
     return _mgr_depts(user) if user else []
@@ -96,46 +97,9 @@ def ensure_client(name, users=None, created_by=None):
         pass
 
 
-_LAST_BACKFILL = [0.0]
-
-
-def backfill_work_clients(min_gap=300):
-    """Add any client named on an existing work item that is missing from the Clients page (throttled)."""
-    import time
-    from database import work_tasks_col, users_col
-    if time.time() - _LAST_BACKFILL[0] < min_gap:
-        return
-    _LAST_BACKFILL[0] = time.time()
-    try:
-        people = {}                     # name(lower) -> {"name": display, "uids": set of user ids on that work}
-        def note(name, uids):
-            name = str(name or "").strip()
-            if name:
-                e = people.setdefault(name.lower(), {"name": name, "uids": set()})
-                e["uids"].update(str(u) for u in uids if u)
-        for t in work_tasks_col.find({"client": {"$nin": [None, ""]}}, {"client": 1, "created_by": 1, "assignees.user_id": 1}):
-            note(t["client"], [t.get("created_by")] + [a.get("user_id") for a in t.get("assignees", [])])
-        for p in work_plans_col.find({"tasks.client": {"$nin": [None, ""]}}, {"tasks.client": 1, "employee_id": 1}):
-            for t in p.get("tasks", []):
-                note(t.get("client"), [p.get("employee_id")])
-        cache = {}
-        def user(uid):
-            if uid not in cache:
-                try:
-                    cache[uid] = users_col.find_one({"_id": ObjectId(uid)}, {"department": 1})
-                except Exception:
-                    cache[uid] = None
-            return cache[uid]
-        for e in people.values():
-            ensure_client(e["name"], [user(u) for u in e["uids"]])
-    except Exception:
-        pass
-
-
-def _my_work_client_ids(user, scope):
-    """Clients named on work the user created / is assigned / planned. A client auto-created from work (or never given a
-    department) is filed under the user's department so it shows normally; a client someone set up deliberately for other
-    departments stays as it is but is still listed for the user because their own work points at it."""
+def _my_work_client_ids(user):
+    """Ids of existing clients named on work the user created / is assigned / planned, so they can still see them even when
+    the client is filed under another department. Read-only: it never creates or changes a client."""
     import re
     from database import work_tasks_col
     uid = str(user.get("_id", ""))
@@ -147,15 +111,11 @@ def _my_work_client_ids(user, scope):
             for t in p.get("tasks", []):
                 if t.get("client"):
                     names[str(t["client"]).strip().lower()] = str(t["client"]).strip()
-        ids, mine = [], {d.lower() for d in scope}
+        ids = []
         for n in names.values():
-            row = clients_col.find_one({"name": {"$regex": "^" + re.escape(n) + "$", "$options": "i"}})
-            if not row:
-                continue
-            have = {str(d).lower() for d in row.get("departments", [])}
-            if scope and not (have & mine) and (row.get("auto") or not have):
-                clients_col.update_one({"_id": row["_id"]}, {"$addToSet": {"departments": {"$each": list(scope)}}})
-            ids.append(row["_id"])
+            row = clients_col.find_one({"name": {"$regex": "^" + re.escape(n) + "$", "$options": "i"}}, {"_id": 1})
+            if row:
+                ids.append(row["_id"])
         return ids
     except Exception:
         return []
@@ -166,11 +126,10 @@ def _my_work_client_ids(user, scope):
 @bp.route("/api/clients", methods=["GET"])
 @token_required
 def list_clients():
-    backfill_work_clients()
     scope = _dept_scope(request.user)
     query = {} if scope is None else {"departments": {"$in": scope}}
     if scope is not None:
-        linked = _my_work_client_ids(request.user, scope)
+        linked = _my_work_client_ids(request.user)
         if linked:
             query = {"$or": [query, {"_id": {"$in": linked}}]}
     rows = []

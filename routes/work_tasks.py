@@ -265,7 +265,7 @@ def edit_work_task(task_id):
         upd["priority"] = data["priority"]
     if "client" in data:
         upd["client"] = _sanitize(data.get("client"), 200)
-        if upd["client"]:
+        if upd["client"] and upd["client"].lower() != str(t.get("client") or "").lower():    # only when it was actually changed
             from routes.clients import ensure_client
             ensure_client(upd["client"], request.user)
     if isinstance(data.get("assignee_ids"), list):
