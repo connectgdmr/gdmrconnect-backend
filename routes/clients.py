@@ -125,7 +125,9 @@ def create_client():
 
     raw_depts = _normalize_departments(data.get("departments"))
     if is_privileged:
-        departments = raw_depts
+        # A client added on the fly from the Add-work form carries no department; file it under the creator's own
+        # department(s) so it shows in a normal Clients folder instead of only an easily-missed "Unassigned" box.
+        departments = raw_depts or (own if data.get("auto_department") else [])
     else:
         # Manager/employee: can only tag departments they belong to;
         # default to all of their own if none were explicitly given.
