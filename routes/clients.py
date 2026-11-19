@@ -121,6 +121,38 @@ def _my_work_client_ids(user):
         return []
 
 
+def _name_re(name):
+    import re
+    return {"$regex": "^" + re.escape(str(name or "").strip()) + "$", "$options": "i"}
+
+
+def _client_work_items(name, limit=None):
+    """Every work item tagged with this client: Daily-plan tasks AND work added through Add work / assigned work.
+    Newest first. This is the single source for both the folder's work-item count and its list."""
+    from database import work_tasks_col
+    items = []
+    pipeline = [{"$match": {"tasks.client": _name_re(name)}}, {"$unwind": "$tasks"}, {"$match": {"tasks.client": _name_re(name)}},
+                {"$project": {"_id": 0, "date": 1, "employee_name": 1, "department": 1, "title": "$tasks.title",
+                              "work_type": "$tasks.work_type", "status": "$tasks.status"}}]
+    for r in work_plans_col.aggregate(pipeline):
+        date = r.get("date") or ""
+        items.append({"kind": "task", "at": f"{date}T23:59:59" if date else "", "date": date, "employee_name": r.get("employee_name", ""),
+                      "department": r.get("department", ""), "title": r.get("title", ""), "work_type": r.get("work_type", ""),
+                      "status": r.get("status", "")})
+    for t in work_tasks_col.find({"client": _name_re(name)}):
+        made = t.get("created_at")
+        date = made.date().isoformat() if hasattr(made, "date") else str(t.get("deadline") or "")
+        who = t.get("assignees") or []
+        done = all(a.get("status") == "Completed" for a in who) if who else t.get("status") == "Completed"
+        items.append({"kind": "task", "at": made.isoformat() if hasattr(made, "isoformat") else date, "date": date,
+                      "employee_name": ", ".join(a.get("name", "") for a in who) or t.get("created_by_name", ""),
+                      "department": ", ".join(dict.fromkeys(a.get("department", "") for a in who if a.get("department"))),
+                      "title": t.get("title", ""), "work_type": t.get("work_type", ""),
+                      "status": "Completed" if done else (t.get("status") or "Open"), "deadline": t.get("deadline")})
+    items.sort(key=lambda x: x.get("at") or "", reverse=True)
+    return items[:limit] if limit else items
+
+
 # ── Client directory ─────────────────────────────────────────────────────────
 
 @bp.route("/api/clients", methods=["GET"])
@@ -135,7 +167,7 @@ def list_clients():
     rows = []
     for c in clients_col.find(query).sort("name", 1):
         name = c.get("name", "")
-        task_count = work_plans_col.count_documents({"tasks.client": name})
+        task_count = len(_client_work_items(name))
         rows.append({
             "_id":         str(c["_id"]),
             "name":        name,
@@ -166,7 +198,7 @@ def get_client(client_id):
         "name":        name,
         "description": client.get("description", ""),
         "departments": client.get("departments", []),
-        "task_count":  work_plans_col.count_documents({"tasks.client": name}),
+        "task_count":  len(_client_work_items(name)),
         "can_write":   _can_write_client(request.user, client.get("departments", [])),
     }), 200
 
@@ -486,38 +518,8 @@ def list_updates(client_id):
             "at":             posted_at.isoformat() if posted_at else None,
         })
 
-    # Auto-pulled: every Daily Work Plan task anyone has tagged with this
-    # client's name — reads work_plans_col directly (routes/work_plans.py's
-    # system of record), so this list can never drift out of sync with what
-    # Daily Work Plan itself shows.
-    pipeline = [
-        {"$match": {"tasks.client": name}},
-        {"$unwind": "$tasks"},
-        {"$match": {"tasks.client": name}},
-        {"$sort": {"date": -1}},
-        {"$limit": limit},
-        {"$project": {
-            "_id": 0, "date": 1, "employee_name": 1, "department": 1,
-            "title": "$tasks.title", "work_type": "$tasks.work_type", "status": "$tasks.status",
-        }},
-    ]
-    auto = []
-    for r in work_plans_col.aggregate(pipeline):
-        # Tasks only carry a date, not a time — pin sorting to end-of-day so a
-        # same-day task reliably ranks alongside/after that day's manual posts
-        # (full ISO timestamps) instead of a bare "YYYY-MM-DD" string prefix
-        # always sorting as "earlier" than any timestamped string on that date.
-        date = r.get("date") or ""
-        auto.append({
-            "kind":          "task",
-            "at":            f"{date}T23:59:59" if date else "",
-            "date":          date,
-            "employee_name": r.get("employee_name", ""),
-            "department":    r.get("department", ""),
-            "title":         r.get("title", ""),
-            "work_type":     r.get("work_type", ""),
-            "status":        r.get("status", ""),
-        })
+    # Auto-pulled: every work item tagged with this client (daily plans + Add work / assigned work).
+    auto = _client_work_items(name, limit)
 
     merged = sorted(manual + auto, key=lambda x: x.get("at") or "", reverse=True)[:limit]
     return jsonify(merged), 200
