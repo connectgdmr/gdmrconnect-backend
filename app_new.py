@@ -236,8 +236,8 @@ app = create_app()
 
 from config import DEMO_INMEMORY
 if DEMO_INMEMORY:                      # demo only: fill the in-memory database once at startup
-    from tools.seed_demo import seed
-    seed(app, db)
+    from tools.seed_demo import seed_minimal
+    seed_minimal(app, db)
 
 if __name__ == "__main__":
     # Dev server only (`python app_new.py`) — production uses gunicorn,

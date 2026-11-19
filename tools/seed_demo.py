@@ -351,6 +351,37 @@ def seed(app, db, log=print):
     return {"admin": admin, "manager": mgr_ops, "employee": staff[0]}
 
 
+MINIMAL_PASSWORD = "Aieque@2026"
+MINIMAL_ACCOUNTS = [
+    ("admin", "Aieque Admin", "Administration", "Admin"),
+    ("manager", "Aieque Manager", "Operations", "Manager"),
+    ("employee", "Aieque Employee", "Operations", "Employee"),
+]
+
+
+def seed_minimal(app, db, log=print):
+    """The aieque client demo: ONLY three logins (admin, manager, employee) and no other data at all.
+    The client enters their own staff, leave, announcements and payroll while trying it out."""
+    import bcrypt
+    from config import IST
+    today = datetime.now(IST).date()
+    for name in db.list_collection_names():
+        if not name.startswith("system."):
+            db[name].delete_many({})
+    pw = bcrypt.hashpw(MINIMAL_PASSWORD.encode(), bcrypt.gensalt(8)).decode()
+    ids = {}
+    for key, name, dept, position in MINIMAL_ACCOUNTS:
+        u = {"name": name, "email": f"{key}@aieque.com", "password": pw, "password_changed": True,
+             "role": key, "department": dept, "position": position, "location": "Dubai, UAE",
+             "employee_code": f"AIQ-00{len(ids) + 1}", "doj": (today - timedelta(days=60)).isoformat(), "shift": "general",
+             "employment_type": "Permanent", "contract_months": None, "manager_id": ids.get("manager") if key == "employee" else None,
+             "created_at": datetime.now(timezone.utc), "late_checkin_count_monthly": 0, "last_late_checkin_month": None,
+             "failed_login_attempts": 0, "locked_until": None, "token_version": 0}
+        ids[key] = str(db["users"].insert_one(u).inserted_id)
+    log("demo ready: 3 logins, no sample data")
+    return ids
+
+
 def main():
     from config import DEMO_MODE, MONGO_DB_NAME
     if not DEMO_MODE:
@@ -358,8 +389,8 @@ def main():
     if MONGO_DB_NAME == "attendance_db":
         sys.exit("Refusing to run: MONGO_DB_NAME must be a separate demo database, never attendance_db.")
     import app_new
-    seed(app_new.app, app_new.db)
-    print(f"\nDone. Logins (password {DEMO_PASSWORD}):\n  admin@{DOMAIN}\n  manager@{DOMAIN}\n  employee@{DOMAIN}")
+    seed_minimal(app_new.app, app_new.db)
+    print(f"\nDone. Logins (password {MINIMAL_PASSWORD}):\n  admin@aieque.com\n  manager@aieque.com\n  employee@aieque.com")
 
 
 if __name__ == "__main__":
