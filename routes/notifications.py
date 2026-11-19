@@ -15,6 +15,23 @@ from config import IST
 bp = Blueprint("notifications", __name__)
 
 
+@bp.route("/api/admin/email-diagnostics", methods=["GET", "POST"])
+@token_required
+def email_diagnostics():
+    """Admin / owner only. GET: check the Brevo set-up and say what is wrong. POST: also send a real test mail to the caller
+    and return Brevo's exact answer."""
+    from helpers import _is_admin
+    from utils import diagnose_email, send_email, LAST_RESULT
+    if not _is_admin(request.user):
+        return jsonify({"message": "Admins only."}), 403
+    out = diagnose_email()
+    if request.method == "POST":
+        to = request.user.get("email")
+        ok = send_email(to, "GDMR Connect — test email", "If you can read this, email sending works.")
+        out["test"] = {"sent_to": to, "ok": bool(ok), "brevo": dict(LAST_RESULT)}
+    return jsonify(out), 200
+
+
 @bp.route("/api/notifications/counts", methods=["GET"])
 @token_required
 def get_notification_counts():
