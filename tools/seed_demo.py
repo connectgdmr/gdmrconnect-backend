@@ -356,6 +356,20 @@ MINIMAL_ACCOUNTS = [
     ("admin", "Aieque Admin", "Administration", "Admin"),
     ("manager", "Aieque Manager", "Operations", "Manager"),
     ("employee", "Aieque Employee", "Operations", "Employee"),
+    ("owner", "Aieque Owner", "Management", "Managing Director"),
+]
+
+# UAE public holidays (reference data, editable in the Holiday Calendar). Dates that follow the moon are the expected
+# dates and can move by a day when the official announcement is made.
+UAE_HOLIDAYS = [
+    ("2026-01-01", "New Year's Day"), ("2026-03-19", "Eid Al Fitr (Eve)"), ("2026-03-20", "Eid Al Fitr"), ("2026-03-21", "Eid Al Fitr"), ("2026-03-22", "Eid Al Fitr"),
+    ("2026-05-26", "Arafat Day"), ("2026-05-27", "Eid Al Adha"), ("2026-05-28", "Eid Al Adha"), ("2026-05-29", "Eid Al Adha"),
+    ("2026-06-16", "Islamic New Year"), ("2026-08-25", "Prophet Muhammad's Birthday"), ("2026-12-01", "Commemoration Day"),
+    ("2026-12-02", "UAE National Day"), ("2026-12-03", "UAE National Day"),
+    ("2027-01-01", "New Year's Day"), ("2027-03-09", "Eid Al Fitr"), ("2027-03-10", "Eid Al Fitr"), ("2027-03-11", "Eid Al Fitr"),
+    ("2027-05-15", "Arafat Day"), ("2027-05-16", "Eid Al Adha"), ("2027-05-17", "Eid Al Adha"), ("2027-05-18", "Eid Al Adha"),
+    ("2027-06-06", "Islamic New Year"), ("2027-08-14", "Prophet Muhammad's Birthday"), ("2027-12-01", "Commemoration Day"),
+    ("2027-12-02", "UAE National Day"), ("2027-12-03", "UAE National Day"),
 ]
 
 
@@ -372,13 +386,15 @@ def seed_minimal(app, db, log=print):
     ids = {}
     for key, name, dept, position in MINIMAL_ACCOUNTS:
         u = {"name": name, "email": f"{key}@aieque.com", "password": pw, "password_changed": True,
-             "role": key, "department": dept, "position": position, "location": "Dubai, UAE",
+             "role": key, "department": dept, "position": position, "location": "Dubai Head Office",
              "employee_code": f"AIQ-00{len(ids) + 1}", "doj": (today - timedelta(days=60)).isoformat(), "shift": "general",
              "employment_type": "Permanent", "contract_months": None, "manager_id": ids.get("manager") if key == "employee" else None,
              "created_at": datetime.now(timezone.utc), "late_checkin_count_monthly": 0, "last_late_checkin_month": None,
              "failed_login_attempts": 0, "locked_until": None, "token_version": 0}
         ids[key] = str(db["users"].insert_one(u).inserted_id)
-    log("demo ready: 3 logins, no sample data")
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    db["holidays"].insert_many([{"date": d, "day": days[datetime.strptime(d, "%Y-%m-%d").weekday()], "name": n} for d, n in UAE_HOLIDAYS])
+    log("demo ready: 4 logins, UAE public holidays, no other sample data")
     return ids
 
 

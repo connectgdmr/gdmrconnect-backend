@@ -220,6 +220,11 @@ def create_app():
     ):
         app.register_blueprint(bp)
 
+    from config import DEMO_MODE as _DEMO
+    if _DEMO:                          # aieque HRIS extensions: demo deployment only, never on production GDMR Connect
+        from routes.hris import bp as hris_bp
+        app.register_blueprint(hris_bp)
+
     # ── Background scheduler ──────────────────────────────────────────────────
     # NOT started here anymore — create_app() now runs once per gunicorn
     # worker process, and starting the scheduler per-worker would fire every

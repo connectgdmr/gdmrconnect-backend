@@ -236,6 +236,23 @@ def get_company_holiday_dates():
 
 # ── Attendance day classification ───────────────────────────────────────────
 
+_hris_cache = {"at": 0.0, "week": [0, 1, 2, 3, 4]}
+
+
+def _hris_working_week():
+    """aieque demo only: the working days (Monday=0) saved in Settings -> Working week. Cached for 30 seconds."""
+    import time
+    if time.time() - _hris_cache["at"] > 30:
+        try:
+            from database import db
+            row = db["hris_settings"].find_one({"_id": "main"}) or {}
+            _hris_cache["week"] = list(row.get("working_week") or [0, 1, 2, 3, 4])
+        except Exception:
+            pass
+        _hris_cache["at"] = time.time()
+    return _hris_cache["week"]
+
+
 def is_weekend_day(day_str, holiday_dates):
     """
     Single source of truth for "is this day a non-working day" — a company
@@ -249,6 +266,8 @@ def is_weekend_day(day_str, holiday_dates):
         return True
     d  = datetime.strptime(day_str, "%Y-%m-%d")
     wd = d.weekday()  # Monday=0 ... Saturday=5, Sunday=6
+    if DEMO_MODE:      # aieque demo: the company's own working week (Settings), instead of the GDMR Sunday/Saturday rule
+        return wd not in _hris_working_week()
     if wd == 6:
         return True
     if wd == 5:
@@ -316,6 +335,8 @@ def classify_attendance_day(emp, day_str, day_checkins, leaves_by_uid, is_weeken
     if on_leave:
         return "leave"
 
+    if DEMO_MODE and is_weekend:      # aieque demo: a weekly off / public holiday is never "not checked in" or "absent"
+        return None
     if is_today:
         return "not_checked_in"
     if not is_weekend:
