@@ -430,6 +430,27 @@ def _users_fields(prof):
     }
 
 
+def department_names():
+    """Every department in use: the formal ones plus any that only exist as a string on an employee."""
+    from database import departments_col
+    names = {d.get("name") for d in departments_col.find({}, {"name": 1}) if d.get("name")}
+    for u in users_col.find({"department": {"$nin": [None, ""]}}, {"department": 1}):
+        dv = u.get("department")
+        for x in (dv if isinstance(dv, list) else [dv]):
+            if x:
+                names.add(x)
+    return sorted(names, key=str.lower)
+
+
+def ensure_department(name):
+    """A department typed on the employee form becomes a real department (so the Departments page lists it)."""
+    import re as _re
+    from database import departments_col
+    name = _s(name)
+    if name and not departments_col.find_one({"name": {"$regex": "^" + _re.escape(name) + "$", "$options": "i"}}):
+        departments_col.insert_one({"name": name, "description": "", "head_ids": [], "head_id": None, "created_at": _now(), "updated_at": _now()})
+
+
 def _next_code():
     hi = 0
     for u in users_col.find({"employee_code": {"$regex": r"^AIQ-\d+$"}}, {"employee_code": 1}):
@@ -453,6 +474,7 @@ def create_employee(payload, actor, st=None):
     st = st or settings()
     prof = _derive(_clean_profile(payload, True), st)
     prof["promotions"], prof["created_at"] = [], _now()
+    ensure_department(prof["job"].get("department"))
     password = secrets.token_urlsafe(9)
     fields = _users_fields(prof)
     user = {**fields, "role": prof["job"]["role"], "password": bcrypt.hashpw(password.encode(), bcrypt.gensalt(10)).decode(), "password_changed": False,
@@ -482,7 +504,7 @@ def create_employee(payload, actor, st=None):
 @token_required
 def meta():
     st = settings()
-    return jsonify({"offices": st["offices"], "leave_policies": st["leave_policies"], "probation_max_months": st["probation_max_months"],
+    return jsonify({"departments": department_names(), "offices": st["offices"], "leave_policies": st["leave_policies"], "probation_max_months": st["probation_max_months"],
                     "employment_types": EMPLOYMENT_TYPES, "statuses": STATUSES, "genders": GENDERS, "marital": MARITAL, "pay_modes": PAY_MODES,
                     "currencies": CURRENCIES, "visa_types": VISA_TYPES, "hired_via": HIRED_VIA, "working_week": st["working_week"],
                     "can_see_salary": _hr(request.user)}), 200
@@ -676,6 +698,7 @@ def update_person(emp_id):
     errors, warnings = validate_profile(new, creating=False, exclude_id=emp_id)
     if errors:
         return jsonify({"message": "Please fix the highlighted fields.", "errors": errors, "warnings": warnings}), 422
+    ensure_department(new["job"].get("department"))
     # who-changed-what for the sensitive fields
     old_j, new_j = pr.get("job") or {}, new["job"]
     for f, label in (("job_title", "Job title"), ("manager_id", "Manager"), ("status", "Status"), ("department", "Department"), ("office", "Office"), ("employment_type", "Employment type")):

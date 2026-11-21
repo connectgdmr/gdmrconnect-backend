@@ -12,7 +12,7 @@ from database import (attendance_col, leaves_col, users_col)
 from decorators import token_required
 from helpers import (_is_admin, _has_module_grant, classify_attendance_day,
                      get_company_holiday_dates, is_weekend_day, active_staff)
-from config import IST
+from config import IST, DEMO_MODE
 
 bp = Blueprint("stats", __name__)
 
@@ -64,6 +64,8 @@ def today_stats():
     present_count   = len(present_ids & active_ids)
     leave_count     = len((all_leave_ids - present_ids) & active_ids)
     not_in_count    = len(active_ids - present_ids - all_leave_ids - not_required_ids)
+    if DEMO_MODE and is_weekend_day(today, get_company_holiday_dates()):
+        not_in_count = 0          # aieque demo: nobody is "not checked in" on a weekly off or a public holiday
     employee_count  = sum(1 for u in active_users if u.get("role") == "employee")
     manager_count   = sum(1 for u in active_users if u.get("role") == "manager")
     by_department: dict = {}
