@@ -182,6 +182,10 @@ def _client_work_items(name, limit=None):
 @token_required
 def list_clients():
     scope = _dept_scope(request.user)
+    # The Add-work client picker (?for=work): someone with company-wide work access ("Work by Team") can tag any client.
+    # Names only - opening a client's folder and files still follows the normal rules.
+    if request.args.get("for") == "work" and scope is not None and _has_module_grant(request.user, "work-by-team"):
+        return jsonify([{"_id": str(c["_id"]), "name": c.get("name", "")} for c in clients_col.find({}, {"name": 1}).sort("name", 1)]), 200
     query = {} if scope is None else {"departments": {"$in": scope}}
     if scope is not None:
         linked = _my_work_client_ids(request.user)
@@ -231,7 +235,7 @@ def get_client(client_id):
 def create_client():
     is_privileged = _is_admin(request.user) or _has_module_grant(request.user, "clients", write=True)
     own = _mgr_depts(request.user)
-    if not is_privileged and not own:
+    if not is_privileged and not own and not _has_module_grant(request.user, "work-by-team"):
         return jsonify({"message": "Unauthorized"}), 403
 
     data = request.json or {}

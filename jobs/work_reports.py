@@ -83,6 +83,38 @@ def _manager_emails(dept):
     return emails
 
 
+# ── has this person actually updated their work? ─────────────────────────────
+
+def _ist_day(value):
+    if not isinstance(value, datetime):
+        return ""
+    if value.tzinfo is None:                      # Mongo returns naive UTC
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(IST).date().isoformat()
+
+
+def day_activity(uid, date_str):
+    """What `uid` did about work on `date_str`, counting BOTH places work lives (daily plan and Add work / assigned work).
+      added    - put work in for the day (submitted a plan, or added a work item that day)
+      updated  - posted any update that day (end-of-day update, a status change from My work, or a daily update on a work item)
+      has_open - has something that still needs an update (a submitted plan or an open work item assigned to them)"""
+    plan = work_plans_col.find_one({"employee_id": uid, "date": date_str}) or {}
+    submitted = plan.get("status") == "submitted"
+    updated = bool(plan.get("evening_submitted_at")) or _ist_day(plan.get("last_update_at")) == date_str
+    added = submitted
+    has_open = submitted
+    for t in work_tasks_col.find({"$or": [{"assignees.user_id": uid}, {"created_by": uid}]},
+                                 {"assignees": 1, "updates": 1, "created_by": 1, "created_at": 1, "status": 1}):
+        if t.get("created_by") == uid and _ist_day(t.get("created_at")) == date_str:
+            added = True
+        if any(u.get("user_id") == uid and u.get("date") == date_str and u.get("type") != "comment" for u in t.get("updates") or []):
+            updated = True
+        mine = next((a for a in t.get("assignees", []) if a.get("user_id") == uid), None)
+        if mine and mine.get("status") != "Completed" and t.get("status") != "Completed":
+            has_open = True
+    return {"added": added, "updated": updated, "has_open": has_open}
+
+
 # ── numbers ─────────────────────────────────────────────────────────────────
 
 def _days(start, end, holidays):
@@ -131,8 +163,11 @@ def collect(start, end, dept_filter=None):
         planned_ids = {p["employee_id"] for p in plans}
         evening_ids = {p["employee_id"] for p in plans if p.get("evening_submitted_at")}
         checked_ids = {u for (u, d) in checkins}
-        missing_plan = sorted(name[u] for u in checked_ids - planned_ids) if single else []
-        missing_evening = sorted(name[u] for u in planned_ids - evening_ids) if single else []
+        missing_plan, missing_evening = [], []
+        if single:
+            acts = {u: day_activity(u, s_iso) for u in checked_ids | planned_ids}
+            missing_plan = sorted(name[u] for u in checked_ids if not (acts[u]["added"] or acts[u]["updated"]))
+            missing_evening = sorted(name[u] for u, a in acts.items() if (a["added"] or a["has_open"]) and not a["updated"])
         absent = sorted(name[u] for u in set(ids) - checked_ids - on_leave) if single and days else []
         # assigned work touching this department
         at_q = {"assignees.user_id": {"$in": ids}}
@@ -372,11 +407,12 @@ def _reminder(kind):
             uid, email = str(p["_id"]), p.get("email")
             if not email or not attendance_col.find_one({"user_id": uid, "type": "checkin", "date": today}):
                 continue
-            plan = work_plans_col.find_one({"employee_id": uid, "date": today})
-            if kind == "plan" and not (plan and plan.get("status") == "submitted"):
+            act = day_activity(uid, today)
+            # never nag someone who has already put in or updated their work today, wherever they did it
+            if kind == "plan" and not (act["added"] or act["updated"]):
                 _mail(email, "Reminder: submit today's work plan", f"<p>Hi {E(p.get('name',''))}, you've checked in but haven't submitted today's work plan yet. Please open the Dashboard and submit it.</p>",
                       f"Hi {p.get('name','')}, you've checked in but haven't submitted today's work plan yet. Please open the Dashboard and submit it.")
-            if kind == "update" and plan and plan.get("status") == "submitted" and not plan.get("evening_submitted_at"):
+            if kind == "update" and act["has_open"] and not act["updated"]:
                 _mail(email, "Reminder: end-of-day work update before check-out", f"<p>Hi {E(p.get('name',''))}, please update the status and remarks of today's work before you check out (Dashboard → End-of-day update).</p>",
                       f"Hi {p.get('name','')}, please update the status and remarks of today's work before you check out (Dashboard → End-of-day update).")
 

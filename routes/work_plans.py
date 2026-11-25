@@ -171,7 +171,7 @@ def update_my_task(plan_id, task_id):
         return jsonify({"message": f"status must be one of: {', '.join(TASK_STATUSES)}"}), 400
 
     now        = datetime.now(timezone.utc)
-    update_doc = {"$set": {"tasks.$[t].status": status, "updated_at": now}}
+    update_doc = {"$set": {"tasks.$[t].status": status, "updated_at": now, "last_update_at": now}}
 
     result = work_plans_col.update_one(
         {"_id": obj, "employee_id": uid},

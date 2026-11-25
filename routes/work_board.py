@@ -233,7 +233,8 @@ def work_update():
                 hit = True
         if not hit:
             return jsonify({"message": "Task not found."}), 404
-        work_plans_col.update_one({"_id": plan["_id"]}, {"$set": {"tasks": plan["tasks"], "updated_at": datetime.now(timezone.utc)}})
+        now = datetime.now(timezone.utc)
+        work_plans_col.update_one({"_id": plan["_id"]}, {"$set": {"tasks": plan["tasks"], "updated_at": now, "last_update_at": now}})
         return jsonify({"message": "Updated"}), 200
     return jsonify({"message": "kind must be 'assigned' or 'plan'."}), 400
 
